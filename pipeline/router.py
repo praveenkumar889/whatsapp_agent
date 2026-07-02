@@ -296,14 +296,20 @@ async def _invoice_guard(incoming, session_history: list) -> Optional[str]:
     # ACTUALLY waiting on a Confirm/Proceed reply right now.
     awaiting_conf = bool(pre_neg_state and pre_neg_state.get("awaiting_invoice_confirmation", False))
 
-    # Explicit invoice inquiry ("send invoice", "where is my invoice") is always valid
-    invoice_inquiry = await _is_invoice_inquiry(incoming)
-
-    is_fast_confirm      = False
-    invoice_confirm_req  = False
+    # Phase 1A parallelization: invoice_inquiry runs unconditionally.
+    # When awaiting confirmation, the two confirmation checks also run —
+    # all three are independent LLM calls, so gather() cuts latency by ~2/3.
     if awaiting_conf:
-        is_fast_confirm = await _check_fast_confirm(incoming, pre_neg_state)
-        invoice_confirm_req = await _is_invoice_confirmation_request(incoming, session_history)
+        invoice_inquiry, is_fast_confirm, invoice_confirm_req = await asyncio.gather(
+            _is_invoice_inquiry(incoming),
+            _check_fast_confirm(incoming, pre_neg_state),
+            _is_invoice_confirmation_request(incoming, session_history),
+        )
+    else:
+        # Not awaiting confirmation — only check invoice inquiry (cheapest path)
+        invoice_inquiry     = await _is_invoice_inquiry(incoming)
+        is_fast_confirm     = False
+        invoice_confirm_req = False
 
     if not (invoice_inquiry or is_fast_confirm or invoice_confirm_req):
         return None
