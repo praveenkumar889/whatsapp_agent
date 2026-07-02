@@ -1,0 +1,123 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+#  Usually these written to a standalone folder, but they may contain host-specific files
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Translations
+*.mo
+*.pot
+
+# Django stuff:
+*.log
+local_settings.py
+db.sqlite3
+db.sqlite3-journal
+
+# Flask stuff:
+instance/
+.webassets-cache
+
+# Scrapy stuff:
+.scrapy
+
+# Sphinx documentation
+docs/_build/
+
+# PyBuilder
+.pybuilder/
+target/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# IPython
+profile_default/
+ipython_config.py
+
+# pyenv
+#   For a library or package, you might want to share your .python-version.
+#   For an app, this can be useful so that everyone uses the same Python version.
+# .python-version
+
+# pipenv
+#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in git.
+#   However, in case of collaboration, if the platform is not identical, the lock file should be omitted.
+# Pipfile.lock
+
+# poetry
+#   Similar to Pipfile.lock, poetry.lock contains specific versions of dependencies
+# poetry.lock
+
+# pdm
+#   Similar to Pipfile.lock, pdm.lock contains specific versions of dependencies
+# pdm.lock
+
+# virtualenv
+#   Empty directories can't be committed so this directory won't exist until you create it.
+venv/
+active_env/
+ENV/
+env/
+ENV/
+.venv/
+.venv_old/
+
+# IDEs and editors
+.idea/
+.project
+.pydevproject
+.settings/
+.vscode/
+*.swp
+*.swo
+
+# Local env files
+.env
+.env.*
