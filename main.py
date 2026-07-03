@@ -136,7 +136,7 @@ async def chat_endpoint(payload: dict):
         session_id      = phone,
         channel         = "web",
         timestamp       = int(time.time()),
-        tenant_id       = "UNRESOLVED",
+        tenant_id       = "tenant_inventaa_led_001",
         waba_id         = "web_waba",
         phone_number_id = phone_number_id,
         biz_name        = os.getenv("DEFAULT_BIZ_NAME",           "Web Business"),

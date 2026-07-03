@@ -5,15 +5,25 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional, List, cast
 from supabase import create_client, Client  # type: ignore[import]
 from models.schemas import IncomingMessage, EntityResult
-from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+from config import (
+    SUPABASE_URL, SUPABASE_SERVICE_KEY,
+    TENANT_SUPABASE_URL, TENANT_SUPABASE_SECRET_KEY,
+)
 
 _supabase: Optional[Client] = None
+_tenant_supabase: Optional[Client] = None
 
 def _get_client() -> Client:
     global _supabase
     if _supabase is None:
         _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     return _supabase
+
+def _get_tenant_client() -> Client:
+    global _tenant_supabase
+    if _tenant_supabase is None:
+        _tenant_supabase = create_client(TENANT_SUPABASE_URL, TENANT_SUPABASE_SECRET_KEY)
+    return _tenant_supabase
 
 
 async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
@@ -43,11 +53,12 @@ async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
         None → phone_number_id not registered, reject message
     """
     try:
-        result = _get_client().table("tenants") \
+        result = _get_tenant_client().table("tenants") \
             .select("*") \
             .eq("phone_number_id", phone_number_id) \
             .limit(1) \
             .execute()
+
 
         if result.data:
             row = cast(dict, result.data[0])

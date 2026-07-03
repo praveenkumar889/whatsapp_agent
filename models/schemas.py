@@ -80,7 +80,31 @@ class IncomingMessage:
     acceptance_keywords:    Optional[str] = None   # comma-separated phrases
     acceptance_exact_words: Optional[str] = None   # comma-separated single words
 
+    # ── Migrated from hardcoded (Migration 014) ───────────────────────────────
+    parse_global_offer_tiers_prompt:           Optional[str] = None
+    invoice_inquiry_check_prompt:              Optional[str] = None
+    order_confirmation_reply_check_prompt:     Optional[str] = None
+    generate_invoice_cta_prompt:               Optional[str] = None
+    invoice_confirmation_request_check_prompt: Optional[str] = None
+    fast_order_confirm_check_prompt:           Optional[str] = None
+    category_matcher_prompt:                   Optional[str] = None
+    pf_data_extraction_prompt:                 Optional[str] = None
+    pf_history_resolver_prompt:                Optional[str] = None
+    pf_offer_inquiry_check_prompt:             Optional[str] = None
+    pf_neg_product_change_check_prompt:        Optional[str] = None
+    pf_vague_reference_check_prompt:           Optional[str] = None
+    pf_vague_reference_rewriter_prompt:        Optional[str] = None
+    pf_offer_inquiry_check_l2_prompt:          Optional[str] = None
+    pf_named_product_extractor_prompt:         Optional[str] = None
+    pf_offers_formatter_prompt:                Optional[str] = None
+    pf_vague_pronoun_resolver_l2_prompt:       Optional[str] = None
+    pf_comparison_prompt:                      Optional[str] = None
+    pf_image_installation_intent_prompt:       Optional[str] = None
+    pf_main_followup_prompt:                   Optional[str] = None
+    pf_new_search_followup_classifier_prompt:  Optional[str] = None
+
     # ── Per-tenant config ─────────────────────────────────────────────────────
+
     valid_intents:    Optional[List[str]] = None
     graphrag_api_url: Optional[str] = None
     products_api_url: Optional[str] = None

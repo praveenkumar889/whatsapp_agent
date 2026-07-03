@@ -22,9 +22,18 @@ SUPABASE_URL            = os.getenv("SUPABASE_URL") or ""
 SUPABASE_SERVICE_KEY    = os.getenv("SUPABASE_SERVICE_KEY") or ""
 SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "whatsapp-media")
 
+# ── Tenant DB (configuration & dynamic prompts) ─────────────────────────────
+TENANT_SUPABASE_URL     = os.getenv("TENANT_SUPABASE_URL") or SUPABASE_URL
+TENANT_SUPABASE_SECRET_KEY = os.getenv("TENANT_SUPABASE_SECRET_KEY") or SUPABASE_SERVICE_KEY
+
+
 # ── Products / GraphRAG APIs ──────────────────────────────────────────────────
-PRODUCTS_API_URL  = os.getenv("PRODUCTS_API_URL", "")
-GRAPHRAG_API_URL  = os.getenv("GRAPHRAG_API_URL", "")
+PRODUCTS_API_URL        = os.getenv("PRODUCTS_API_URL", "")
+GRAPHRAG_API_URL        = os.getenv("GRAPHRAG_API_URL", "")
+MCP_SERVER_URL          = os.getenv("MCP_SERVER_URL", os.getenv("INVENTAA_MCP_SERVER_URL", "http://localhost:8008/mcp"))
+INVENTAA_MCP_SERVER_URL = MCP_SERVER_URL  # Backward compatibility alias
+USE_MCP_SERVER          = os.getenv("USE_MCP_SERVER", "true").lower() == "true"
+
 
 # ── Mem0 ──────────────────────────────────────────────────────────────────────
 # Get your API key from https://app.mem0.ai

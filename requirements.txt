@@ -9,4 +9,5 @@ tzdata
 reportlab
 streamlit
 mem0ai
+fastmcp>=3.4.0
 

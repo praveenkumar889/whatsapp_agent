@@ -15,9 +15,11 @@ from typing import Optional
 from openai import AzureOpenAI
 from config import (
     GRAPHRAG_API_URL,
+    MCP_SERVER_URL, USE_MCP_SERVER,
     AZURE_AI_ENDPOINT, AZURE_AI_API_KEY,
     AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION,
 )
+
 from messaging import send_reply, send_image
 from ai.product_followup import _try_resolve_product_followup
 from db.session_store import (
@@ -414,44 +416,69 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # 1. Per-tenant URL passed from main.py (from tenants table column) — highest priority
         # 2. Global GRAPHRAG_API_URL env var — fallback
         effective_graphrag_url = graphrag_url or GRAPHRAG_API_URL
-        if not effective_graphrag_url:
-            print(f"[GRAPHRAG] No GraphRAG URL configured for tenant {incoming.tenant_id}")
-            support = getattr(incoming, 'support_email', None) or incoming.biz_name
-            return (
-                f"I'm not able to look up products right now, {incoming.sender_name}. "
-                f"Please contact *{support}* for assistance."
+
+        data = None
+        if USE_MCP_SERVER or (effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url)):
+            mcp_url = effective_graphrag_url if effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url) else MCP_SERVER_URL
+            print(f"[GRAPHRAG-MCP] Routing via MCP Server at {mcp_url}")
+            from ai.mcp_client import query_mcp_catalog
+            mcp_res = await query_mcp_catalog(
+                query=graphrag_text,
+                session_id=incoming.session_id,
+                server_url=mcp_url
             )
+            if mcp_res and mcp_res.get("status") == "success":
+                products = mcp_res.get("products", [])
+                response_str = mcp_res.get("response", "")
+                if products and len(products) > 0:
+                    data = {"response_text": products, "intent": mcp_res.get("intent")}
+                elif response_str:
+                    data = {"response_text": response_str, "intent": mcp_res.get("intent")}
+                else:
+                    data = {"response_text": []}
+            else:
+                print(f"[GRAPHRAG-MCP] MCP query did not return success, falling back to REST: {effective_graphrag_url}")
 
-        print(f"[GRAPHRAG] Calling {effective_graphrag_url[:60]} for: '{graphrag_text[:60]}'")
+        if data is None:
+            if not effective_graphrag_url:
+                print(f"[GRAPHRAG] No GraphRAG URL configured for tenant {incoming.tenant_id}")
+                support = getattr(incoming, 'support_email', None) or incoming.biz_name
+                return (
+                    f"I'm not able to look up products right now, {incoming.sender_name}. "
+                    f"Please contact *{support}* for assistance."
+                )
 
-        # GraphRAG uses LangChain + Neo4j — can take 40-60 seconds
-        graphrag_timeout = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0)
-        async with httpx.AsyncClient(timeout=graphrag_timeout) as client:
-            response = await client.post(
-                effective_graphrag_url,
-                json    = payload,
-                headers = {"Content-Type": "application/json"},
-            )
+            print(f"[GRAPHRAG] Calling {effective_graphrag_url[:60]} for: '{graphrag_text[:60]}'")
 
-        if response.status_code == 403:
-            print(f"[GRAPHRAG] 403 — host not whitelisted")
-            support = getattr(incoming, 'support_email', None) or incoming.biz_name
-            return (
-                f"Thanks for your interest, {incoming.sender_name}! 😊\n\n"
-                f"I'm having trouble fetching product information right now.\n"
-                f"Please contact *{support}* for assistance."
-            )
+            # GraphRAG uses LangChain + Neo4j — can take 40-60 seconds
+            graphrag_timeout = httpx.Timeout(connect=10.0, read=90.0, write=10.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=graphrag_timeout) as client:
+                response = await client.post(
+                    effective_graphrag_url,
+                    json    = payload,
+                    headers = {"Content-Type": "application/json"},
+                )
 
-        if response.status_code != 200:
-            print(f"[GRAPHRAG] HTTP {response.status_code}")
-            support = getattr(incoming, 'support_email', None) or incoming.biz_name
-            return (
-                f"I'm having trouble fetching product information right now, "
-                f"{incoming.sender_name}. 🔧\n\n"
-                f"Please try again shortly or contact *{support}*"
-            )
+            if response.status_code == 403:
+                print(f"[GRAPHRAG] 403 — host not whitelisted")
+                support = getattr(incoming, 'support_email', None) or incoming.biz_name
+                return (
+                    f"Thanks for your interest, {incoming.sender_name}! 😊\n\n"
+                    f"I'm having trouble fetching product information right now.\n"
+                    f"Please contact *{support}* for assistance."
+                )
 
-        data = response.json()
+            if response.status_code != 200:
+                print(f"[GRAPHRAG] HTTP {response.status_code}")
+                support = getattr(incoming, 'support_email', None) or incoming.biz_name
+                return (
+                    f"I'm having trouble fetching product information right now, "
+                    f"{incoming.sender_name}. 🔧\n\n"
+                    f"Please try again shortly or contact *{support}*"
+                )
+
+            data = response.json()
+
         print(f"[GRAPHRAG] Response received — keys: {list(data.keys()) if isinstance(data, dict) else 'list'}")
 
         # Store raw response on incoming so pipeline can save it to DB

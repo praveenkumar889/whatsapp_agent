@@ -35,7 +35,29 @@ PROMPT_COLUMNS = [
     "product_summary_recommendation_prompt",
     "acceptance_keywords",
     "acceptance_exact_words",
+    "parse_global_offer_tiers_prompt",
+    "invoice_inquiry_check_prompt",
+    "order_confirmation_reply_check_prompt",
+    "generate_invoice_cta_prompt",
+    "invoice_confirmation_request_check_prompt",
+    "fast_order_confirm_check_prompt",
+    "category_matcher_prompt",
+    "pf_data_extraction_pro mpt",
+    "pf_history_resolver_prompt",
+    "pf_offer_inquiry_check_prompt",
+    "pf_neg_product_change_check_prompt",
+    "pf_vague_reference_check_prompt",
+    "pf_vague_reference_rewriter_prompt",
+    "pf_offer_inquiry_check_l2_prompt",
+    "pf_named_product_extractor_prompt",
+    "pf_offers_formatter_prompt",
+    "pf_vague_pronoun_resolver_l2_prompt",
+    "pf_comparison_prompt",
+    "pf_image_installation_intent_prompt",
+    "pf_main_followup_prompt",
+    "pf_new_search_followup_classifier_prompt",
 ]
+
 
 
 async def setup_pipeline(incoming: IncomingMessage) -> tuple:

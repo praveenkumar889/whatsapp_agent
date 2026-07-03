@@ -53,10 +53,11 @@ def _cache_set(tenant_id: str, prompt_name: str, language: str, text: str):
 def _load_from_db(tenant_id: str, prompt_name: str, language: str) -> Optional[str]:
     """Reads the active prompt from prompt_templates table."""
     try:
-        from db.session_store import _get_client
+        from db.session_store import _get_tenant_client
         result = (
-            _get_client()
+            _get_tenant_client()
             .table("prompt_templates")
+
             .select("prompt_text")
             .eq("tenant_id",   tenant_id)
             .eq("prompt_name", prompt_name)
