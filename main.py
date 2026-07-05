@@ -140,7 +140,7 @@ async def chat_endpoint(payload: dict):
         waba_id         = "web_waba",
         phone_number_id = phone_number_id,
         biz_name        = os.getenv("DEFAULT_BIZ_NAME",           "Web Business"),
-        region          = os.getenv("DEFAULT_REGION", "india"),
+        region          = "india",
         timezone        = os.getenv("DEFAULT_TIMEZONE",           "Asia/Kolkata"),
         language        = "en",
         sender_name     = sender_name,
@@ -191,25 +191,6 @@ async def reset_endpoint(payload: dict):
 # ══════════════════════════════════════════════════════════════════════════════
 # CORE PIPELINE
 # ══════════════════════════════════════════════════════════════════════════════
-
-async def _verify_prompt_keys_on_startup(tenant_id: str) -> None:
-    """
-    Item 2 (architect rec): fail fast if any required prompt key is missing from DB.
-    Called once at startup — catches misconfigured tenants before first customer message.
-    """
-    from db.prompt_store import PROMPT_KEYS, _load_from_db
-    missing = []
-    for key in PROMPT_KEYS:
-        if _load_from_db(tenant_id, key, "en") is None:
-            missing.append(key)
-    if missing:
-        print(f"[STARTUP] ⚠️  Missing {len(missing)} prompt keys for tenant '{tenant_id}':")
-        for k in missing:
-            print(f"  - {k}")
-        print("[STARTUP] Add these keys to prompt_templates table before serving traffic.")
-    else:
-        print(f"[STARTUP] ✅ All {len(PROMPT_KEYS)} prompt keys verified for '{tenant_id}'")
-
 
 async def run_pipeline(incoming: IncomingMessage) -> dict:
     """
@@ -281,14 +262,22 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
                 text       = reply,
                 region     = incoming.region,
             )
-            # FIX: Fire-and-forget — Mem0 save runs after response is sent.
-            # Previously awaited here, adding 1-3s to every message latency.
+            # Step 10: Fire-and-forget background tasks — never block response.
+            # 1. Save raw turn to Mem0 (conversation memory)
             asyncio.create_task(_save_mem0_turn(
                 tenant_id  = incoming.tenant_id,
                 session_id = incoming.session_id,
                 user_text  = incoming.text,
                 bot_reply  = reply,
             ))
+            # 2. If invoice was just generated, trigger conversation summary
+            if "invoice" in reply.lower() or "INV#" in reply:
+                asyncio.create_task(_save_conversation_summary(
+                    tenant_id       = incoming.tenant_id,
+                    session_id      = incoming.session_id,
+                    session_history = session_history,
+                    incoming        = incoming,
+                ))
 
         # ── Step 8: Return debug info ────────────────────────────────────────
         latency = round(time.monotonic() - _t0, 2)
@@ -315,8 +304,8 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
 async def _save_mem0_turn(tenant_id: str, session_id: str,
                            user_text: str, bot_reply: str) -> None:
     """
-    Fire-and-forget Mem0 save. Called via asyncio.create_task() so it runs
-    after the HTTP response is already sent — never blocks the pipeline.
+    Fire-and-forget Mem0 conversation turn save.
+    Runs after HTTP response sent — never blocks the pipeline.
     """
     try:
         await add_conversation_turn(
@@ -327,6 +316,27 @@ async def _save_mem0_turn(tenant_id: str, session_id: str,
         )
     except Exception as e:
         print(f"[MEM0] Background save failed (non-critical): {e}")
+
+
+async def _save_conversation_summary(
+    tenant_id: str, session_id: str,
+    session_history: list, incoming,
+) -> None:
+    """
+    Step 5 + Step 10: Generate and save semantic conversation summary to Mem0.
+    Triggered after invoice generation — captures the full conversation lifecycle.
+    Fire-and-forget — never blocks response.
+    """
+    try:
+        from ai.summary_generator import generate_and_save_conversation_summary
+        await generate_and_save_conversation_summary(
+            tenant_id  = tenant_id,
+            session_id = session_id,
+            messages   = session_history,
+            incoming   = incoming,
+        )
+    except Exception as e:
+        print(f"[MEM0] Conversation summary failed (non-critical): {e}")
 
 
 async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional[str]:

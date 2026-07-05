@@ -102,6 +102,14 @@ class MemoryManager:
         except Exception as e:
             print(f"[MEM] save failed ({memory_type}): {e}")
 
+    async def _async_save(self, content: str, memory_type: str, extra_meta: dict = {}) -> None:
+        """Helper to run _save_raw asynchronously in an executor."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: self._save_raw(content, memory_type, extra_meta)
+        )
+
     def _rank(self, memories: list, mem_type: str) -> list:
         """
         Ranks memories by: importance_weight × recency × confidence.

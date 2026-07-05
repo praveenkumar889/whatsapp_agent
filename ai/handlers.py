@@ -10,11 +10,12 @@
 import asyncio
 import json
 from datetime import datetime, timezone, timedelta
-from typing import List, Optional
+from typing import List, Optional, Any
 
 from openai import AzureOpenAI
+from openai.types.chat import ChatCompletionMessageParam
 from config import AZURE_AI_ENDPOINT, AZURE_AI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION
-from models.schemas import IntentResult, EntityResult, OrderItem
+from models.schemas import IntentResult, EntityResult, OrderItem, IncomingMessage
 from db.prompt_store import get_prompt
 
 _client = AzureOpenAI(
@@ -34,18 +35,18 @@ DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION",
 
 async def classify_intent(
     customer_message: str,
-    session_history:  Optional[List[dict]] = None,
-    incoming = None,
+    session_history:  Optional[List[ChatCompletionMessageParam]] = None,
+    incoming: Optional[IncomingMessage] = None,
 ) -> IntentResult:
     """
     Classifies intent using tenant's intent_system_prompt from DB.
     Raises RuntimeError if prompt not set in DB.
     """
     system_prompt  = get_prompt(incoming, "intent_system_prompt")
-    valid_intents  = set(incoming.valid_intents) if incoming.valid_intents else DEFAULT_VALID_INTENTS
+    valid_intents  = set(incoming.valid_intents) if incoming and incoming.valid_intents else DEFAULT_VALID_INTENTS
     raw = ""
     try:
-        messages = [{"role": "system", "content": system_prompt}]
+        messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
         if session_history:
             messages.extend(session_history)
         messages.append({"role": "user", "content": customer_message})
@@ -99,7 +100,7 @@ def _get_time_greeting(timezone_str: str) -> tuple:
     return "evening", "Good evening"
 
 
-async def handle_greeting(incoming) -> str:
+async def handle_greeting(incoming: IncomingMessage) -> str:
     time_of_day, time_greeting = _get_time_greeting(incoming.timezone)
 
     system_prompt = get_prompt(
@@ -127,9 +128,10 @@ async def handle_greeting(incoming) -> str:
         raw    = content.strip()
         parsed = json.loads(raw)
         reply  = parsed.get("reply", "")
-        if reply:
-            print(f"[GREETING] type={parsed.get('type')} time={time_of_day}")
-            return reply
+        if not reply:
+            raise ValueError("Empty reply in greeting response")
+        print(f"[GREETING] type={parsed.get('type')} time={time_of_day}")
+        return reply
     except RuntimeError:
         raise
     except Exception as e:
@@ -137,7 +139,7 @@ async def handle_greeting(incoming) -> str:
         raise RuntimeError(f"[GREETING] Failed to generate reply: {e}")
 
 
-async def handle_escalation(incoming) -> str:
+async def handle_escalation(incoming: IncomingMessage) -> str:
     system_prompt = get_prompt(
         incoming, "escalation_prompt",
         sender_name = incoming.sender_name,
@@ -165,7 +167,7 @@ async def handle_escalation(incoming) -> str:
         raise RuntimeError(f"[ESCALATION] Failed to generate reply: {e}")
 
 
-async def handle_unknown(incoming) -> str:
+async def handle_unknown(incoming: IncomingMessage) -> str:
     system_prompt = get_prompt(
         incoming, "unknown_prompt",
         sender_name = incoming.sender_name,
@@ -201,14 +203,15 @@ NEW_ORDER_TRIGGERS = [
     "new order", "i want to buy", "i need to order", "can i order",
 ]
 
-def _get_relevant_history(session_history: List[dict], current_message: str) -> List[dict]:
+def _get_relevant_history(session_history: List[ChatCompletionMessageParam], current_message: str) -> List[ChatCompletionMessageParam]:
     if not session_history:
         return []
     if any(t in current_message.lower() for t in NEW_ORDER_TRIGGERS):
         return []
     last_idx = -1
     for i, msg in enumerate(session_history):
-        if msg.get("role") == "user" and any(t in msg.get("content","").lower() for t in NEW_ORDER_TRIGGERS):
+        content = msg.get("content")
+        if msg.get("role") == "user" and isinstance(content, str) and any(t in content.lower() for t in NEW_ORDER_TRIGGERS):
             last_idx = i
     if last_idx >= 0:
         return session_history[last_idx:]
@@ -222,8 +225,8 @@ def _default_delivery_date() -> str:
 
 async def extract_entities(
     customer_message: str,
-    incoming,
-    session_history:  Optional[List[dict]] = None,
+    incoming: IncomingMessage,
+    session_history:  Optional[List[ChatCompletionMessageParam]] = None,
     force_new_order:  bool = False,
     cached_items:     Optional[List] = None,
 ) -> EntityResult:
@@ -260,7 +263,7 @@ Example:
         else:
             system_prompt = base_prompt
 
-        messages = [{"role": "system", "content": system_prompt}]
+        messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
         if relevant_history:
             messages.extend(relevant_history)
         messages.append({"role": "user", "content": f"[tenant: {incoming.tenant_id}]\n{customer_message}"})

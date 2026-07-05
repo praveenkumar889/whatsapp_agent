@@ -296,20 +296,14 @@ async def _invoice_guard(incoming, session_history: list) -> Optional[str]:
     # ACTUALLY waiting on a Confirm/Proceed reply right now.
     awaiting_conf = bool(pre_neg_state and pre_neg_state.get("awaiting_invoice_confirmation", False))
 
-    # Phase 1A parallelization: invoice_inquiry runs unconditionally.
-    # When awaiting confirmation, the two confirmation checks also run —
-    # all three are independent LLM calls, so gather() cuts latency by ~2/3.
+    # Explicit invoice inquiry ("send invoice", "where is my invoice") is always valid
+    invoice_inquiry = await _is_invoice_inquiry(incoming)
+
+    is_fast_confirm      = False
+    invoice_confirm_req  = False
     if awaiting_conf:
-        invoice_inquiry, is_fast_confirm, invoice_confirm_req = await asyncio.gather(
-            _is_invoice_inquiry(incoming),
-            _check_fast_confirm(incoming, pre_neg_state),
-            _is_invoice_confirmation_request(incoming, session_history),
-        )
-    else:
-        # Not awaiting confirmation — only check invoice inquiry (cheapest path)
-        invoice_inquiry     = await _is_invoice_inquiry(incoming)
-        is_fast_confirm     = False
-        invoice_confirm_req = False
+        is_fast_confirm = await _check_fast_confirm(incoming, pre_neg_state)
+        invoice_confirm_req = await _is_invoice_confirmation_request(incoming, session_history)
 
     if not (invoice_inquiry or is_fast_confirm or invoice_confirm_req):
         return None
@@ -471,11 +465,11 @@ async def _save_neg_outcome_async(
 ) -> None:
     """Fire-and-forget negotiation outcome save to Mem0."""
     try:
-        from db.memory_store import save_negotiation_outcome
-        await save_negotiation_outcome(
-            tenant_id     = tenant_id,
-            session_id    = session_id,
-            product_name  = product,
+        # save_negotiation_outcome lives in MemoryManager (ai/memory_manager.py)
+        from ai.memory_manager import MemoryManager
+        mm = MemoryManager(tenant_id, session_id)
+        await mm.save_negotiation_outcome(
+            product       = product,
             opening_price = opening_price,
             final_price   = final_price,
             rounds        = rounds,
