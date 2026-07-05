@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+import re
 from typing import List, Optional, cast
 
 from openai import AzureOpenAI
@@ -131,7 +132,30 @@ def calculate_offer(price_num: float, quantity: int, tiers: Optional[list] = Non
 
 # ── Detection helpers — all prompts from DB ───────────────────────────────────
 
+# Regex fast-path for is_negotiation_request(). Only ever short-circuits to
+# True (skip the LLM call entirely) — never to False. Anything not matched
+# here still goes through the LLM exactly as before, so this can only reduce
+# latency, never change behavior on ambiguous messages.
+_NEG_REQUEST_FAST_PATTERNS = [
+    r'\bcan (i|we) get (it |this )?for\b',
+    r'\b(how about|what about)\s+\d',
+    r'\b(do|make) it (for )?\d',
+    r'\bwill you (take|accept)\b',
+    r'\bmy (budget|price|offer) is\b',
+    r'\bfinal (budget|price|offer)\b',
+    r'\brs\.?\s*\d{2,}\b',
+    r'\b\d{2,}\s*(rs|rupees?|/-)?\s*(per unit|each)?\s*$',
+    r'\b(discount|reduce|lower|cheaper|less price|best price|lowest price|negotiate|negotiable|any offer|special price)\b',
+]
+_NEG_REQUEST_FAST_RE = re.compile("|".join(_NEG_REQUEST_FAST_PATTERNS), re.IGNORECASE)
+
+
 async def is_negotiation_request(message: str, incoming, session_history: Optional[list] = None) -> bool:
+    # Fast path: obvious negotiation language — skip the ~2s LLM round-trip.
+    if _NEG_REQUEST_FAST_RE.search(message or ""):
+        print(f"[NEGOTIATOR] is_negotiation_request: regex fast-path matched — skipping LLM")
+        return True
+
     prompt = get_prompt(incoming, "neg_is_request_prompt")
     try:
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": prompt}]
@@ -268,7 +292,7 @@ async def detect_more_discount_request(message: str, incoming, session_history: 
 
 
 async def detect_acceptance(message: str, incoming, session_history: Optional[list] = None) -> bool:
-    prompt = get_prompt(incoming, "neg_detect_accept_prompt")
+    prompt = get_prompt(incoming, "neg_detect_accept_prompt", message=message)
     try:
         r = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _client.chat.completions.create(

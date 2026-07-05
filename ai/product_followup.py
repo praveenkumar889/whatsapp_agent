@@ -45,6 +45,33 @@ _client = AzureOpenAI(
 )
 
 
+def normalize_parsed(parsed: dict) -> dict:
+    """
+    Normalizes the follow-up parser's output to one stable schema.
+
+    WHY THIS EXISTS:
+        pf_data_extraction_prompt's real LLM output uses "parsed_order_quantity"
+        for quantity, while the exception-fallback dict inside
+        _parse_followup_message historically used "quantity" — and downstream
+        code read "quantity" directly. Since the LLM path is the normal path,
+        parsed_qty was silently None on every successful parse. This is what
+        caused negotiation_state to never receive a real quantity across turns.
+
+        Call this ONCE at the source (inside _parse_followup_message, below)
+        rather than at every call site — every caller downstream should read
+        parsed["quantity"] and parsed["selected_product_name"] ONLY, never
+        "parsed_order_quantity" or "product_name" directly. This is the single
+        place that class of bug gets fixed, instead of scattered
+        parsed.get(a, parsed.get(b)) fallbacks at every read site.
+    """
+    normalized = dict(parsed)  # preserve any other keys untouched (e.g. is_comparison)
+    normalized["quantity"] = parsed.get("parsed_order_quantity", parsed.get("quantity"))
+    normalized["selected_product_name"] = (
+        parsed.get("selected_product_name") or parsed.get("product_name")
+    )
+    return normalized
+
+
 async def _parse_followup_message(incoming, selection: list, session_history: Optional[list] = None) -> dict:
     """
     Uses LLM to parse the follow-up message to identify if they are:
@@ -54,6 +81,10 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
     - requesting images (asks_for_image)
     - performing a new category search / broad search (is_new_search)
     Zero hardcoding.
+
+    Always returns a dict normalized via normalize_parsed() — callers should
+    read result["quantity"] and result["selected_product_name"], never the
+    raw LLM schema keys.
     """
     product_names = [p.get("product_name") or p.get("name") or "" for p in selection]
     try:
@@ -83,19 +114,20 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
             if lines[-1].startswith("```"):
                 lines = lines[:-1]
             content = "\n".join(lines).strip()
-        return json.loads(content)
+        return normalize_parsed(json.loads(content))
     except Exception as e:
         print(f"[FOLLOW-UP] LLM parser failed: {e}")
-        return {
+        return normalize_parsed({
             "selected_product_name": None,
             "quantity": None,
+            "parsed_order_quantity": None,
             "quantity_unit": None,
             "is_comparison": False,
             "is_recommendation": False,
             "is_offer_inquiry": False,
             "asks_for_image": False,
             "is_new_search": False
-        }
+        })
 
 
 async def _get_active_product_context(
@@ -1253,6 +1285,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     print(f"[FOLLOW-UP] List-position pick: '{extracted_number}' -> {matched_product.get('product_name') or matched_product.get('name')} (list size={len(selection)})")
                     # Force quantity to remain unset — never reuse this number as quantity.
                     parsed["quantity"] = None
+                    parsed["parsed_order_quantity"] = None
                     parsed["_number_was_list_position"] = True  # threaded downstream to suppress quantity inference
                 else:
                     print(f"[FOLLOW-UP] '{extracted_number}' out of range for list size={len(selection)} — asking for product name")
@@ -1515,6 +1548,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         product_context["customer_just_selected_by_number"] = True
         print(f"[FOLLOW-UP] Number was used for list-position selection — suppressing quantity inference for this turn")
     else:
+        # pf_data_extraction_prompt's real schema returns "parsed_order_quantity",
+        # not "quantity" — only the exception-fallback dict uses "quantity".
+        # Check both so this works regardless of which path produced `parsed`.
+        # normalize_parsed() (applied inside _parse_followup_message) guarantees
+        # "quantity" is always the correct value here, regardless of which
+        # underlying schema (LLM success path or exception fallback) produced it.
         parsed_qty = parsed.get("quantity")
     parsed_unit = parsed.get("quantity_unit") or "units"
 

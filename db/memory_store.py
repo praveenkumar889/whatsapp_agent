@@ -63,11 +63,25 @@ def _search_and_filter(
             result = result.get("results", [])
         if not isinstance(result, list):
             return []
+        _raw_count = len(result)
         # Filter to only this tenant's memories
         filtered = [
             r for r in result
             if _matches_tenant(r.get("memory", ""), tenant_id, session_id)
         ]
+        # DIAGNOSTIC: raw vs tenant-filtered count + per-type breakdown, in one
+        # line, so a still-0 retrieval can be pinned to a specific cause:
+        #   raw=0                      → nothing indexed yet / wrong user_id / genuine miss
+        #   raw>0, tenant_filtered=0   → write path missing the tenant prefix somewhere
+        #   raw>0, tenant_filtered>0   → working; check "types:" breakdown for what came back
+        # Remove once Mem0 retrieval is confirmed stable end-to-end.
+        _type_counts: dict = {}
+        for r in filtered:
+            _t = (r.get("metadata") or {}).get("type", "unknown")
+            _type_counts[_t] = _type_counts.get(_t, 0) + 1
+        _types_str = " ".join(f"{k}={v}" for k, v in _type_counts.items()) or "none"
+        print(f"[MEM0 SEARCH] query=\"{query[:40]}\" raw={_raw_count} "
+              f"tenant_filtered={len(filtered)} types: {_types_str}")
         # Strip prefix from memory text so callers get clean content
         for r in filtered:
             if isinstance(r, dict) and "memory" in r:

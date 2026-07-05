@@ -654,7 +654,7 @@ async def get_cached_product_by_name(
     # Tier 4: Fallback in-memory  (below, in case DB column missing)
 
     def _parse_row(row: dict) -> Optional[dict]:
-        raw  = cast(dict, row).get("api_response")
+        raw  = row.get("api_response")
         data = _json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(data, list):
             data = [data]
