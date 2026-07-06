@@ -143,6 +143,8 @@ class MemoryManager:
             _preview = content[:60].replace("\n", " ")
             print(f"[MEM0 SAVE] user_id={self.session_id} tenant={self.tenant_id} "
                   f"memory_type={memory_type} preview={_preview}...")
+            from ai import memory_metrics
+            memory_metrics.record_manager_save(memory_type)
         except Exception as e:
             print(f"[MEM] save failed ({memory_type}): {e}")
 
@@ -220,7 +222,10 @@ class MemoryManager:
         """
         import asyncio
         import concurrent.futures
+        import time as _time_metrics
+        from ai import memory_metrics
 
+        _t0 = _time_metrics.monotonic()
         loop = asyncio.get_event_loop()
 
         async def _fetch(mem_type: str) -> tuple[str, list]:
@@ -244,6 +249,12 @@ class MemoryManager:
             if isinstance(item, tuple):
                 mem_type, ranked = item
                 output[mem_type] = ranked
+
+        _latency_ms  = round((_time_metrics.monotonic() - _t0) * 1000, 1)
+        _total_hits  = sum(len(v) for v in output.values())
+        _types_hit   = [t for t, v in output.items() if v]
+        memory_metrics.record_manager_search(_latency_ms, _total_hits, _types_hit)
+
         return output
 
     # ── Save methods ──────────────────────────────────────────────────────────

@@ -6,7 +6,6 @@
 
 import asyncio
 import json
-import re
 from typing import List, Optional, cast
 
 from openai import AzureOpenAI
@@ -132,30 +131,21 @@ def calculate_offer(price_num: float, quantity: int, tiers: Optional[list] = Non
 
 # ── Detection helpers — all prompts from DB ───────────────────────────────────
 
-# Regex fast-path for is_negotiation_request(). Only ever short-circuits to
-# True (skip the LLM call entirely) — never to False. Anything not matched
-# here still goes through the LLM exactly as before, so this can only reduce
-# latency, never change behavior on ambiguous messages.
-_NEG_REQUEST_FAST_PATTERNS = [
-    r'\bcan (i|we) get (it |this )?for\b',
-    r'\b(how about|what about)\s+\d',
-    r'\b(do|make) it (for )?\d',
-    r'\bwill you (take|accept)\b',
-    r'\bmy (budget|price|offer) is\b',
-    r'\bfinal (budget|price|offer)\b',
-    r'\brs\.?\s*\d{2,}\b',
-    r'\b\d{2,}\s*(rs|rupees?|/-)?\s*(per unit|each)?\s*$',
-    r'\b(discount|reduce|lower|cheaper|less price|best price|lowest price|negotiate|negotiable|any offer|special price)\b',
-]
-_NEG_REQUEST_FAST_RE = re.compile("|".join(_NEG_REQUEST_FAST_PATTERNS), re.IGNORECASE)
-
-
 async def is_negotiation_request(message: str, incoming, session_history: Optional[list] = None) -> bool:
-    # Fast path: obvious negotiation language — skip the ~2s LLM round-trip.
-    if _NEG_REQUEST_FAST_RE.search(message or ""):
-        print(f"[NEGOTIATOR] is_negotiation_request: regex fast-path matched — skipping LLM")
-        return True
+    """
+    Pure LLM classification via neg_is_request_prompt — no regex fast-path.
+    This app is multi-tenant and multi-language; a hardcoded pattern list
+    would silently fail for any tenant whose customers phrase things
+    differently, with no fix available short of a code deploy.
 
+    In the normal flow this function is only reached as a FALLBACK — see
+    product_followup.py's is_negotiation_request field (from its unified
+    pf_data_extraction_prompt parse), which classifies this for free in the
+    same call that already parses the message. This function stays as the
+    correct, regex-free classification path for tenants whose DB prompt
+    hasn't been updated to include that field yet, and for any other
+    caller that needs a standalone answer to "is this a negotiation ask?".
+    """
     prompt = get_prompt(incoming, "neg_is_request_prompt")
     try:
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": prompt}]
@@ -203,6 +193,27 @@ async def extract_quantity(message: str, product_name: str, incoming, session_hi
 
 
 async def detect_quantity_change(message: str, current_qty: int, product_name: str, incoming) -> Optional[int]:
+    """
+    Returns the final new quantity (absolute int), or None if no change.
+
+    FIX: previously asked the LLM to return the already-computed final
+    quantity directly (e.g. "add 10 more units" with current_qty=2 → LLM
+    was expected to reply "12"). LLM arithmetic on this is NOT reliable —
+    confirmed in production: the same phrasing pattern ("add N more units")
+    sometimes correctly summed and sometimes returned N as if it were the
+    absolute total (2 → 10 instead of 2 → 12). Now the prompt returns a
+    JSON {"operation": "SET"|"ADD"|"REMOVE"|"NONE", "value": <raw number
+    mentioned, never pre-computed>} and the arithmetic happens here in
+    deterministic Python — removing LLM arithmetic reliability from the
+    equation entirely. Multi-tenant note: this only changes HOW the number
+    is computed, not the classification itself, which remains fully
+    DB-prompt-driven and tenant-configurable.
+
+    Backward compatible: if a tenant's neg_detect_qty_change_prompt hasn't
+    been updated to the new JSON schema yet, the response is a bare
+    integer or "NONE" (old schema) — falls back to treating that as an
+    already-final absolute quantity, exactly as before.
+    """
     prompt = get_prompt(
         incoming, "neg_detect_qty_change_prompt",
         current_qty=current_qty, product_name=product_name,
@@ -213,19 +224,48 @@ async def detect_quantity_change(message: str, current_qty: int, product_name: s
         ]
         r = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=10, temperature=0,
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=30, temperature=0,
                 messages=messages,
             )
         )
         content = r.choices[0].message.content
         if not content:
             return None
-        raw = content.strip().upper()
-        if raw == "NONE": return None
-        clean = raw.replace(",","").strip()
+        raw = content.strip()
+
+        # New schema: JSON {"operation": ..., "value": ...}
+        if raw.startswith("{"):
+            try:
+                parsed = json.loads(raw)
+                operation = str(parsed.get("operation", "NONE")).upper()
+                value     = parsed.get("value")
+                if operation == "NONE" or value is None:
+                    return None
+                value = int(value)
+                if operation == "ADD":
+                    result = current_qty + value
+                elif operation == "REMOVE":
+                    result = max(1, current_qty - value)
+                elif operation == "SET":
+                    result = value
+                else:
+                    return None
+                if result != current_qty:
+                    print(f"[NEGOTIATOR] Qty change ({operation}): {current_qty}→{result}")
+                return result
+            except (ValueError, TypeError, json.JSONDecodeError):
+                return None
+
+        # Old schema fallback: bare integer or "NONE" (tenant hasn't
+        # updated neg_detect_qty_change_prompt yet) — treat as already the
+        # final absolute quantity, exactly as this function always did.
+        raw_upper = raw.upper()
+        if raw_upper == "NONE":
+            return None
+        clean = raw_upper.replace(",", "").strip()
         result = int(clean) if clean.isdigit() else None
         if result and result != current_qty:
-            print(f"[NEGOTIATOR] Qty change: {current_qty}→{result}")
+            print(f"[NEGOTIATOR] Qty change (legacy schema): {current_qty}→{result}")
         return result
     except RuntimeError: raise
     except Exception as e:
@@ -629,6 +669,14 @@ async def extract_negotiation_intent(
             except (ValueError, TypeError):
                 pass
 
+        # Operation field (SET/ADD/REMOVE) — see neg_extract_negotiation_intent_prompt
+        # migration 017. Defaults to "SET" when absent so tenants on the
+        # older prompt schema (which didn't distinguish SET from ADD) get
+        # EXACTLY their previous behavior: quantity_change.value was always
+        # treated as the final absolute quantity.
+        _qc_field = parsed.get("quantity_change", {})
+        qty_operation = str(_qc_field.get("operation", "SET")).upper() if isinstance(_qc_field, dict) else "SET"
+
         raw_counter = _val("counter_offer")
         counter_offer_val = None
         if raw_counter is not None and str(raw_counter).strip() != "":
@@ -641,7 +689,7 @@ async def extract_negotiation_intent(
             "intent":          intent,
             "matched_phrase":  matched_phrase,
             "accepted":        {"value": bool(_val("accepted") or False),           "confidence": _conf("accepted")},
-            "quantity_change": {"value": qty_change_val,                            "confidence": _conf("quantity_change")},
+            "quantity_change": {"value": qty_change_val, "operation": qty_operation, "confidence": _conf("quantity_change")},
             "counter_offer":   {"value": counter_offer_val,                         "confidence": _conf("counter_offer")},
             "more_discount":   {"value": bool(_val("more_discount") or False),       "confidence": _conf("more_discount")},
         }
@@ -768,6 +816,7 @@ async def handle_negotiation(
         _primary = _intent.get("intent", "NONE")
         _accepted_val  = (_intent.get("accepted",        {}) or {}).get("value", False)
         _qty_val       = (_intent.get("quantity_change", {}) or {}).get("value")
+        _qty_operation = (_intent.get("quantity_change", {}) or {}).get("operation", "SET")
         _counter_val   = (_intent.get("counter_offer",   {}) or {}).get("value")
         _disc_val      = (_intent.get("more_discount",   {}) or {}).get("value", False)
 
@@ -783,8 +832,20 @@ async def handle_negotiation(
                     "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
         # PRECEDENCE 2: Quantity change — update qty, ignore price signals
-        if _primary == "QTY_CHANGE" and _qty_val and _qty_val != quantity:
-            new_qty = _qty_val
+        # FIX: the LLM's quantity_change.value is the RAW number the customer
+        # said (e.g. "10" from "add 10 more units") — never a pre-computed
+        # total. The arithmetic happens here, deterministically, based on
+        # operation. Previously new_qty = _qty_val directly, which silently
+        # treated every phrasing as SET — "add 10 more units" at qty=2
+        # became qty=10 instead of qty=12.
+        if _primary == "QTY_CHANGE" and _qty_val:
+            if _qty_operation == "ADD":
+                _computed_qty = quantity + _qty_val
+            elif _qty_operation == "REMOVE":
+                _computed_qty = max(1, quantity - _qty_val)
+            else:  # SET, or unrecognized operation — safest default
+                _computed_qty = _qty_val
+            new_qty = _computed_qty if _computed_qty != quantity else None
         else:
             new_qty = None
 
@@ -818,30 +879,21 @@ async def handle_negotiation(
     #
     # This rule is implemented by checking `if accepted: return` BEFORE
     # processing new_qty, so new_qty is discarded when accepted=True.
-        import re as _re
-        _price_patterns = [
-            r'\bcan (i|we) get (it )?for\b',
-            r'\bhow about\b',
-            r'\bwhat about\b',
-            r'\bcan we move (with|to|at)\b',
-            r'\bmy (budget|price|offer) is\b',
-            r'\bfinal (budget|price|offer)\b',
-            r'\bcan you (do|offer|give)\b',
-            r'\bwill you (take|accept)\b',
-            r'\bprice.*\brs\.?\s*\d\b',
-            r'\brs\.?\s*\d+.*\bper unit\b',
-        ]
-        _is_price_msg = any(_re.search(p, msg.lower()) for p in _price_patterns)
-
-        # Run acceptance and qty change in parallel — saves ~1.5s vs sequential
-        if _is_price_msg:
-            accepted = await detect_acceptance(msg, incoming, session_history)
-            new_qty  = None
-        else:
-            accepted, new_qty = await asyncio.gather(
-                detect_acceptance(msg, incoming, session_history),
-                detect_quantity_change(msg, quantity, product_name, incoming),
-            )
+        # This rule is implemented by checking `if accepted: return` BEFORE
+        # processing new_qty, so new_qty is discarded when accepted=True.
+        #
+        # NOTE: previously had a regex pre-check here to decide whether to
+        # run detect_quantity_change in parallel or skip it for price-offer
+        # messages. Removed — multi-tenant/multi-language platform, no
+        # hardcoded English patterns. Running both checks in parallel
+        # unconditionally costs nothing in wall-clock time (they're
+        # gathered together) and this whole block is itself only reached
+        # as a fallback when extract_negotiation_intent's structured call
+        # already failed, so it's rare in practice.
+        accepted, new_qty = await asyncio.gather(
+            detect_acceptance(msg, incoming, session_history),
+            detect_quantity_change(msg, quantity, product_name, incoming),
+        )
 
         # Precedence: acceptance always wins — handle it before qty change
         if accepted:

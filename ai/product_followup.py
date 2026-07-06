@@ -69,7 +69,24 @@ def normalize_parsed(parsed: dict) -> dict:
     normalized["selected_product_name"] = (
         parsed.get("selected_product_name") or parsed.get("product_name")
     )
+    # Tri-state (True/False/None) — these two fields are part of the
+    # consolidated classifier schema (collapsing what used to be 3 separate
+    # LLM calls into this one parse). None means the tenant's
+    # pf_data_extraction_prompt hasn't been updated to include them yet;
+    # callers must treat None as "unknown", not "False" — see the fallback
+    # logic in _try_resolve_product_followup and ai/memory_policy.py.
+    normalized["is_negotiation_request"]  = parsed.get("is_negotiation_request")
+    normalized["needs_long_term_memory"]  = parsed.get("needs_long_term_memory")
     return normalized
+
+
+# Mem0 retrieval gating now lives in ai/memory_policy.py (MemoryPolicy) —
+# a single reusable decision point shared by this file, negotiator.py,
+# graphrag_handler.py, and any future agent module, instead of each
+# reimplementing its own heuristic. See that module for the full rationale
+# and its documented limitations/extension path.
+from ai.memory_policy import MemoryPolicy, MemoryRequest
+from ai import perf_metrics
 
 
 async def _parse_followup_message(incoming, selection: list, session_history: Optional[list] = None) -> dict:
@@ -126,7 +143,9 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
             "is_recommendation": False,
             "is_offer_inquiry": False,
             "asks_for_image": False,
-            "is_new_search": False
+            "is_new_search": False,
+            "is_negotiation_request": None,
+            "needs_long_term_memory": None,
         })
 
 
@@ -399,71 +418,42 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
-    # ── PRICE NEGOTIATION GUARD (runs BEFORE offer inquiry check) ───────────
-    # Bug fix: "can I get it for 1000", "give me at 1800", "my budget is 1500"
-    # were being classified as offer inquiries because the offer-inquiry check
-    # ran first. A customer proposing a specific price is ALWAYS negotiation,
-    # never an offer inquiry. This guard short-circuits before the LLM check.
-    # Uses top-level 'import re' — no local import needed.
-    _price_negotiation_patterns = [
-        r'\bcan (i|we) get (it )?for\b',
-        r'\bgive (it|me|us) (at|for)\b',
-        r'\bmy (budget|price|offer) is\b',
-        r'\bi(ll| will) (take|pay|give)\b',
-        r'\b(do|make) it (for )?\d',
-        r'\b(how about|what about) \d',
-        r'\brs\.?\s*\d{3,}\b',          # "Rs.1000", "rs 1800"
-        r'\b\d{3,}\s*(rs|rupees?|/-)?\s*(per unit|each)?\s*$',  # "1000 per unit"
-    ]
-    _is_price_negotiation_msg = any(
-        re.search(p, incoming.text.lower())
-        for p in _price_negotiation_patterns
-    )
-    if _is_price_negotiation_msg:
-        print(f"[PRICE GUARD] Detected price offer in: '{incoming.text}' — skipping offer inquiry check")
-
-    # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
-    # Runs BEFORE parse and is_negotiation_request.
-    # "Currently is there any offers?" / "is there any offers?" →
-    # is_negotiation_request returns True (sees "offers" as discount).
-    # This focused YES/NO check catches it first and blocks the negotiation path.
-    # SKIPPED when a price negotiation pattern was detected above.
+    # ── Negotiation vs. offer-inquiry disambiguation ─────────────────────────
+    # FIX: previously used hardcoded English regex patterns ("Rs.", "budget
+    # is", "can i get...for", etc.) to detect price offers before the offer-
+    # inquiry check ran. That's incompatible with a multi-tenant platform —
+    # a tenant selling in Tamil, or a different domain's phrasing entirely,
+    # would silently defeat every one of those patterns with no way to fix
+    # it short of a code change. Removed entirely. The disambiguation now
+    # comes from the SAME unified LLM parse below (pf_data_extraction_prompt),
+    # which is tenant-configurable DB content like every other prompt in
+    # this app — a tenant can improve its disambiguation by editing their
+    # prompt, never by waiting on a deploy.
     _is_offer_inq = False
-    try:
-        _oiq = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
-                messages=[
-                    {"role": "system", "content": get_prompt(incoming, "pf_offer_inquiry_check_prompt")},
-                    {"role": "user", "content": incoming.text},
-                ],
-            )
-        )
-        _content = _oiq.choices[0].message.content
-        # Skip offer inquiry if a price pattern was already detected
-        if _content and "YES" in _content.strip().upper() and not _is_price_negotiation_msg:
-            _is_offer_inq = True
-            print(f"[OFFER INQUIRY] Pre-check YES: '{incoming.text}'")
-        elif _content and "YES" in _content.strip().upper() and _is_price_negotiation_msg:
-            print(f"[OFFER INQUIRY] Suppressed — price negotiation takes precedence")
-    except Exception as _oiqe:
-        print(f"[OFFER INQUIRY] Pre-check failed: {_oiqe}")
 
-    # ── Always parse the follow-up BEFORE the negotiation check ─────────────
+    # ── Parse the follow-up (single consolidated LLM call) ──────────────────
     _t_parse_early = time.monotonic()
     quick_parsed = await _parse_followup_message(incoming, selection, session_history)
-    print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
+    _parse_latency_ms = (time.monotonic() - _t_parse_early) * 1000
+    print(f"[TIMING] early _parse_followup_message: {_parse_latency_ms/1000:.2f}s")
+    perf_metrics.record("pf_data_extraction_prompt", _parse_latency_ms, tenant_id=incoming.tenant_id)
 
-    # Merge pre-check with parser — a specific price offer is NEVER an offer
-    # inquiry, no matter what either classifier says. Without this guard,
-    # pf_data_extraction_prompt (called inside _parse_followup_message) can
-    # independently flag is_offer_inquiry=True for messages like "can I get
-    # this for 1000", silently overriding the price guard below and routing
-    # the customer to the store-offers reply instead of the negotiator.
-    _is_offer_inq = (_is_offer_inq or quick_parsed.get("is_offer_inquiry", False)) and not _is_price_negotiation_msg
-    if _is_price_negotiation_msg and quick_parsed.get("is_offer_inquiry", False):
-        print(f"[OFFER INQUIRY] Suppressed via quick_parsed — price negotiation takes precedence")
+    # pf_data_extraction_prompt's schema includes is_negotiation_request
+    # directly — this replaces what used to be a SEPARATE is_negotiation_request()
+    # LLM call plus a regex pre-filter, collapsing them into the one parse
+    # call above. Tri-state on purpose: None means the tenant's DB prompt
+    # hasn't been updated to include this field yet, in which case we fall
+    # back to the standalone (still regex-free, still tenant-configurable)
+    # is_negotiation_request() LLM call rather than silently guessing wrong.
+    _is_neg_req_field = quick_parsed.get("is_negotiation_request")
+
+    # Negotiation always wins over offer-inquiry classification — a specific
+    # price offer is never an "offer inquiry". Only overridden when the
+    # unified field explicitly says True (tri-state None/False don't override).
+    _is_offer_inq = quick_parsed.get("is_offer_inquiry", False)
+    if _is_neg_req_field is True and _is_offer_inq:
+        print(f"[OFFER INQUIRY] Suppressed — unified parse flagged is_negotiation_request=True")
+        _is_offer_inq = False
 
     # is_comparison/recommendation/offer_inquiry = never a price negotiation.
     if (quick_parsed.get("is_comparison", False)
@@ -511,9 +501,16 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                     neg_state = None
 
-    _t_neg_check_start = time.monotonic()
-    _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, incoming, session_history)
-    print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
+    if _is_neg_req_field is not None:
+        _is_neg_req = _is_neg_req_field
+        print(f"[TIMING] is_negotiation_request: 0.00s (from unified parse)")
+    else:
+        _t_neg_check_start = time.monotonic()
+        _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, incoming, session_history)
+        _neg_req_latency_ms = (time.monotonic() - _t_neg_check_start) * 1000
+        print(f"[TIMING] is_negotiation_request: {_neg_req_latency_ms/1000:.2f}s "
+              f"(fallback call — add is_negotiation_request to pf_data_extraction_prompt to remove this)")
+        perf_metrics.record("neg_is_request_prompt_fallback", _neg_req_latency_ms, tenant_id=incoming.tenant_id)
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
         # 1. Active negotiation state (already has product_name)
@@ -850,34 +847,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Customers must now select products by NAME only.
     is_comparison     = parsed.get("is_comparison", False)
     is_recommendation = parsed.get("is_recommendation", False)
-    is_offer_inquiry  = (_is_offer_inq or parsed.get("is_offer_inquiry", False)) and not _is_price_negotiation_msg
+    # Trust the unified parse's own is_offer_inquiry directly. A second
+    # "layer-2" LLM call used to run here on almost every turn regardless
+    # of the first result — removed. If a tenant's disambiguation needs
+    # improving, that's a DB prompt edit (pf_data_extraction_prompt), not
+    # an extra LLM round-trip baked into the code for every tenant.
+    is_offer_inquiry  = _is_offer_inq or parsed.get("is_offer_inquiry", False)
     asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
-
-    # ── Case 0: Offer inquiry ─────────────────────────────────────────────────
-    # Two-layer detection — layer 2 specifically handles "offers for [product name]"
-    # which layer 1 sometimes misses due to product context.
-    if not is_offer_inquiry:
-        try:
-            _oi = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: _client.chat.completions.create(
-                    model       = AZURE_OPENAI_DEPLOYMENT,
-                    max_tokens  = 5,
-                    temperature = 0,
-                    messages    = [
-                        {"role": "system", "content": get_prompt(incoming, "pf_offer_inquiry_check_l2_prompt", customer_message=incoming.text)},
-                        {"role": "user", "content": incoming.text},
-                    ],
-                )
-            )
-            content = _oi.choices[0].message.content
-            if content and "YES" in content.strip().upper():
-                is_offer_inquiry = True
-                print(f"[OFFER INQUIRY] Detected via layer-2: '{incoming.text}'")
-        except Exception as _e:
-            print(f"[OFFER INQUIRY] Layer-2 check failed: {_e}")
 
     if is_offer_inquiry:
         _offers_text = None
@@ -1408,7 +1386,17 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     if not product_name:
         return None
     
-    # Save as the last discussed product in the database so context is retained
+    # Save as the last discussed product in the database so context is retained.
+    # Check the PREVIOUS value first so we only write a fresh Mem0 memory when
+    # the product actually changed — previously this fired on every follow-up
+    # turn ("brief", "installation guide", "offers", "order") even when it was
+    # the same product each time, creating a duplicate memory per turn.
+    try:
+        _previous_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+    except Exception:
+        _previous_product = None
+    _product_changed = (_previous_product or "").strip().lower() != (product_name or "").strip().lower()
+
     try:
         await save_last_discussed_product(incoming.tenant_id, incoming.session_id, product_name)
     except Exception as e:
@@ -1420,7 +1408,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # not after invoice. This makes "is it waterproof?" work even if
     # workflow expires or customer comes back tomorrow.
     # Fire-and-forget so it never blocks the response path.
-    if cached_product:
+    # Only when the product actually changed — see _product_changed above.
+    if cached_product and _product_changed:
         asyncio.create_task(_save_product_to_mem0(
             tenant_id  = incoming.tenant_id,
             session_id = incoming.session_id,
@@ -1609,54 +1598,67 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
     recent_history = session_history[-6:] if session_history else []
 
-    # Bug 2 fix: retrieve Mem0 context before the main LLM call.
-    # Injects product_context, customer_preferences, negotiation_profile
-    # from semantic memory so the LLM has full customer history.
+    # Bug 2 fix: retrieve Mem0 context before the main LLM call — but ONLY
+    # when the message plausibly needs long-term/cross-session memory.
+    # PostgreSQL/workflow_sessions already covers current product, current
+    # negotiation, pending order, and conversation history — Mem0 added
+    # nothing for "is it waterproof?", "add 3 units", "compare 2 and 3", etc,
+    # and every one of those calls was pure overhead (a network round-trip
+    # with no payoff). See ai/memory_policy.py's MemoryPolicy for the gate.
     _mem0_ctx: dict = {"product_context": "", "customer_preferences": "",
                        "negotiation_profile": "", "workflow_context": ""}
-    try:
-        import time as _time_mem0
-        from db.memory_store import get_relevant_context as _grc
-        _mem_query    = product_name or incoming.text
-        _mem_t0       = _time_mem0.monotonic()
-        _mem_results  = await _grc(
-            tenant_id  = incoming.tenant_id,
-            session_id = incoming.session_id,
-            query      = _mem_query,
-            limit      = 5,
-        )
-        _mem_latency_ms = round((_time_mem0.monotonic() - _mem_t0) * 1000)
+    # Workflow proxy: this point in the function is only reached after all
+    # negotiation branches have already returned, so "ORDERING" (a quantity
+    # was just parsed) vs "BROWSING" (plain product Q&A) covers what's left.
+    _mem_ctx = MemoryRequest(
+        text                    = incoming.text,
+        workflow                = "ORDERING" if parsed_qty is not None else "BROWSING",
+        tenant_id               = incoming.tenant_id,
+        session_id              = incoming.session_id,
+        current_product         = product_name,
+        negotiation_active      = False,  # negotiation branches already returned before this point
+        needs_long_term_memory  = parsed.get("needs_long_term_memory"),
+    )
+    _mem_decision = MemoryPolicy.evaluate(_mem_ctx)
+    if _mem_decision.retrieve:
+        try:
+            import time as _time_mem0
+            from ai.memory_manager import MemoryManager
+            _mem_query = product_name or incoming.text
+            _mem_t0    = _time_mem0.monotonic()
+            _mm        = MemoryManager(incoming.tenant_id, incoming.session_id)
+            _mem_by_type = await _mm.search(
+                _mem_decision.types, query=_mem_query, max_results=_mem_decision.max_results,
+            )
+            _mem_latency_ms = round((_time_mem0.monotonic() - _mem_t0) * 1000)
+            _total_hits = sum(len(v) for v in _mem_by_type.values())
 
-        # Build context strings from retrieved memories
-        _product_mems = [m for m in _mem_results if "PRODUCT_CONTEXT" in m.get("content","")]
-        _pref_mems    = [m for m in _mem_results if "CUSTOMER_PREF"   in m.get("content","")]
-        _neg_mems     = [m for m in _mem_results if "NEG_OUTCOME"     in m.get("content","")]
-        _conv_mems    = [m for m in _mem_results
-                         if not any(k in m.get("content","")
-                                    for k in ["PRODUCT_CONTEXT","CUSTOMER_PREF","NEG_OUTCOME"])]
+            # MemoryManager.search() returns {memory_type: [ranked memories]},
+            # already deduped/ranked/expiry-filtered — no more string-matching
+            # markers like "PRODUCT_CONTEXT:" across an undifferentiated list.
+            _product_mems = _mem_by_type.get("product_context", [])
+            _pref_mems    = _mem_by_type.get("customer_preference", [])
+            _neg_mems     = _mem_by_type.get("negotiation_outcome", [])
 
-        if _product_mems:
-            _mem0_ctx["product_context"]      = _product_mems[0]["content"][:200]
-        if _pref_mems:
-            _mem0_ctx["customer_preferences"] = "; ".join(m["content"] for m in _pref_mems)[:200]
-        if _neg_mems:
-            _mem0_ctx["negotiation_profile"]  = _neg_mems[0]["content"][:150]
+            if _product_mems:
+                _mem0_ctx["product_context"]      = _product_mems[0].get("memory", "")[:200]
+            if _pref_mems:
+                _mem0_ctx["customer_preferences"] = "; ".join(m.get("memory", "") for m in _pref_mems)[:200]
+            if _neg_mems:
+                _mem0_ctx["negotiation_profile"]  = _neg_mems[0].get("memory", "")[:150]
 
-        # Rich logging: query + latency + per-type (score, content preview)
-        print(f"[MEM0] Query='{_mem_query[:40]}' search_time={_mem_latency_ms}ms "
-              f"results={len(_mem_results)}")
-        for _m in _mem_results:
-            _txt   = _m.get("content", "")
-            _score = round(float(_m.get("score", 0) or 0), 2)
-            if "PRODUCT_CONTEXT" in _txt:   _mtype = "product_context"
-            elif "CUSTOMER_PREF" in _txt:   _mtype = "preference"
-            elif "NEG_OUTCOME"   in _txt:   _mtype = "neg_profile"
-            else:                            _mtype = "conversation"
-            _preview = _txt[:60].replace("\n"," ")
-            print(f"  [{_mtype}] score={_score}  '{_preview}...'")
+            print(f"[MEM0] Query='{_mem_query[:40]}' reason={_mem_decision.reason} "
+                  f"types={_mem_decision.types} search_time={_mem_latency_ms}ms results={_total_hits}")
+            for _mtype, _mems in _mem_by_type.items():
+                for _m in _mems:
+                    _score   = round(float(_m.get("score", 0) or 0), 2)
+                    _preview = str(_m.get("memory", ""))[:60].replace("\n", " ")
+                    print(f"  [{_mtype}] score={_score}  '{_preview}...'")
 
-    except Exception as _me:
-        print(f"[MEM0] Retrieval failed (non-critical): {_me}")
+        except Exception as _me:
+            print(f"[MEM0] Retrieval failed (non-critical): {_me}")
+    else:
+        print(f"[MEM0] Skipped (reason={_mem_decision.reason}): '{incoming.text[:50]}'")
 
     try:
         _t_final_start = time.monotonic()
@@ -1677,7 +1679,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         if not content:
             raise ValueError("Empty or None response content")
         reply = content.strip()
-        print(f"[TIMING] Final answer LLM call: {time.monotonic() - _t_final_start:.2f}s")
+        _final_latency_ms = (time.monotonic() - _t_final_start) * 1000
+        print(f"[TIMING] Final answer LLM call: {_final_latency_ms/1000:.2f}s")
+        perf_metrics.record("pf_main_followup_prompt", _final_latency_ms, tenant_id=incoming.tenant_id,
+                             workflow="ORDERING" if parsed_qty is not None else "BROWSING")
         print(f"[FOLLOW-UP] LLM answered for product '{product_name}'")
 
         incoming._graphrag_raw = json.dumps({
