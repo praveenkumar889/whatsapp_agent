@@ -30,6 +30,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import Optional
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 
@@ -44,20 +46,28 @@ from pipeline.setup import setup_pipeline
 from pipeline.router import dispatch
 from messaging import send_reply
 
-app = FastAPI(title="WhatsApp AI Agent")
-
 # ── Concurrency guard — max 50 simultaneous pipeline runs ─────────────────────
 _pipeline_semaphore = asyncio.Semaphore(50)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STARTUP
+# LIFESPAN (replaces deprecated @app.on_event)
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(_periodic_lock_cleanup())
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ── Startup ──────────────────────────────────────────────────────────────
+    cleanup_task = asyncio.create_task(_periodic_lock_cleanup())
     print("[STARTUP] Periodic lock cleanup task started")
+
+    yield  # Application runs here
+
+    # ── Shutdown ─────────────────────────────────────────────────────────────
+    cleanup_task.cancel()
+    print("[SHUTDOWN] Periodic lock cleanup task cancelled")
+
+
+app = FastAPI(title="WhatsApp AI Agent", lifespan=lifespan)
 
 
 async def _periodic_lock_cleanup():
