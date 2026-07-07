@@ -425,6 +425,7 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             mcp_res = await query_mcp_catalog(
                 query=graphrag_text,
                 session_id=incoming.session_id,
+                tenant_id=incoming.tenant_id,
                 server_url=mcp_url
             )
             if mcp_res and mcp_res.get("status") == "success":

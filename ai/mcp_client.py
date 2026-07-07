@@ -15,7 +15,8 @@ logger = logging.getLogger(__name__)
 async def query_mcp_catalog(
     query: str,
     session_id: Optional[str] = None,
-    limit: int = 6,
+    tenant_id: Optional[str] = None,
+    limit: int = 15,
     server_url: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
@@ -31,17 +32,17 @@ async def query_mcp_catalog(
     Returns None if connection or tool call fails, allowing seamless fallback to REST API.
     """
     url = server_url or MCP_SERVER_URL
-    print(f"[MCP-CLIENT] Connecting to MCP server at {url} for query: '{query[:50]}'")
+    print(f"[MCP-CLIENT] Connecting to MCP server at {url} for query: '{query[:50]}' (tenant_id: {tenant_id})")
     try:
         async with Client(url) as client:
-            res = await client.call_tool(
-                "search_catalog",
-                {
-                    "query": query,
-                    "limit": limit,
-                    "session_id": session_id
-                }
-            )
+            tool_args = {
+                "query": query,
+                "limit": limit,
+                "session_id": session_id
+            }
+            if tenant_id:
+                tool_args["tenant_id"] = tenant_id
+            res = await client.call_tool("search_catalog", tool_args)
             # res.data contains the tool return value (dict) when calling via FastMCP
             data = getattr(res, "data", None)
             if data is not None and isinstance(data, dict):
@@ -69,16 +70,20 @@ query_inventaa_catalog = query_mcp_catalog
 
 async def get_product_details_mcp(
     sku: str,
+    tenant_id: Optional[str] = None,
     server_url: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Calls the `get_product_details` tool on the FastMCP server by SKU.
     """
     url = server_url or MCP_SERVER_URL
-    print(f"[MCP-CLIENT] Requesting product details for SKU '{sku}' via MCP ({url})")
+    print(f"[MCP-CLIENT] Requesting product details for SKU '{sku}' via MCP ({url}) (tenant_id: {tenant_id})")
     try:
         async with Client(url) as client:
-            res = await client.call_tool("get_product_details", {"sku": sku})
+            tool_args = {"sku": sku}
+            if tenant_id:
+                tool_args["tenant_id"] = tenant_id
+            res = await client.call_tool("get_product_details", tool_args)
             data = getattr(res, "data", None)
             if data is not None and isinstance(data, dict):
                 return data

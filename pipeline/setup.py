@@ -42,8 +42,9 @@ PROMPT_COLUMNS = [
     "invoice_confirmation_request_check_prompt",
     "fast_order_confirm_check_prompt",
     "category_matcher_prompt",
-    "pf_data_extraction_pro mpt",
+    "pf_data_extraction_prompt",
     "pf_history_resolver_prompt",
+
     "pf_offer_inquiry_check_prompt",
     "pf_neg_product_change_check_prompt",
     "pf_vague_reference_check_prompt",
