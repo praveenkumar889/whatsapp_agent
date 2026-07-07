@@ -1,25 +1,5 @@
 import os
 # main.py — FastAPI Application Entry Point
-#
-# ARCHITECTURE:
-#   This file is the ORCHESTRATOR only — no business logic lives here.
-#   All logic is in specialist modules:
-#
-#   pipeline/setup.py      → tenant resolve, dedup, lock, history, save
-#   pipeline/router.py     → neg guard, invoice guard, intent dispatch
-#   ai/intent_router.py    → LLM intent classification
-#   db/session_store.py    → all Supabase DB operations
-#   db/memory_store.py     → Mem0 context + workflow state
-#
-# PIPELINE (8 steps):
-#   1. Parse webhook        → IncomingMessage
-#   2. Setup pipeline       → tenant, dedup, lock, history, save
-#   3. Classify intent      → LLM classification
-#   4. Update intent in DB  → audit
-#   5. Dispatch             → neg guard → invoice guard → intent routing
-#   6. Send reply           → WhatsApp / mock channel
-#   7. Store reply          → Mem0 turn + DB audit
-#   8. Return debug info
 
 import asyncio
 import hashlib
@@ -45,24 +25,16 @@ from db.memory_store import add_conversation_turn
 from pipeline.setup import setup_pipeline
 from pipeline.router import dispatch
 from messaging import send_reply
+from utils.alerting import alert_pipeline_error
 
-# ── Concurrency guard — max 50 simultaneous pipeline runs ─────────────────────
 _pipeline_semaphore = asyncio.Semaphore(50)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# LIFESPAN (replaces deprecated @app.on_event)
-# ══════════════════════════════════════════════════════════════════════════════
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # ── Startup ──────────────────────────────────────────────────────────────
     cleanup_task = asyncio.create_task(_periodic_lock_cleanup())
     print("[STARTUP] Periodic lock cleanup task started")
-
-    yield  # Application runs here
-
-    # ── Shutdown ─────────────────────────────────────────────────────────────
+    yield
     cleanup_task.cancel()
     print("[SHUTDOWN] Periodic lock cleanup task cancelled")
 
@@ -81,13 +53,8 @@ async def _periodic_lock_cleanup():
             print(f"[CLEANUP] {e}")
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# ENDPOINTS
-# ══════════════════════════════════════════════════════════════════════════════
-
 @app.get("/webhook")
 async def verify_webhook(request: Request):
-    """Meta webhook verification — runs once during setup."""
     params    = dict(request.query_params)
     mode      = params.get("hub.mode")
     token     = params.get("hub.verify_token")
@@ -100,10 +67,6 @@ async def verify_webhook(request: Request):
 
 @app.post("/webhook")
 async def receive_message(request: Request):
-    """
-    Receives WhatsApp messages from Meta.
-    Returns HTTP 200 immediately, processes in background.
-    """
     if WEBHOOK_SECRET:
         sig_header = request.headers.get("X-Hub-Signature-256", "")
         body_bytes = await request.body()
@@ -120,10 +83,18 @@ async def receive_message(request: Request):
         data = await request.json()
 
     async def _guarded():
-        async with _pipeline_semaphore:
-            incoming = await parse_webhook(data)
-            if incoming:
-                await run_pipeline(incoming)
+        try:
+            async with _pipeline_semaphore:
+                incoming = await parse_webhook(data)
+                if incoming:
+                    await run_pipeline(incoming)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                await alert_pipeline_error(e, locals().get("incoming"))
+            except Exception:
+                pass
 
     asyncio.create_task(_guarded())
     return JSONResponse(content={"status": "ok"})
@@ -134,11 +105,17 @@ async def chat_endpoint(payload: dict):
     """Streamlit/web testing interface — constructs IncomingMessage directly."""
     phone           = payload.get("phone")
     message         = payload.get("message")
-    phone_number_id = payload.get("phone_number_id", os.getenv("DEFAULT_PHONE_NUMBER_ID", "1124766240726230"))
+    phone_number_id = payload.get("phone_number_id") or os.getenv("DEFAULT_PHONE_NUMBER_ID")
     sender_name     = payload.get("sender_name", "Test User")
 
     if not phone or not message:
         return JSONResponse(content={"error": "phone and message are required"}, status_code=400)
+    if not phone_number_id:
+        return JSONResponse(
+            content={"error": "phone_number_id not provided and DEFAULT_PHONE_NUMBER_ID not set in .env — "
+                               "refusing to guess a tenant's phone_number_id"},
+            status_code=400,
+        )
 
     incoming = IncomingMessage(
         trace_id        = f"trace_web_{uuid.uuid4().hex[:8]}",
@@ -149,8 +126,8 @@ async def chat_endpoint(payload: dict):
         tenant_id       = "UNRESOLVED",
         waba_id         = "web_waba",
         phone_number_id = phone_number_id,
-        biz_name        = os.getenv("DEFAULT_BIZ_NAME",           "Web Business"),
-        region          = "india",
+        biz_name        = os.getenv("DEFAULT_BIZ_NAME", "Business"),  # neutral — overwritten by tenant resolution
+        region          = "unresolved",  # overwritten by tenant resolution in setup.py
         timezone        = os.getenv("DEFAULT_TIMEZONE",           "Asia/Kolkata"),
         language        = "en",
         sender_name     = sender_name,
@@ -165,10 +142,12 @@ async def chat_endpoint(payload: dict):
         return await run_pipeline(incoming)
     except Exception as e:
         import traceback
-        traceback.print_exc()
+        traceback.print_exc()  # full detail stays server-side only
         return JSONResponse(
             content={
-                "replies": [{"type": "text", "body": f"⚠️ Pipeline error: {str(e)}"}],
+                "replies": [{"type": "text", "body":
+                    "Sorry, something went wrong on our end. Please try again in a moment, "
+                    "or contact support if this keeps happening."}],
                 "debug": {"intent": "ERROR", "confidence": 0.0,
                           "latency": 0.0, "route": "Error Handler", "tenant_id": "None"},
             },
@@ -180,10 +159,19 @@ async def chat_endpoint(payload: dict):
 async def reset_endpoint(payload: dict):
     """Clears all session data for a phone number — dev/testing use."""
     phone     = payload.get("phone")
-    tenant_id = payload.get("tenant_id", os.getenv("DEFAULT_TENANT_ID",        "tenant_inventaa_led_001"))
+    tenant_id = payload.get("tenant_id") or os.getenv("DEFAULT_TENANT_ID")
 
     if not phone:
         return JSONResponse(content={"error": "phone is required"}, status_code=400)
+    if not tenant_id:
+        # SAFETY: this endpoint deletes data. Never guess a real tenant_id —
+        # require it explicitly (or DEFAULT_TENANT_ID set in .env for local
+        # dev convenience only).
+        return JSONResponse(
+            content={"error": "tenant_id is required (or set DEFAULT_TENANT_ID in .env for local dev) — "
+                               "refusing to guess which tenant's data to delete"},
+            status_code=400,
+        )
 
     try:
         from db.session_store import _get_client
@@ -198,35 +186,42 @@ async def reset_endpoint(payload: dict):
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# CORE PIPELINE
-# ══════════════════════════════════════════════════════════════════════════════
+def _get_safe_error_reply(incoming: IncomingMessage) -> str:
+    sender_name = getattr(incoming, "sender_name", None) or "there"
+    try:
+        from db.prompt_store import get_prompt
+        return get_prompt(
+            incoming, "pipeline_error_reply",
+            sender_name = sender_name,
+            biz_name    = getattr(incoming, "biz_name", None) or "our team",
+        )
+    except Exception:
+        return (
+            f"Sorry {sender_name}, something went wrong on our end. 🙏 "
+            f"Our team has been notified and is looking into it. "
+            f"Please try again in a few minutes."
+        )
+
 
 async def run_pipeline(incoming: IncomingMessage) -> dict:
-    """
-    Core 8-step pipeline. Lightweight orchestrator — no business logic here.
-    All logic lives in pipeline/setup.py, pipeline/router.py, and ai/ modules.
-    """
     _t0 = time.monotonic()
-
-    # ── Steps 1-5: Setup (tenant, dedup, lock, history, save) ───────────────
-    ok, session_history = await setup_pipeline(incoming)
-    if not ok:
-        return _empty_result()
+    _lock_owned_by_this_request = False
 
     try:
-        # ── Step 2.5: Load negotiation state ONCE, cache on incoming ────────
-        # FIX: Previously loaded 3-4x per request across _neg_guard,
-        # _invoice_guard, _resume_negotiation, and product_followup.
-        # Now loaded once here — all downstream reads use incoming._cached_neg_state.
+        ok, session_history = await setup_pipeline(incoming)
+        if not ok:
+            # setup_pipeline() guarantees: a (False, ...) return means this
+            # request never held the lock (unknown tenant, duplicate message,
+            # or another worker already holds it) — nothing to release.
+            return _empty_result()
+        # setup_pipeline() succeeded: this request now genuinely owns the
+        # processing lock and is responsible for releasing it below.
+        _lock_owned_by_this_request = True
+
         from db.session_store import get_negotiation_state as _gns
         incoming._cached_neg_state = await _gns(incoming.tenant_id, incoming.session_id)
         _neg = incoming._cached_neg_state
 
-        # ── Step 3: Classify intent — with NEG BYPASS ───────────────────────
-        # FIX: During active negotiation the intent classifier oscillates between
-        # FAQ_KNOWLEDGE and WORKFLOW_ACTION wasting 2.5-3s per message.
-        # Bypass saves that time and keeps intent consistent.
         _t_intent = time.monotonic()
         _in_active_neg = (
             _neg is not None
@@ -249,16 +244,12 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         print(f"[TIMING] classify_intent: {time.monotonic() - _t_intent:.2f}s")
         print(f"[INTENT]   {result.intent}  confidence={result.confidence_score}")
 
-        # ── Step 4: Update intent in DB ──────────────────────────────────────
         await update_intent(incoming.message_id, result.intent, result.confidence_score, incoming.tenant_id)
 
-        # ── Step 5: Dispatch to handler ──────────────────────────────────────
         reply = await dispatch(incoming, result, session_history)
 
-        # ── Step 6: Send reply ───────────────────────────────────────────────
         sent_wamid = await _send_reply_chunked(incoming, reply)
 
-        # ── Step 7: Store reply (Mem0 + DB) ─────────────────────────────────
         if sent_wamid:
             replied_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
             await update_reply(
@@ -272,15 +263,12 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
                 text       = reply,
                 region     = incoming.region,
             )
-            # Step 10: Fire-and-forget background tasks — never block response.
-            # 1. Save raw turn to Mem0 (conversation memory)
             asyncio.create_task(_save_mem0_turn(
                 tenant_id  = incoming.tenant_id,
                 session_id = incoming.session_id,
                 user_text  = incoming.text,
                 bot_reply  = reply,
             ))
-            # 2. If invoice was just generated, trigger conversation summary
             if "invoice" in reply.lower() or "INV#" in reply:
                 asyncio.create_task(_save_conversation_summary(
                     tenant_id       = incoming.tenant_id,
@@ -289,7 +277,6 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
                     incoming        = incoming,
                 ))
 
-        # ── Step 8: Return debug info ────────────────────────────────────────
         latency = round(time.monotonic() - _t0, 2)
         print(f"[TIMING] TOTAL pipeline time: {latency}s")
         return {
@@ -303,20 +290,51 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
             },
         }
 
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+
+        try:
+            await alert_pipeline_error(e, incoming)
+        except Exception as alert_err:
+            print(f"[SAFETY NET] alert_pipeline_error itself failed: {alert_err}")
+
+        try:
+            safe_reply = _get_safe_error_reply(incoming)
+            await send_reply(incoming, safe_reply)
+        except Exception as send_err:
+            print(f"[SAFETY NET] Failed to send safe reply: {send_err}")
+
+        latency = round(time.monotonic() - _t0, 2)
+        print(f"[SAFETY NET] Pipeline error handled in {latency}s: {e}")
+        return {
+            "replies": incoming.captured_replies,
+            "debug": {
+                "intent":     "ERROR",
+                "confidence": 0.0,
+                "latency":    latency,
+                "route":      "Safety Net",
+                "tenant_id":  getattr(incoming, "tenant_id", "UNKNOWN"),
+                "error":      str(e),
+            },
+        }
+
     finally:
-        await release_lock(incoming.session_id, incoming.tenant_id)
+        # Only release if THIS request actually acquired the lock (see
+        # setup_pipeline()'s ownership invariant). Releasing unconditionally
+        # whenever tenant_id was resolved — the previous logic — would also
+        # fire for "duplicate message" and "lock held by another worker",
+        # neither of which means this request holds the lock; the second
+        # case would actively delete a different, currently-active
+        # request's lock (processing_locks is keyed by session_id alone).
+        if _lock_owned_by_this_request:
+            tenant_id = getattr(incoming, "tenant_id", None)
+            if tenant_id and tenant_id != "UNRESOLVED":
+                await release_lock(incoming.session_id, tenant_id)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
 
 async def _save_mem0_turn(tenant_id: str, session_id: str,
                            user_text: str, bot_reply: str) -> None:
-    """
-    Fire-and-forget Mem0 conversation turn save.
-    Runs after HTTP response sent — never blocks the pipeline.
-    """
     try:
         await add_conversation_turn(
             tenant_id  = tenant_id,
@@ -332,11 +350,6 @@ async def _save_conversation_summary(
     tenant_id: str, session_id: str,
     session_history: list, incoming,
 ) -> None:
-    """
-    Step 5 + Step 10: Generate and save semantic conversation summary to Mem0.
-    Triggered after invoice generation — captures the full conversation lifecycle.
-    Fire-and-forget — never blocks response.
-    """
     try:
         from ai.summary_generator import generate_and_save_conversation_summary
         await generate_and_save_conversation_summary(
@@ -350,7 +363,6 @@ async def _save_conversation_summary(
 
 
 async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional[str]:
-    """Sends reply, splitting into chunks if over WhatsApp's 4096 char limit."""
     if not reply:
         return None
 
@@ -368,7 +380,6 @@ async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional
 
 
 def _get_route(result) -> str:
-    """Returns a human-readable route label for debug output."""
     if result.intent == "GREETING":
         return "Greeting Handler"
     if result.intent == "HUMAN_ESCALATION":
@@ -386,6 +397,5 @@ def _empty_result() -> dict:
     }
 
 
-# ── Module imports at bottom — avoids circular import issues ──────────────────
 from ai.graphrag_handler import call_graphrag_api, _send_structured_product_list, _coerce_pythonic_dict
 from ai.product_followup import _try_resolve_product_followup, _parse_followup_message

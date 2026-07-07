@@ -22,6 +22,7 @@ def _get_client():
         except ImportError:
             print("[MEM0] WARNING: 'mem0ai' module is not installed. Falling back to Postgres database storage.")
             return None
+    return _mem0_client
 
 
 # ── Multi-tenant isolation ────────────────────────────────────────────────────
@@ -95,7 +96,16 @@ def _save_to_mem0(
     client, text: str, tenant_id: str, session_id: str,
     metadata: Optional[dict] = None,
 ) -> None:
-    """Saves to Mem0 with tenant prefix embedded for isolation."""
+    """
+    Saves to Mem0 with tenant prefix embedded for isolation.
+
+    NOTE: currently unused anywhere in this codebase — no call sites found.
+    Kept in case it's intended for future use; the stray `return _mem0_client`
+    previously at the end of this function (nonsensical given the -> None
+    annotation) has been removed — it was almost certainly a copy-paste
+    artifact from _get_client(), which is where that return statement
+    actually belonged and was missing (see _get_client() fix).
+    """
     try:
         prefixed = _add_tenant_prefix(text, tenant_id, session_id)
         meta     = {"type": "general", **(metadata or {})}
@@ -107,7 +117,6 @@ def _save_to_mem0(
         )
     except Exception as e:
         print(f"[MEM0] save failed: {e}")
-    return _mem0_client
 
 
 def _extract_memory_text(r) -> str:

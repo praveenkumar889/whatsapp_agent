@@ -18,8 +18,30 @@ _client = AzureOpenAI(
     api_version=AZURE_AI_API_VERSION, timeout=30.0, max_retries=0,
 )
 
-MAX_NEGOTIATION_ROUNDS = 4
-DEFAULT_FLOOR_DISC_PCT = 5
+MAX_NEGOTIATION_ROUNDS = 4   # default — see get_max_negotiation_rounds()
+DEFAULT_FLOOR_DISC_PCT = 5   # default — see get_negotiation_floor_disc()
+DEFAULT_FLOOR_MULTIPLIER = 0.95   # default — see get_floor_multiplier()
+
+
+def get_max_negotiation_rounds(incoming=None) -> int:
+    """
+    Tenant-configurable max negotiation rounds before forcing a final price.
+    Different businesses reasonably want different negotiation depth (a
+    high-touch B2B seller might want 6+ rounds; a low-margin retailer might
+    want 2). Falls back to MAX_NEGOTIATION_ROUNDS when a tenant hasn't set
+    max_negotiation_rounds in their tenant row.
+    """
+    val = getattr(incoming, "max_negotiation_rounds", None) if incoming else None
+    return int(val) if val else MAX_NEGOTIATION_ROUNDS
+
+
+def get_floor_multiplier(incoming=None) -> float:
+    """
+    Tenant-configurable floor multiplier (final concession = baseline ×
+    this value). Falls back to DEFAULT_FLOOR_MULTIPLIER when unset.
+    """
+    val = getattr(incoming, "neg_floor_multiplier", None) if incoming else None
+    return float(val) if val else DEFAULT_FLOOR_MULTIPLIER
 
 
 # ── Tier helpers (no prompts — pure math) ─────────────────────────────────────
@@ -48,10 +70,11 @@ def parse_global_offer_tiers(incoming, global_offers: str) -> list:
         return []
 
 
-def get_negotiation_floor_disc(tiers: list) -> int:
+def get_negotiation_floor_disc(tiers: list, incoming=None) -> int:
     if len(tiers) >= 2: return tiers[1][1]
     if len(tiers) == 1: return tiers[0][1]
-    return DEFAULT_FLOOR_DISC_PCT
+    val = getattr(incoming, "neg_floor_disc_pct", None) if incoming else None
+    return int(val) if val else DEFAULT_FLOOR_DISC_PCT
 
 def get_applicable_tier(order_value: float, tiers: list) -> tuple:
     applicable = (0, 0)
@@ -374,7 +397,14 @@ async def _reply_no_discount(incoming, product_name, price_num, regular_price, d
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_no_discount failed: {e}")
         total = round(price_num * quantity, 2)
-        return f"{incoming.sender_name}, price is *Rs.{price_num:,.0f}*/unit (Total: *Rs.{total:,.0f}*). Buy {min_units}+ units for extra discounts!"
+        try:
+            return get_prompt(
+                incoming, "neg_no_discount_fallback",
+                sender_name=incoming.sender_name, price_num=f"{price_num:,.0f}",
+                total=f"{total:,.0f}", min_units=min_units,
+            )
+        except RuntimeError:
+            return f"{incoming.sender_name}, price is *Rs.{price_num:,.0f}*/unit (Total: *Rs.{total:,.0f}*). Buy {min_units}+ units for extra discounts!"
 
 
 async def build_product_summary(incoming, product_data: Optional[dict]) -> str:
@@ -461,7 +491,15 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
     except RuntimeError: raise
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_first_offer failed: {e}")
-        base_reply = f"Great news, {incoming.sender_name}! 🎉 For *{offer['quantity']} units* of *{product_name}*: *Rs.{offer['offer_price']:,.0f}*/unit (Total: *Rs.{offer['total_price']:,.0f}*). Shall we proceed?"
+        try:
+            base_reply = get_prompt(
+                incoming, "neg_first_offer_fallback",
+                sender_name=incoming.sender_name, quantity=offer["quantity"],
+                product_name=product_name, offer_price=f"{offer['offer_price']:,.0f}",
+                offer_total=f"{offer['total_price']:,.0f}",
+            )
+        except RuntimeError:
+            base_reply = f"Great news, {incoming.sender_name}! 🎉 For *{offer['quantity']} units* of *{product_name}*: *Rs.{offer['offer_price']:,.0f}*/unit (Total: *Rs.{offer['total_price']:,.0f}*). Shall we proceed?"
 
     # ── FIX: Append "order N more to unlock X% off" upsell hint ───────────────
     # This was previously only present on the FIRST-time order entry path in
@@ -514,7 +552,15 @@ async def _reply_counter_offer(incoming, product_name, customer_price, new_offer
     except RuntimeError: raise
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_counter_offer failed: {e}")
-        return f"{incoming.sender_name}, we can do *Rs.{new_offer:,.0f}*/unit (Total: *Rs.{total:,.0f}* for {quantity} units). {'This is our best price.' if is_final else 'Shall we proceed?'}"
+        try:
+            return get_prompt(
+                incoming, "neg_counter_offer_fallback",
+                sender_name=incoming.sender_name, new_offer=f"{new_offer:,.0f}",
+                new_total=f"{total:,.0f}", quantity=quantity,
+                closing_line="This is our best price." if is_final else "Shall we proceed?",
+            )
+        except RuntimeError:
+            return f"{incoming.sender_name}, we can do *Rs.{new_offer:,.0f}*/unit (Total: *Rs.{total:,.0f}* for {quantity} units). {'This is our best price.' if is_final else 'Shall we proceed?'}"
 
 
 async def _reply_final_price(incoming, product_name, last_offer, quantity) -> str:
@@ -540,7 +586,14 @@ async def _reply_final_price(incoming, product_name, last_offer, quantity) -> st
     except RuntimeError: raise
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_final_price failed: {e}")
-        return f"{incoming.sender_name}, *Rs.{last_offer:,.0f}/unit* is our absolute best price (Total: *Rs.{total:,.0f}*). 🙏 Would you like to proceed?"
+        try:
+            return get_prompt(
+                incoming, "neg_final_price_fallback",
+                sender_name=incoming.sender_name, last_offer=f"{last_offer:,.0f}",
+                total=f"{total:,.0f}",
+            )
+        except RuntimeError:
+            return f"{incoming.sender_name}, *Rs.{last_offer:,.0f}/unit* is our absolute best price (Total: *Rs.{total:,.0f}*). 🙏 Would you like to proceed?"
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -702,6 +755,21 @@ async def extract_negotiation_intent(
         return {}
 
 
+def _reply_negotiation_accepted(incoming, quantity, product_name, last_offer) -> str:
+    """
+    Shared acceptance-confirmation reply — same message previously duplicated
+    verbatim in both the Phase 2 (structured extraction) and Phase 1
+    (fallback) acceptance branches of handle_negotiation().
+    """
+    try:
+        return get_prompt(
+            incoming, "neg_accepted_confirmation_prompt",
+            quantity=quantity, product_name=product_name, last_offer=f"{last_offer:,.0f}",
+        )
+    except RuntimeError:
+        return f"Wonderful! 🎉 Confirming *{quantity} units* of *{product_name}* at *Rs.{last_offer:,.0f}/unit*. Reply *Confirm* to place your order!"
+
+
 async def handle_negotiation(
     incoming, product_name: str, price_num: float, regular_price: float,
     graphrag_discount_pct: int, session_history: list,
@@ -725,14 +793,14 @@ async def handle_negotiation(
     # above and ensures the negotiation ceiling actually reflects the best
     # discount tier the store offers — not an arbitrary fixed position.
     max_disc    = max((d for _, d in tiers), default=0) if tiers else 0
-    floor_disc  = max_disc if max_disc > 0 else get_negotiation_floor_disc(tiers)
+    floor_disc  = max_disc if max_disc > 0 else get_negotiation_floor_disc(tiers, incoming)
     floor_price = round(price_num * (1 - floor_disc / 100), 2)
     awaiting_qty = negotiation_state.get("awaiting_quantity", False)
 
     _saved_auto = negotiation_state.get("auto_offer_unit_price")
     negotiation_baseline = float(_saved_auto) if _saved_auto and float(_saved_auto) < price_num else price_num
     if negotiation_baseline < price_num:
-        floor_price = round(negotiation_baseline * 0.95)  # whole rupees — no fractional prices
+        floor_price = round(negotiation_baseline * get_floor_multiplier(incoming))  # whole rupees — no fractional prices
 
     def _state(**kw): return {**negotiation_state, "product_name": product_name, "price_num": price_num,
                                "floor_price": floor_price, "global_offers": global_offers, "_tiers": tiers,
@@ -742,7 +810,14 @@ async def handle_negotiation(
     if awaiting_qty:
         quantity = await extract_quantity(msg, product_name, incoming, session_history)
         if not quantity:
-            return {"reply": f"I didn't catch that, {incoming.sender_name}. How many units of *{product_name}* would you like?",
+            try:
+                _ask_qty_reply = get_prompt(
+                    incoming, "neg_ask_quantity_prompt",
+                    sender_name=incoming.sender_name, product_name=product_name,
+                )
+            except RuntimeError:
+                _ask_qty_reply = f"I didn't catch that, {incoming.sender_name}. How many units of *{product_name}* would you like?"
+            return {"reply": _ask_qty_reply,
                     "state": _state(awaiting_quantity=True, rounds=rounds),
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
         offer = calculate_offer(price_num, quantity, tiers)
@@ -827,7 +902,7 @@ async def handle_negotiation(
 
         # PRECEDENCE 1: Acceptance — close negotiation immediately
         if _primary == "ACCEPTED" and _accepted_val:
-            return {"reply": f"Wonderful! 🎉 Confirming *{quantity} units* of *{product_name}* at *Rs.{last_offer:,.0f}/unit*. Reply *Confirm* to place your order!",
+            return {"reply": _reply_negotiation_accepted(incoming, quantity, product_name, last_offer),
                     "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
                     "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
@@ -897,7 +972,7 @@ async def handle_negotiation(
 
         # Precedence: acceptance always wins — handle it before qty change
         if accepted:
-            return {"reply": f"Wonderful! 🎉 Confirming *{quantity} units* of *{product_name}* at *Rs.{last_offer:,.0f}/unit*. Reply *Confirm* to place your order!",
+            return {"reply": _reply_negotiation_accepted(incoming, quantity, product_name, last_offer),
                     "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
                     "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
     if new_qty and new_qty != quantity:
@@ -953,29 +1028,52 @@ async def handle_negotiation(
         current_tier_disc = offer.get("current_tier_disc", 0)
 
         prev_qty = negotiation_state.get("quantity", quantity)
-        lines = [
-            f"✅ Updated your order from *{prev_qty}* to *{quantity} units*, {incoming.sender_name}!",
-            "",
-            f"• *Product:* {product_name}",
-            f"• *Quantity:* {quantity} units",
-            f"• *Regular price:* Rs.{price_num:,.0f}/unit",
-        ]
         if current_tier_disc > 0:
-            lines.append(
-                f"• *Store offer {current_tier_disc}% OFF applied:* Rs.{tier_price:,.0f}/unit"
-            )
+            try:
+                body = get_prompt(
+                    incoming, "neg_qty_update_with_discount_prompt",
+                    prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
+                    product_name=product_name, price_num=f"{price_num:,.0f}",
+                    current_tier_disc=current_tier_disc, tier_price=f"{tier_price:,.0f}",
+                    sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}",
+                    total_pay=f"{total_pay:,.2f}",
+                )
+            except RuntimeError:
+                body = (
+                    f"✅ Updated your order from *{prev_qty}* to *{quantity} units*, {incoming.sender_name}!\n\n"
+                    f"• *Product:* {product_name}\n• *Quantity:* {quantity} units\n"
+                    f"• *Regular price:* Rs.{price_num:,.0f}/unit\n"
+                    f"• *Store offer {current_tier_disc}% OFF applied:* Rs.{tier_price:,.0f}/unit\n"
+                    f"• *Subtotal:* Rs.{sub_price:,.2f}\n• *GST ({gst_pct}%):* Rs.{gst_amount:,.2f}\n"
+                    f"• *Total Payable:* Rs.{total_pay:,.2f}"
+                )
         else:
-            lines.append(f"• *Unit price:* Rs.{tier_price:,.0f}")
-        lines += [
-            f"• *Subtotal:* Rs.{sub_price:,.2f}",
-            f"• *GST ({gst_pct}%):* Rs.{gst_amount:,.2f}",
-            f"• *Total Payable:* Rs.{total_pay:,.2f}",
-        ]
+            try:
+                body = get_prompt(
+                    incoming, "neg_qty_update_no_discount_prompt",
+                    prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
+                    product_name=product_name, price_num=f"{price_num:,.0f}", tier_price=f"{tier_price:,.0f}",
+                    sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}",
+                    total_pay=f"{total_pay:,.2f}",
+                )
+            except RuntimeError:
+                body = (
+                    f"✅ Updated your order from *{prev_qty}* to *{quantity} units*, {incoming.sender_name}!\n\n"
+                    f"• *Product:* {product_name}\n• *Quantity:* {quantity} units\n"
+                    f"• *Regular price:* Rs.{price_num:,.0f}/unit\n• *Unit price:* Rs.{tier_price:,.0f}\n"
+                    f"• *Subtotal:* Rs.{sub_price:,.2f}\n• *GST ({gst_pct}%):* Rs.{gst_amount:,.2f}\n"
+                    f"• *Total Payable:* Rs.{total_pay:,.2f}"
+                )
+
+        lines = [body]
         if upsell_line:
             lines.append(upsell_line.strip())
         if summary_block:
             lines += ["", summary_block]
-        lines += ["", "Reply *Confirm* to place your order! 🎉"]
+        try:
+            lines += ["", get_prompt(incoming, "neg_qty_update_footer_prompt")]
+        except RuntimeError:
+            lines += ["", "Reply *Confirm* to place your order! 🎉"]
 
         update_reply = "\n".join(lines)
 
@@ -998,12 +1096,20 @@ async def handle_negotiation(
     # (either from Phase 2 structured extraction or Phase 1 parallel batches)
 
     if not counter and not more_disc:
-        return {"reply": f"Our current offer is *Rs.{last_offer:,.0f}/unit* for *{quantity} units* (Total: *Rs.{round(last_offer*quantity,2):,.0f}*). Would you like to proceed?",
+        try:
+            _stalemate_reply = get_prompt(
+                incoming, "neg_stalemate_reply_prompt",
+                last_offer=f"{last_offer:,.0f}", quantity=quantity,
+                total=f"{round(last_offer*quantity,2):,.0f}",
+            )
+        except RuntimeError:
+            _stalemate_reply = f"Our current offer is *Rs.{last_offer:,.0f}/unit* for *{quantity} units* (Total: *Rs.{round(last_offer*quantity,2):,.0f}*). Would you like to proceed?"
+        return {"reply": _stalemate_reply,
                 "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer),
                 "order_ready": False, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
     rounds   += 1
-    is_final  = rounds >= MAX_NEGOTIATION_ROUNDS
+    is_final  = rounds >= get_max_negotiation_rounds(incoming)
 
     # ── Stateful bargaining engine ────────────────────────────────────────────
     # Improvements over the fixed-step approach:

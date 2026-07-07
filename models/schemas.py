@@ -86,6 +86,11 @@ class IncomingMessage:
     products_api_url: Optional[str] = None
     access_token:     Optional[str] = None
 
+    # ── Negotiation config ────────────────────────────────────────────────────
+    max_negotiation_rounds: Optional[int]   = None
+    neg_floor_disc_pct:     Optional[int]   = None
+    neg_floor_multiplier:   Optional[float] = None
+
     # ── Media ─────────────────────────────────────────────────────────────────
     media_id:        Optional[str]   = None
     media_mime_type: Optional[str]   = None

@@ -1237,22 +1237,35 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         bare_number_only = re.fullmatch(r"\s*\d{1,4}\s*", incoming.text.strip()) is not None
         if bare_number_only and not parsed.get("selected_product_name"):
 
-            last_bot_msg = ""
-            if session_history:
-                assistant_msgs = [m["content"] for m in session_history if m.get("role") == "assistant"]
-                if assistant_msgs:
-                    last_bot_msg = assistant_msgs[-1].lower()
+            extracted_number = int(incoming.text.strip())
 
-            # Unique marker text that ONLY appears on a freshly-shown product list —
-            # guarantees this number is the customer's first reply to THAT exact list.
-            bot_just_showed_list = "reply with the product" in last_bot_msg and ("name" in last_bot_msg or "number" in last_bot_msg)
-
-            bot_asked_quantity = (
-                "how many units" in last_bot_msg
-                or "how many would you like" in last_bot_msg
+            # Ground truth from STATE, not from parsing the bot's own prior
+            # message text. The old approach checked for English substrings
+            # like "reply with the product" / "how many units" in the last
+            # assistant message — that silently breaks for any tenant whose
+            # prompts are customized or in a different language, since the
+            # check can never match text it wasn't written to expect.
+            #
+            # Signal used instead:
+            #   - A single product already "in focus" with no quantity yet
+            #     (active negotiation_state.product_name set, quantity unset)
+            #     → the bot is almost certainly waiting on a quantity, so the
+            #       bare number is treated as one.
+            #   - Otherwise, if a fresh multi-item product list is loaded for
+            #     this session (selection has more than one option) → treat
+            #     the number as a 1-based position in that list.
+            #   - Neither condition → ambiguous, ask for the product name
+            #     (unchanged from before).
+            _neg_for_bare_num = getattr(incoming, "_cached_neg_state", None) or \
+                await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+            _product_awaiting_qty = bool(
+                _neg_for_bare_num
+                and _neg_for_bare_num.get("product_name")
+                and not _neg_for_bare_num.get("quantity")
             )
 
-            extracted_number = int(incoming.text.strip())
+            bot_asked_quantity   = _product_awaiting_qty
+            bot_just_showed_list = (not _product_awaiting_qty) and bool(selection) and len(selection) > 1
 
             if bot_just_showed_list:
                 # (a) Map number -> product by 1-based position in the SAME list
@@ -1275,11 +1288,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             elif bot_asked_quantity:
                 # (b) Legitimate quantity context — let existing downstream logic
                 # (Case 3 / quantity injection) handle it normally.
-                print(f"[FOLLOW-UP] Bot asked quantity — '{extracted_number}' treated as QUANTITY, falling through")
+                print(f"[FOLLOW-UP] Product '{(_neg_for_bare_num or {}).get('product_name')}' awaiting quantity — "
+                      f"'{extracted_number}' treated as QUANTITY, falling through")
 
             else:
-                # (c) Ambiguous — bot's last message was neither a list nor a
-                # quantity question. Do not guess; ask for the product name.
+                # (c) Ambiguous — no product awaiting quantity, no active list.
+                # Do not guess; ask for the product name.
                 print(f"[FOLLOW-UP] Bare number '{extracted_number}' with no list/quantity context — asking for product name instead of guessing")
                 return (
                     f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
@@ -1660,6 +1674,21 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     else:
         print(f"[MEM0] Skipped (reason={_mem_decision.reason}): '{incoming.text[:50]}'")
 
+    # Build workflow_context as an explicit, unambiguous string — never embed
+    # a bare "qty=None". A literal "None" in the prompt was one contributor
+    # to the LLM occasionally treating an unrelated number from earlier
+    # conversation history as if it were a known quantity (see migration 020
+    # for the other half of this fix — an explicit prompt instruction not to
+    # infer quantity from conversation history at all).
+    if product_name:
+        _workflow_context_str = (
+            f"product={product_name}, quantity not yet specified"
+            if parsed_qty is None else
+            f"product={product_name}, qty={parsed_qty}"
+        )
+    else:
+        _workflow_context_str = ""
+
     try:
         _t_final_start = time.monotonic()
         response = await asyncio.get_event_loop().run_in_executor(
@@ -1669,7 +1698,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 max_tokens  = 400,
                 temperature = 0.3,
                 messages    = [
-                    {"role": "system", "content": get_prompt(incoming, "pf_main_followup_prompt", biz_name=incoming.biz_name, sender_name=incoming.sender_name, product_name=product_name or "", product_context=_mem0_ctx.get("product_context") or json.dumps(product_context, ensure_ascii=False), catalog_data=json.dumps(product_context, ensure_ascii=False), workflow_context=f"product={product_name}, qty={parsed_qty}" if product_name else "", customer_preferences=_mem0_ctx.get("customer_preferences",""), parsed_intent=parsed.get("intent","") if isinstance(parsed, dict) else "")},
+                    {"role": "system", "content": get_prompt(incoming, "pf_main_followup_prompt", biz_name=incoming.biz_name, sender_name=incoming.sender_name, product_name=product_name or "", product_context=_mem0_ctx.get("product_context") or json.dumps(product_context, ensure_ascii=False), catalog_data=json.dumps(product_context, ensure_ascii=False), workflow_context=_workflow_context_str, customer_preferences=_mem0_ctx.get("customer_preferences",""), parsed_intent=parsed.get("intent","") if isinstance(parsed, dict) else "")},
                     *recent_history,
                     {"role": "user", "content": incoming.text},
                 ],

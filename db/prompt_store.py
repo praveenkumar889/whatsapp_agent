@@ -302,4 +302,46 @@ PROMPT_KEYS: dict = {
     "neg_first_offer_fallback":                  "neg_first_offer_fallback",
     "neg_counter_offer_fallback":                "neg_counter_offer_fallback",
     "neg_final_price_fallback":                  "neg_final_price_fallback",
+
+    # Migration 019 — hardcoded customer-facing strings moved to DB prompts
+    "media_unsupported_prompt":                  "media_unsupported_prompt",
+    "generate_invoice_cta_fallback":              "generate_invoice_cta_fallback",
+    "invoice_no_orders_found_prompt":             "invoice_no_orders_found_prompt",
+    "invoice_success_reply_prompt":               "invoice_success_reply_prompt",
+    "invoice_pdf_failed_prompt":                  "invoice_pdf_failed_prompt",
+    "neg_still_bargaining_prompt":                "neg_still_bargaining_prompt",
+    "neg_ask_quantity_prompt":                    "neg_ask_quantity_prompt",
+    "graphrag_no_url_configured_prompt":          "graphrag_no_url_configured_prompt",
+    "graphrag_403_error_prompt":                  "graphrag_403_error_prompt",
+    "graphrag_http_error_prompt":                 "graphrag_http_error_prompt",
+    "graphrag_product_list_header_prompt":        "graphrag_product_list_header_prompt",
+    "graphrag_product_list_footer_prompt":        "graphrag_product_list_footer_prompt",
+    "graphrag_category_clarify_default":          "graphrag_category_clarify_default",
+    "graphrag_category_clarify_greeting_prompt":  "graphrag_category_clarify_greeting_prompt",
+    "graphrag_category_clarify_footer_prompt":    "graphrag_category_clarify_footer_prompt",
+    "graphrag_empty_results_prompt":              "graphrag_empty_results_prompt",
+    "graphrag_retry_failed_prompt":                "graphrag_retry_failed_prompt",
+    "graphrag_exception_fallback_prompt":         "graphrag_exception_fallback_prompt",
+
+    # Pipeline-wide safety net (main.py::run_pipeline / _get_safe_error_reply).
+    # Tenant-customizable via DB, but the caller MUST catch RuntimeError/any
+    # exception and fall back to a hardcoded string — this prompt existing in
+    # the DB is a nice-to-have, not something the safety net can depend on to
+    # fire correctly (a safety net that depends on the very systems it's
+    # meant to catch failures in defeats its purpose).
+    "pipeline_error_reply":                      "pipeline_error_reply",
+
+    # Migration 022 — negotiator remaining hardcoded strings
+    "neg_accepted_confirmation_prompt":           "neg_accepted_confirmation_prompt",
+    "neg_qty_update_with_discount_prompt":        "neg_qty_update_with_discount_prompt",
+    "neg_qty_update_no_discount_prompt":          "neg_qty_update_no_discount_prompt",
+    "neg_qty_update_footer_prompt":               "neg_qty_update_footer_prompt",
+    "neg_stalemate_reply_prompt":                 "neg_stalemate_reply_prompt",
+
+    # Migration 021 — order summary (pipeline/router.py::_build_order_summary)
+    "order_summary_full_discount_prompt":         "order_summary_full_discount_prompt",
+    "order_summary_store_discount_only_prompt":   "order_summary_store_discount_only_prompt",
+    "order_summary_plain_price_prompt":           "order_summary_plain_price_prompt",
+    "order_summary_savings_line_prompt":          "order_summary_savings_line_prompt",
+    "order_summary_footer_prompt":                "order_summary_footer_prompt",
 }

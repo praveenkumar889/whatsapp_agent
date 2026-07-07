@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, cast
 from supabase import create_client, Client  # type: ignore[import]
-from models.schemas import IncomingMessage, EntityResult
+from models.schemas import IncomingMessage
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 _supabase: Optional[Client] = None
@@ -166,26 +166,11 @@ async def update_intent(message_id: str, intent: str, confidence: float, tenant_
         return False
 
 
-async def update_entities(message_id: str, entities: EntityResult) -> bool:
-    """Stores extracted entities after entity extraction engine runs."""
-    try:
-        _get_client().table("messages") \
-            .update({
-                "product_name":      entities.product_name,
-                "quantity_value":    entities.quantity_value,
-                "quantity_unit":     entities.quantity_unit,
-                "delivery_date":     entities.delivery_date,
-                "invoice_number":    entities.invoice_number,
-                "payment_reference": entities.payment_reference,
-                "missing_entities":  json.dumps(entities.missing_entities),
-            }) \
-            .eq("message_id", message_id) \
-            .execute()
-        print(f"[DB] Entities updated — product={entities.product_name} qty_value={entities.quantity_value} qty_unit={entities.quantity_unit}")
-        return True
-    except Exception as e:
-        print(f"[DB] Entities update failed: {e}")
-        return False
+# update_entities() removed — confirmed dead code. Its only caller,
+# ai/handlers.py::extract_entities(), was itself confirmed dead (zero
+# callers anywhere in the live pipeline) and has been removed. Both were
+# part of a first-generation entity-extraction architecture superseded by
+# the current GraphRAG-first flow (PRODUCT_SELECTION + negotiation_state).
 
 
 async def update_reply(
@@ -654,7 +639,7 @@ async def get_cached_product_by_name(
     # Tier 4: Fallback in-memory  (below, in case DB column missing)
 
     def _parse_row(row: dict) -> Optional[dict]:
-        raw  = row.get("api_response")
+        raw  = cast(dict, row).get("api_response")
         data = _json.loads(raw) if isinstance(raw, str) else raw
         if not isinstance(data, list):
             data = [data]
@@ -981,6 +966,67 @@ async def clear_category_selection(
     except Exception as e:
         print(f"[DB] clear_category_selection failed: {e}")
         return False
+
+
+async def clear_last_discussed_product(
+    tenant_id:  str,
+    session_id: str,
+) -> bool:
+    """Clears the LAST_DISCUSSED_PRODUCT marker, e.g. after an order is confirmed."""
+    try:
+        _get_client().table("workflow_sessions") \
+            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("tenant_id",  tenant_id) \
+            .eq("session_id", session_id) \
+            .eq("status", "LAST_DISCUSSED_PRODUCT") \
+            .execute()
+        print(f"[DB] LAST_DISCUSSED_PRODUCT cleared for {session_id}")
+        return True
+    except Exception as e:
+        print(f"[DB] clear_last_discussed_product failed: {e}")
+        return False
+
+
+async def clear_product_selection(
+    tenant_id:  str,
+    session_id: str,
+) -> bool:
+    """Clears the PRODUCT_SELECTION (numbered list) state, e.g. after an order is confirmed."""
+    try:
+        _get_client().table("workflow_sessions") \
+            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()}) \
+            .eq("tenant_id",  tenant_id) \
+            .eq("session_id", session_id) \
+            .eq("status", "PRODUCT_SELECTION") \
+            .execute()
+        print(f"[DB] PRODUCT_SELECTION cleared for {session_id}")
+        return True
+    except Exception as e:
+        print(f"[DB] clear_product_selection failed: {e}")
+        return False
+
+
+async def clear_post_order_context(
+    tenant_id:  str,
+    session_id: str,
+) -> None:
+    """
+    Convenience wrapper: clears everything that should NOT survive into a
+    fresh shopping session after an order is confirmed and invoiced —
+    last discussed product, the numbered product-selection list, and any
+    pending (unconfirmed) order. Negotiation state is cleared separately by
+    the caller (clear_negotiation_state), since it's cleared earlier in the
+    confirm flow, before the invoice is generated.
+
+    Best-effort: each clear runs independently so one failure doesn't block
+    the others. Never raises — this runs after the customer already has
+    their invoice, so nothing here should be able to disrupt that response.
+    """
+    for _clear_fn in (clear_last_discussed_product, clear_product_selection, delete_pending_order):
+        try:
+            await _clear_fn(tenant_id, session_id)
+        except Exception as e:
+            print(f"[DB] clear_post_order_context: {_clear_fn.__name__} failed (non-critical): {e}")
 
 
 # ── Negotiation State ─────────────────────────────────────────────────────────

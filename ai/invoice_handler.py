@@ -81,7 +81,10 @@ async def _generate_confirmation_prompt(reply_text: str, incoming) -> str:
         return content.strip()
     except Exception as e:
         print(f"[INVOICE] Failed to generate confirmation prompt: {e}")
-        return "Reply 'Proceed' or 'Confirm' to automatically generate and receive your tax invoice! 📄"
+        try:
+            return _get_invoice_prompt("generate_invoice_cta_fallback", incoming)
+        except RuntimeError:
+            return "Reply 'Proceed' or 'Confirm' to automatically generate and receive your tax invoice! 📄"
 
 
 async def _is_invoice_confirmation_request(incoming, session_history: list) -> bool:
@@ -181,15 +184,24 @@ async def handle_invoice_request(incoming, negotiated_order: Optional[dict] = No
                     if new_order:
                         print(f"[INVOICE] Order committed: {new_order.get('order_id')}")
                         await delete_pending_order(incoming.tenant_id, incoming.session_id)
+                        try:
+                            from db.session_store import clear_post_order_context
+                            import asyncio as _asyncio
+                            _asyncio.create_task(clear_post_order_context(incoming.tenant_id, incoming.session_id))
+                        except Exception:
+                            pass  # never block invoice for a context-cleanup save
         except Exception as commit_err:
             print(f"[INVOICE] Error committing pending order: {commit_err}")
 
         order = await get_last_order_from_orders(incoming.tenant_id, incoming.session_id)
     if not order:
-        return (
-            f"I couldn't find any recent orders for you, {incoming.sender_name}. 🤔\n\n"
-            f"If you'd like to place a new order, just let me know what you need!"
-        )
+        try:
+            return _get_invoice_prompt("invoice_no_orders_found_prompt", incoming, sender_name=incoming.sender_name)
+        except RuntimeError:
+            return (
+                f"I couldn't find any recent orders for you, {incoming.sender_name}. 🤔\n\n"
+                f"If you'd like to place a new order, just let me know what you need!"
+            )
 
     # Get invoice_url if already exists
     invoice_url = order.get("invoice_url")
@@ -215,17 +227,27 @@ async def handle_invoice_request(incoming, negotiated_order: Optional[dict] = No
             print(f"[INVOICE] Invoice URL updated in DB: {invoice_url}")
 
     if invoice_url:
-        return (
-            f"Here is your tax invoice for order *{order.get('order_id')}*, {incoming.sender_name}! 📄\n\n"
-            f"🔗 *Download Invoice PDF*:\n{invoice_url}\n\n"
-            f"Thank you for doing business with *{incoming.biz_name}*! 🙏"
-        )
+        try:
+            return _get_invoice_prompt(
+                "invoice_success_reply_prompt", incoming,
+                order_id=order.get('order_id'), sender_name=incoming.sender_name,
+                invoice_url=invoice_url, biz_name=incoming.biz_name,
+            )
+        except RuntimeError:
+            return (
+                f"Here is your tax invoice for order *{order.get('order_id')}*, {incoming.sender_name}! 📄\n\n"
+                f"🔗 *Download Invoice PDF*:\n{invoice_url}\n\n"
+                f"Thank you for doing business with *{incoming.biz_name}*! 🙏"
+            )
     else:
         support = getattr(incoming, 'support_email', None) or incoming.biz_name
-        return (
-            f"I had trouble generating your invoice PDF right now, {incoming.sender_name}. 🔧\n\n"
-            f"Please contact our team at *{support}* to get your invoice."
-        )
+        try:
+            return _get_invoice_prompt("invoice_pdf_failed_prompt", incoming, sender_name=incoming.sender_name, support=support)
+        except RuntimeError:
+            return (
+                f"I had trouble generating your invoice PDF right now, {incoming.sender_name}. 🔧\n\n"
+                f"Please contact our team at *{support}* to get your invoice."
+            )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
