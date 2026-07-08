@@ -1,6 +1,7 @@
 # adapter/whatsapp_adapter.py — Communication Adapter (WhatsApp → IncomingMessage)
 # Supabase Storage added — uploads raw image/audio binary after download.
 
+import os
 import uuid
 import httpx
 from datetime import datetime, timezone
@@ -12,6 +13,11 @@ from config import (
     WABA_ID, PHONE_NUMBER_ID, BUSINESS_NAME, ACCESS_TOKEN,
     SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_STORAGE_BUCKET,
 )
+
+# Meta Graph API version — override via GRAPH_API_VERSION in .env if Meta
+# deprecates v21.0 before this gets a proper config.py entry. Not tenant
+# config (platform-wide, not per-business), so this stays an env var.
+GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v21.0")
 
 # ── Supabase client — lazy singleton ──────────────────────────────────────────
 # Created on first use (not at import time) so a missing/placeholder .env
@@ -40,7 +46,7 @@ async def download_media(media_id: str) -> Optional[bytes]:
     async with httpx.AsyncClient(timeout=30.0) as client:
         # ── Step 1: Resolve media_id → temporary signed download URL ──────────
         step1 = await client.get(
-            f"https://graph.facebook.com/v21.0/{media_id}",
+            f"https://graph.facebook.com/{GRAPH_API_VERSION}/{media_id}",
             headers=headers
         )
         if step1.status_code != 200:
@@ -196,8 +202,13 @@ async def parse_webhook(data: dict) -> Optional[IncomingMessage]:
             media_url = upload_to_storage(media_binary, media_mime_type, "images", file_name, _scope)
             # media_url is None if upload failed — pipeline continues either way.
 
-            # Sprint 2: text = await ocr_engine.extract(media_binary, media_mime_type)
-            text = "[Image received — OCR processing coming in Sprint 2]"
+            # OCR not yet implemented. Use an internal marker, never
+            # customer-facing text — tenant_id isn't resolved yet at this
+            # point (that happens in pipeline/setup.py), so we can't render
+            # a DB-driven prompt here. setup.py detects this marker right
+            # after tenant resolution and replaces it with the tenant's own
+            # media_unsupported_prompt (see migration 018).
+            text = "__MEDIA_UNSUPPORTED_IMAGE__"
 
         elif msg_type == "audio":
             media_id        = msg["audio"]["id"]
@@ -216,8 +227,10 @@ async def parse_webhook(data: dict) -> Optional[IncomingMessage]:
             file_name = f"{msg['from']}_{timestamp}{get_file_extension(media_mime_type)}"
             media_url = upload_to_storage(media_binary, media_mime_type, "audio", file_name, _scope)
 
-            # Sprint 2: text = await whisper_stt.transcribe(media_binary, media_mime_type)
-            text = "[Voice note received — STT processing coming in Sprint 2]"
+            # STT not yet implemented — same internal-marker approach as
+            # the image case above; see setup.py for where this becomes a
+            # real, tenant-configurable customer-facing message.
+            text = "__MEDIA_UNSUPPORTED_AUDIO__"
 
         else:
             # Sticker, reaction, location, contact, document — not in scope for Phase 1.
@@ -235,8 +248,8 @@ async def parse_webhook(data: dict) -> Optional[IncomingMessage]:
             waba_id           = meta.get("waba_id", WABA_ID),
             phone_number_id   = meta.get("phone_number_id", PHONE_NUMBER_ID),
             biz_name          = BUSINESS_NAME,
-            region            = "india",
-            timezone          = "UTC",
+            region            = "unresolved",  # overwritten by tenant resolution in setup.py
+            timezone          = "UTC",  # neutral placeholder until tenant resolution overwrites it
             language          = "en",
             sender_name       = contact["profile"]["name"],
             sender_phone      = contact["wa_id"],
@@ -273,7 +286,7 @@ async def send_whatsapp_reply(
     """
     _pid   = phone_number_id or PHONE_NUMBER_ID
     _token = access_token    or ACCESS_TOKEN
-    url     = f"https://graph.facebook.com/v21.0/{_pid}/messages"
+    url     = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{_pid}/messages"
     headers = {"Authorization": f"Bearer {_token}", "Content-Type": "application/json"}
     payload = {
         "messaging_product": "whatsapp",
@@ -314,7 +327,7 @@ async def send_whatsapp_image(
     try:
         _pid   = phone_number_id or PHONE_NUMBER_ID
         _token = access_token    or ACCESS_TOKEN
-        url     = f"https://graph.facebook.com/v21.0/{_pid}/messages"
+        url     = f"https://graph.facebook.com/{GRAPH_API_VERSION}/{_pid}/messages"
         headers = {"Authorization": f"Bearer {_token}", "Content-Type": "application/json"}
         payload = {
             "messaging_product": "whatsapp",

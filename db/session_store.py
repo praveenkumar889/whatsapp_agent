@@ -1029,6 +1029,54 @@ async def clear_negotiation_state(
         return False
 
 
+async def clear_post_order_context(tenant_id: str, session_id: str) -> bool:
+    """
+    Clears stale conversational context after an order is successfully confirmed.
+
+    This includes updating statuses to 'COMPLETED' in workflow_sessions for:
+      - LAST_DISCUSSED_PRODUCT
+      - PRODUCT_SELECTION
+      - ORDER_PENDING
+      - WORKFLOW_PENDING
+      - CATEGORY_SELECTION
+
+    It also updates the Mem0 workflow snapshot state to 'INVOICED'.
+    """
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 1. Update Supabase states
+        statuses_to_clear = [
+            "LAST_DISCUSSED_PRODUCT",
+            "PRODUCT_SELECTION",
+            "ORDER_PENDING",
+            "WORKFLOW_PENDING",
+            "CATEGORY_SELECTION"
+        ]
+
+        _get_client().table("workflow_sessions") \
+            .update({"status": "COMPLETED", "updated_at": now_iso}) \
+            .eq("tenant_id", tenant_id) \
+            .eq("session_id", session_id) \
+            .in_("status", statuses_to_clear) \
+            .execute()
+
+        print(f"[DB] Supabase post-order context cleared for {session_id}")
+
+        # 2. Update Mem0 workflow snapshot
+        try:
+            from db.memory_store import save_workflow_snapshot
+            await save_workflow_snapshot(tenant_id, session_id, "INVOICED")
+            print(f"[DB] Mem0 workflow snapshot updated to INVOICED for {session_id}")
+        except Exception as mem_err:
+            print(f"[DB] Mem0 snapshot update failed during context clear: {mem_err}")
+
+        return True
+    except Exception as e:
+        print(f"[DB] clear_post_order_context failed: {e}")
+        return False
+
+
 async def update_order_invoice_url(order_id: str, tenant_id: str, invoice_url: str) -> bool:
     """Updates the invoice URL for a specific order in the database."""
     try:

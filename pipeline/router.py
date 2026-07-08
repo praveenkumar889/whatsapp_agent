@@ -47,7 +47,9 @@ async def dispatch(incoming, result, session_history: list) -> str:
         from ai.handlers import handle_escalation
         return await handle_escalation(incoming)
 
-    if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < 0.50:
+    from ai.handlers import DEFAULT_INTENT_MIN_CONFIDENCE
+    _min_conf = getattr(incoming, "intent_min_confidence", None) or DEFAULT_INTENT_MIN_CONFIDENCE
+    if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
         from ai.graphrag_handler import call_graphrag_api
         return await call_graphrag_api(incoming, session_history)
 
@@ -102,7 +104,7 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
             updated = {**pre_neg_state, "awaiting_invoice_confirmation": True,
                        "counter_offer_presented": False, "last_offer_price": pr.negotiated_unit_price}
             await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated)
-            return pr.to_whatsapp_summary(product, incoming.sender_name)
+            return pr.to_whatsapp_summary(product, incoming.sender_name, incoming=incoming)
         else:
             # Customer still negotiating — politely hold our final price
             final_price = float(pre_neg_state.get("last_offer_price", 0))
@@ -110,12 +112,20 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
             total       = round(final_price * quantity, 2)
             product     = pre_neg_state.get("product_name", "this product")
             print(f"[NEG GUARD] Customer still bargaining after final offer — holding price Rs.{final_price:,.0f}")
-            return (
-                f"I understand, {incoming.sender_name}. 🙏 Rs.*{final_price:,.0f}/unit* is already "
-                f"our absolute best price for *{product}* — we can't reduce it further.\n\n"
-                f"For *{quantity} units*, your total would be *Rs.{total:,.2f}* + GST.\n\n"
-                f"Would you like to proceed at this price? Reply *Confirm* to place your order!"
-            )
+            from db.prompt_store import get_prompt
+            try:
+                return get_prompt(
+                    incoming, "neg_still_bargaining_prompt",
+                    sender_name=incoming.sender_name, final_price=f"{final_price:,.0f}",
+                    product=product, quantity=quantity, total=f"{total:,.2f}",
+                )
+            except RuntimeError:
+                return (
+                    f"I understand, {incoming.sender_name}. 🙏 Rs.*{final_price:,.0f}/unit* is already "
+                    f"our absolute best price for *{product}* — we can't reduce it further.\n\n"
+                    f"For *{quantity} units*, your total would be *Rs.{total:,.2f}* + GST.\n\n"
+                    f"Would you like to proceed at this price? Reply *Confirm* to place your order!"
+                )
 
     # ── Phase 3: awaiting_invoice_confirmation — customer has accepted ──────────
     awaiting_conf = (
@@ -240,6 +250,22 @@ async def _resume_negotiation(incoming, neg_state: dict, session_history: list) 
         negotiation_state     = resumed,
         global_offers         = global_offers,
     )
+
+    # DEFERRAL: see product_followup.py's identical handling — the negotiator
+    # determined this message isn't negotiation-related (greeting/escalation
+    # arriving while awaiting invoice confirmation). Route it properly
+    # instead of returning ng_result["reply"], which would be None here.
+    if ng_result.get("defer_intent") is not None:
+        await save_negotiation_state(incoming.tenant_id, incoming.session_id, ng_result["state"])
+        _defer_intent = ng_result["defer_intent"].intent
+        incoming._deferred_intent = _defer_intent  # so main.py's debug output reflects the real routing decision
+        print(f"[NEG RESUME] Negotiator deferred (intent={_defer_intent}) — routing directly")
+        if _defer_intent == "GREETING":
+            from ai.handlers import handle_greeting
+            return await handle_greeting(incoming)
+        elif _defer_intent == "HUMAN_ESCALATION":
+            from ai.handlers import handle_escalation
+            return await handle_escalation(incoming)
 
     if ng_result["order_ready"] and ng_result["agreed_price"]:
         negotiator_reply = ng_result.get("reply", "")
@@ -395,6 +421,16 @@ async def _confirm_negotiated_order(incoming, neg_state: dict) -> str:
     )
     await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
 
+    # Clear stale conversational context now that the order is placed —
+    # last discussed product, the numbered product-selection list, and any
+    # pending order should not leak into whatever the customer asks next.
+    # Fire-and-forget: never let this add latency to the invoice response.
+    try:
+        from db.session_store import clear_post_order_context
+        asyncio.create_task(clear_post_order_context(incoming.tenant_id, incoming.session_id))
+    except Exception:
+        pass  # never block invoice for a context-cleanup save
+
     # Save negotiation outcome to Mem0 so customer profile builds over time.
     # After a few orders, get_negotiation_profile() returns avg discount accepted,
     # typical rounds, and budget range — enabling smarter opening offers.
@@ -428,34 +464,80 @@ def _build_order_summary(incoming, product, agreed_price, qty, sub, gst, tot, st
     s_save    = round((price_raw - auto_unit) * qty, 2)
     n_save    = round((auto_unit - agreed_price) * qty, 2)
     tot_save  = round((price_raw - agreed_price) * qty, 2)
+    gst_pct   = int(incoming.gst_rate * 100)
 
-    lines = [
-        f"Here's your updated order summary, {incoming.sender_name}! 🎉", "",
-        f"• *Product:* {product}", f"• *Quantity:* {qty} units",
-    ]
+    from db.prompt_store import get_prompt
+
+    # Which scenario applies is a data-availability decision (does a store
+    # discount exist? was there also a negotiated reduction beyond it?) —
+    # that's not wording, so it stays in Python. Each scenario's actual
+    # message is fully DB-driven with a hardcoded English fallback only if
+    # the tenant hasn't seeded these prompts yet.
     if auto_pct and s_save > 0 and n_save > 0:
-        lines += [
-            f"• *Regular price:* Rs.{price_raw:,.0f}/unit",
-            f"• *Store offer {auto_pct}% OFF:* Rs.{auto_unit:,.0f}/unit",
-            f"• *Negotiated price:* Rs.{agreed_price:,.0f}/unit",
-        ]
+        try:
+            body = get_prompt(
+                incoming, "order_summary_full_discount_prompt",
+                sender_name=incoming.sender_name, product=product, qty=qty,
+                price_raw=f"{price_raw:,.0f}", auto_pct=auto_pct, auto_unit=f"{auto_unit:,.0f}",
+                agreed_price=f"{agreed_price:,.0f}", sub=f"{sub:,.0f}",
+                gst_pct=gst_pct, gst=f"{gst:,.2f}", tot=f"{tot:,.2f}",
+            )
+        except RuntimeError:
+            body = (
+                f"Here's your updated order summary, {incoming.sender_name}! 🎉\n\n"
+                f"• *Product:* {product}\n• *Quantity:* {qty} units\n"
+                f"• *Regular price:* Rs.{price_raw:,.0f}/unit\n"
+                f"• *Store offer {auto_pct}% OFF:* Rs.{auto_unit:,.0f}/unit\n"
+                f"• *Negotiated price:* Rs.{agreed_price:,.0f}/unit\n"
+                f"• *Subtotal:* Rs.{sub:,.0f}\n• *GST ({gst_pct}%):* Rs.{gst:,.2f}\n"
+                f"• *Total Payable:* Rs.{tot:,.2f}"
+            )
     elif auto_pct and s_save > 0:
-        lines += [
-            f"• *Regular price:* Rs.{price_raw:,.0f}/unit",
-            f"• *Store offer {auto_pct}% OFF:* Rs.{auto_unit:,.0f}/unit",
-        ]
+        try:
+            body = get_prompt(
+                incoming, "order_summary_store_discount_only_prompt",
+                sender_name=incoming.sender_name, product=product, qty=qty,
+                price_raw=f"{price_raw:,.0f}", auto_pct=auto_pct, auto_unit=f"{auto_unit:,.0f}",
+                sub=f"{sub:,.0f}", gst_pct=gst_pct, gst=f"{gst:,.2f}", tot=f"{tot:,.2f}",
+            )
+        except RuntimeError:
+            body = (
+                f"Here's your updated order summary, {incoming.sender_name}! 🎉\n\n"
+                f"• *Product:* {product}\n• *Quantity:* {qty} units\n"
+                f"• *Regular price:* Rs.{price_raw:,.0f}/unit\n"
+                f"• *Store offer {auto_pct}% OFF:* Rs.{auto_unit:,.0f}/unit\n"
+                f"• *Subtotal:* Rs.{sub:,.0f}\n• *GST ({gst_pct}%):* Rs.{gst:,.2f}\n"
+                f"• *Total Payable:* Rs.{tot:,.2f}"
+            )
     else:
-        lines.append(f"• *Price per unit:* Rs.{agreed_price:,.0f}")
+        try:
+            body = get_prompt(
+                incoming, "order_summary_plain_price_prompt",
+                sender_name=incoming.sender_name, product=product, qty=qty,
+                agreed_price=f"{agreed_price:,.0f}", sub=f"{sub:,.0f}",
+                gst_pct=gst_pct, gst=f"{gst:,.2f}", tot=f"{tot:,.2f}",
+            )
+        except RuntimeError:
+            body = (
+                f"Here's your updated order summary, {incoming.sender_name}! 🎉\n\n"
+                f"• *Product:* {product}\n• *Quantity:* {qty} units\n"
+                f"• *Price per unit:* Rs.{agreed_price:,.0f}\n"
+                f"• *Subtotal:* Rs.{sub:,.0f}\n• *GST ({gst_pct}%):* Rs.{gst:,.2f}\n"
+                f"• *Total Payable:* Rs.{tot:,.2f}"
+            )
 
-    lines += [
-        f"• *Subtotal:* Rs.{sub:,.0f}",
-        f"• *GST ({int(incoming.gst_rate*100)}%):* Rs.{gst:,.2f}",
-        f"• *Total Payable:* Rs.{tot:,.2f}",
-    ]
     if tot_save > 0:
-        lines += ["", f"🎁 *You save Rs.{tot_save:,.0f} on this order!*"]
-    lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
-    return "\n".join(lines)
+        try:
+            body += "\n\n" + get_prompt(incoming, "order_summary_savings_line_prompt", tot_save=f"{tot_save:,.0f}")
+        except RuntimeError:
+            body += f"\n\n🎁 *You save Rs.{tot_save:,.0f} on this order!*"
+
+    try:
+        body += "\n\n" + get_prompt(incoming, "order_summary_footer_prompt")
+    except RuntimeError:
+        body += "\n\nReply *Confirm* to place your order and receive your invoice! 🎉"
+
+    return body
 
 
 async def _save_neg_outcome_async(
@@ -465,11 +547,11 @@ async def _save_neg_outcome_async(
 ) -> None:
     """Fire-and-forget negotiation outcome save to Mem0."""
     try:
-        from db.memory_store import save_negotiation_outcome
-        await save_negotiation_outcome(
-            tenant_id     = tenant_id,
-            session_id    = session_id,
-            product_name  = product,
+        # save_negotiation_outcome lives in MemoryManager (ai/memory_manager.py)
+        from ai.memory_manager import MemoryManager
+        mm = MemoryManager(tenant_id, session_id)
+        await mm.save_negotiation_outcome(
+            product       = product,
             opening_price = opening_price,
             final_price   = final_price,
             rounds        = rounds,
