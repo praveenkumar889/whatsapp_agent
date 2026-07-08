@@ -198,7 +198,7 @@ class MemoryPolicy:
 
         if workflow in cls._DENY_WORKFLOWS and not worthy:
             decision = MemoryDecision(retrieve=False, reason="deny_workflow")
-        elif isinstance(intent, str) and intent in cls._ALLOW_INTENTS:
+        elif intent in cls._ALLOW_INTENTS:
             types, max_results = cls._TYPES_BY_INTENT.get(intent, cls._DEFAULT_TYPES)
             decision = MemoryDecision(retrieve=True, types=types, max_results=max_results, reason="allow_intent")
         elif worthy:

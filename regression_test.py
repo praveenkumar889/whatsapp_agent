@@ -62,6 +62,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
+DEFAULT_TENANT_ID = "tenant_inventaa_led_001"  # used as reset() fallback so a forgotten
+                                                 # --tenant-id can't silently no-op every reset
+
 try:
     import requests
 except ImportError:
@@ -144,11 +147,13 @@ class Suite:
 
     def reset(self, phone: Optional[str] = None):
         p = phone or self.phone
-        payload = {"phone": p}
-        if self.tenant_id:
-            payload["tenant_id"] = self.tenant_id
+        payload = {"phone": p, "tenant_id": self.tenant_id or DEFAULT_TENANT_ID}
         try:
-            requests.post(f"{self.base_url}/reset", json=payload, timeout=15)
+            r = requests.post(f"{self.base_url}/reset", json=payload, timeout=15)
+            if r.status_code != 200:
+                print(f"  [WARN] /reset returned HTTP {r.status_code} for {p} — state was NOT cleared. "
+                      f"Response: {r.text[:200]}")
+                print(f"  [WARN] Every check from here on may be contaminated by leftover state from a prior run.")
         except Exception as e:
             print(f"  [WARN] /reset failed (continuing anyway): {e}")
 
@@ -403,7 +408,7 @@ def main():
                          help="Required unless DEFAULT_PHONE_NUMBER_ID is set in your .env — "
                               "the /chat endpoint refuses to guess a tenant's phone_number_id "
                               "(a deliberate safety fix; see main.py::chat_endpoint).")
-    parser.add_argument("--tenant-id", default=None)
+    parser.add_argument("--tenant-id", default=DEFAULT_TENANT_ID)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 

@@ -1,4 +1,4 @@
-    # ai/memory_metrics.py — Lightweight observability for the memory subsystem
+# ai/memory_metrics.py — Lightweight observability for the memory subsystem
 #
 # ROLE:
 #   Tracks the counters your review specifically asked for:
