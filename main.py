@@ -279,13 +279,19 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
 
         latency = round(time.monotonic() - _t0, 2)
         print(f"[TIMING] TOTAL pipeline time: {latency}s")
+        # If the negotiator deferred (message wasn't negotiation-related —
+        # e.g. an escalation request arriving mid-negotiation), the ACTUAL
+        # intent used for routing differs from result.intent (which may
+        # still be the NEG_BYPASS stub). Report the real one.
+        _reported_intent = getattr(incoming, "_deferred_intent", None) or result.intent
         return {
             "replies": incoming.captured_replies,
             "debug": {
-                "intent":     result.intent,
+                "intent":     _reported_intent,
                 "confidence": result.confidence_score,
                 "latency":    latency,
-                "route":      _get_route(result),
+                "route":      _get_route(result) if _reported_intent == result.intent
+                              else _get_route_for_intent(_reported_intent),
                 "tenant_id":  incoming.tenant_id,
             },
         }
@@ -380,13 +386,24 @@ async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional
 
 
 def _get_route(result) -> str:
+    from ai.handlers import DEFAULT_INTENT_MIN_CONFIDENCE
     if result.intent == "GREETING":
         return "Greeting Handler"
     if result.intent == "HUMAN_ESCALATION":
         return "Human Handoff Escalation"
-    if result.intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or result.confidence_score < 0.50:
+    if result.intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or result.confidence_score < DEFAULT_INTENT_MIN_CONFIDENCE:
         return "GraphRAG / Catalog"
     return "Unknown Intent Handler"
+
+
+def _get_route_for_intent(intent: str) -> str:
+    """Same mapping as _get_route(), for the deferred-intent case where we
+    only have the intent string, not a full IntentResult with a confidence score."""
+    if intent == "GREETING":
+        return "Greeting Handler"
+    if intent == "HUMAN_ESCALATION":
+        return "Human Handoff Escalation"
+    return "GraphRAG / Catalog"
 
 
 def _empty_result() -> dict:

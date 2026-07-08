@@ -344,4 +344,11 @@ PROMPT_KEYS: dict = {
     "order_summary_plain_price_prompt":           "order_summary_plain_price_prompt",
     "order_summary_savings_line_prompt":          "order_summary_savings_line_prompt",
     "order_summary_footer_prompt":                "order_summary_footer_prompt",
+
+    # Migration 023 — remaining hardcoded strings
+    "neg_upsell_hint_prompt":                     "neg_upsell_hint_prompt",
+    "neg_max_discount_unlocked_prompt":           "neg_max_discount_unlocked_prompt",
+    "neg_already_confirmed_prompt":               "neg_already_confirmed_prompt",
+    "pf_invalid_number_prompt":                   "pf_invalid_number_prompt",
+    "pf_no_product_name_prompt":                  "pf_no_product_name_prompt",
 }

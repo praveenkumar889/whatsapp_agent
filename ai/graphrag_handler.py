@@ -39,6 +39,20 @@ def _load_category_prompt(incoming, cat_list: str) -> str:
     return get_prompt(incoming, "category_matcher_prompt", cat_list=cat_list)
 
 
+def _reply_prompt(incoming, key: str, fallback: str, **kwargs) -> str:
+    """
+    Renders a DB-driven customer-facing reply, falling back to `fallback`
+    (plain English) only if the tenant hasn't seeded this prompt key yet
+    (migration 019). Every hardcoded customer-facing string in this file
+    now goes through this helper instead of being a bare Python literal.
+    """
+    from db.prompt_store import get_prompt
+    try:
+        return get_prompt(incoming, key, **kwargs)
+    except RuntimeError:
+        return fallback
+
+
 
 _client = AzureOpenAI(
     azure_endpoint = AZURE_AI_ENDPOINT,
@@ -122,7 +136,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     except Exception as e:
         print(f"[GRAPHRAG] tenant_offers save failed (non-critical): {e}")
 
-    MAX_IMAGE_PRODUCTS = 3
+    MAX_IMAGE_PRODUCTS = getattr(incoming, "max_image_products", None) or 3
     for i, p in enumerate(products, 1):
         if i > MAX_IMAGE_PRODUCTS:
             break
@@ -166,7 +180,11 @@ async def _send_structured_product_list(incoming, products: list) -> str:
                     region        = incoming.region,
                 )
 
-    lines = [f"Here are the options for you, {incoming.sender_name}! 💡\n"]
+    lines = [_reply_prompt(
+        incoming, "graphrag_product_list_header_prompt",
+        fallback=f"Here are the options for you, {incoming.sender_name}! 💡\n",
+        sender_name=incoming.sender_name,
+    )]
     for i, p in enumerate(products, 1):
         name      = p.get("name", "Product")
         price     = p.get("price_num", 0)
@@ -181,7 +199,10 @@ async def _send_structured_product_list(incoming, products: list) -> str:
             lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
 
     lines.append(
-        f"\nReply with the product *number* or *name* to know more or place an order."
+        "\n" + _reply_prompt(
+            incoming, "graphrag_product_list_footer_prompt",
+            fallback="Reply with the product *number* or *name* to know more or place an order.",
+        )
     )
 
     summary_text = "\n".join(lines)
@@ -417,9 +438,11 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         if not effective_graphrag_url:
             print(f"[GRAPHRAG] No GraphRAG URL configured for tenant {incoming.tenant_id}")
             support = getattr(incoming, 'support_email', None) or incoming.biz_name
-            return (
-                f"I'm not able to look up products right now, {incoming.sender_name}. "
-                f"Please contact *{support}* for assistance."
+            return _reply_prompt(
+                incoming, "graphrag_no_url_configured_prompt",
+                fallback=f"I'm not able to look up products right now, {incoming.sender_name}. "
+                         f"Please contact *{support}* for assistance.",
+                sender_name=incoming.sender_name, support=support,
             )
 
         print(f"[GRAPHRAG] Calling {effective_graphrag_url[:60]} for: '{graphrag_text[:60]}'")
@@ -436,19 +459,23 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         if response.status_code == 403:
             print(f"[GRAPHRAG] 403 — host not whitelisted")
             support = getattr(incoming, 'support_email', None) or incoming.biz_name
-            return (
-                f"Thanks for your interest, {incoming.sender_name}! 😊\n\n"
-                f"I'm having trouble fetching product information right now.\n"
-                f"Please contact *{support}* for assistance."
+            return _reply_prompt(
+                incoming, "graphrag_403_error_prompt",
+                fallback=f"Thanks for your interest, {incoming.sender_name}! 😊\n\n"
+                         f"I'm having trouble fetching product information right now.\n"
+                         f"Please contact *{support}* for assistance.",
+                sender_name=incoming.sender_name, support=support,
             )
 
         if response.status_code != 200:
             print(f"[GRAPHRAG] HTTP {response.status_code}")
             support = getattr(incoming, 'support_email', None) or incoming.biz_name
-            return (
-                f"I'm having trouble fetching product information right now, "
-                f"{incoming.sender_name}. 🔧\n\n"
-                f"Please try again shortly or contact *{support}*"
+            return _reply_prompt(
+                incoming, "graphrag_http_error_prompt",
+                fallback=f"I'm having trouble fetching product information right now, "
+                         f"{incoming.sender_name}. 🔧\n\n"
+                         f"Please try again shortly or contact *{support}*",
+                sender_name=incoming.sender_name, support=support,
             )
 
         data = response.json()
@@ -479,17 +506,25 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             collections = response_text.get("available_collections", [])
             clarify_msg = response_text.get(
                 "message",
-                "Could you let me know which category you're interested in?"
+                _reply_prompt(incoming, "graphrag_category_clarify_default",
+                               fallback="Could you let me know which category you're interested in?")
             )
             print(f"[GRAPHRAG] Needs clarification — {len(collections)} collections offered")
 
-            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+            lines = [_reply_prompt(
+                incoming, "graphrag_category_clarify_greeting_prompt",
+                fallback=f"Hi {incoming.sender_name}! {clarify_msg}",
+                sender_name=incoming.sender_name, clarify_msg=clarify_msg,
+            )]
             if collections:
                 lines.append("")
                 for i, c in enumerate(collections, 1):
                     lines.append(f"*{i}.* {c}")
                 lines.append("")
-                lines.append("Just reply with the collection name and I'll show you the options! 💡")
+                lines.append(_reply_prompt(
+                    incoming, "graphrag_category_clarify_footer_prompt",
+                    fallback="Just reply with the collection name and I'll show you the options! 💡",
+                ))
                 try:
                     await save_category_selection(incoming.tenant_id, incoming.session_id, collections)
                     print(f"[CATEGORY] Saved {len(collections)} category options for follow-up")
@@ -512,9 +547,11 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # friendly message instead of ever exposing raw API internals.
         if isinstance(response_text, list) and len(response_text) == 0:
             print(f"[GRAPHRAG] Empty product list — no matches found")
-            return (
-                f"Sorry {incoming.sender_name}, I couldn't find any products matching that. "
-                f"Could you try describing it differently, or browse all products at {incoming.website or incoming.biz_name}? 💡"
+            return _reply_prompt(
+                incoming, "graphrag_empty_results_prompt",
+                fallback=f"Sorry {incoming.sender_name}, I couldn't find any products matching that. "
+                         f"Could you try describing it differently, or browse all products at {incoming.website or incoming.biz_name}? 💡",
+                sender_name=incoming.sender_name, website=(incoming.website or incoming.biz_name),
             )
 
         reply_str = str(response_text).strip() if response_text else str(data)
@@ -560,15 +597,23 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
                             collections = retry_text.get("available_collections", [])
                             clarify_msg = retry_text.get(
                                 "message",
-                                "Could you let me know which category you're interested in?"
+                                _reply_prompt(incoming, "graphrag_category_clarify_default",
+                                               fallback="Could you let me know which category you're interested in?")
                             )
-                            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+                            lines = [_reply_prompt(
+                                incoming, "graphrag_category_clarify_greeting_prompt",
+                                fallback=f"Hi {incoming.sender_name}! {clarify_msg}",
+                                sender_name=incoming.sender_name, clarify_msg=clarify_msg,
+                            )]
                             if collections:
                                 lines.append("")
                                 for i, c in enumerate(collections, 1):
                                     lines.append(f"*{i}.* {c}")
                                 lines.append("")
-                                lines.append("Just reply with the collection name and I'll show you the options! 💡")
+                                lines.append(_reply_prompt(
+                                    incoming, "graphrag_category_clarify_footer_prompt",
+                                    fallback="Just reply with the collection name and I'll show you the options! 💡",
+                                ))
                                 try:
                                     await save_category_selection(incoming.tenant_id, incoming.session_id, collections)
                                     print(f"[CATEGORY] Saved {len(collections)} category options (retry path)")
@@ -585,9 +630,11 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             # raw error string to the customer — replace with a friendly message.
             if len(reply_str) <= 100 and ("error" in reply_str.lower() or "sorry" in reply_str.lower()):
                 print(f"[GRAPHRAG] Retry did not resolve the error — sending friendly fallback")
-                return (
-                    f"Sorry {incoming.sender_name}, I'm having trouble finding that right now. "
-                    f"Could you try rephrasing, or browse all products at {incoming.website or incoming.biz_name}? 💡"
+                return _reply_prompt(
+                    incoming, "graphrag_retry_failed_prompt",
+                    fallback=f"Sorry {incoming.sender_name}, I'm having trouble finding that right now. "
+                             f"Could you try rephrasing, or browse all products at {incoming.website or incoming.biz_name}? 💡",
+                    sender_name=incoming.sender_name, website=(incoming.website or incoming.biz_name),
                 )
 
         if len(reply_str) <= 4096:
@@ -625,9 +672,14 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         print(f"[GRAPHRAG] Traceback: {traceback.format_exc()[-300:]}")
         support = getattr(incoming, 'support_email', None) or incoming.biz_name
         website = getattr(incoming, 'website', None) or ""
-        return (
+        _fallback_lines = (
             f"Thanks for your interest in our products, {incoming.sender_name}! 💡\n\n"
             f"Our product search is temporarily unavailable. Meanwhile:\n\n"
             + (f"• Browse all products at *{website}*\n" if website else "")
             + f"\nNeed help? Contact *{support}*"
+        )
+        return _reply_prompt(
+            incoming, "graphrag_exception_fallback_prompt",
+            fallback=_fallback_lines,
+            sender_name=incoming.sender_name, support=support, website=website,
         )

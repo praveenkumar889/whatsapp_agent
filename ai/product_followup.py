@@ -588,6 +588,27 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         incoming.tenant_id, incoming.session_id, result["state"]
                     )
 
+                    # DEFERRAL: the negotiator determined this message isn't
+                    # negotiation-related after all (e.g. a greeting or an
+                    # escalation request arriving mid-negotiation) — route it
+                    # properly instead of repeating the current offer.
+                    # Negotiation state above is already saved UNCHANGED, so
+                    # the customer can resume negotiating afterward.
+                    if result.get("defer_intent") is not None:
+                        _defer_intent = result["defer_intent"].intent
+                        incoming._deferred_intent = _defer_intent  # so main.py's debug output reflects the real routing decision, not the stale NEG_BYPASS value
+                        print(f"[FOLLOW-UP] Negotiator deferred (intent={_defer_intent}) — routing directly")
+                        if _defer_intent == "GREETING":
+                            from ai.handlers import handle_greeting
+                            return await handle_greeting(incoming)
+                        elif _defer_intent == "HUMAN_ESCALATION":
+                            from ai.handlers import handle_escalation
+                            return await handle_escalation(incoming)
+                        # Fall through to normal product_followup handling below
+                        # for any other deferred intent (shouldn't normally
+                        # reach here — negotiator.py only defers on GREETING/
+                        # HUMAN_ESCALATION today — but fail safe rather than crash).
+
                     if result["order_ready"] and result["agreed_price"]:
                         # FIX BUGS 1,2,3,4: order_ready=True means negotiation is concluded
                         # (floor reached, acceptance detected, or rounds exhausted).
@@ -630,7 +651,13 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             new_agreed = float(result["agreed_price"])
                             if abs(old_agreed - new_agreed) < 1.0:
                                 print(f"[NEGOTIATOR] Already awaiting confirmation at Rs.{old_agreed} — skipping duplicate summary")
-                                return f"You've already confirmed Rs.{old_agreed:,.0f}/unit, {incoming.sender_name}. Please reply *Confirm* to place your order! 🎉"
+                                try:
+                                    return get_prompt(
+                                        incoming, "neg_already_confirmed_prompt",
+                                        old_agreed=f"{old_agreed:,.0f}", sender_name=incoming.sender_name,
+                                    )
+                                except RuntimeError:
+                                    return f"You've already confirmed Rs.{old_agreed:,.0f}/unit, {incoming.sender_name}. Please reply *Confirm* to place your order! 🎉"
 
                         # Do NOT create order yet — show summary first and wait for Confirm
                         agreed  = result["agreed_price"]
@@ -658,11 +685,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                                 _ov71     = agreed * qty
                                 _next71   = _gnt71(_ov71, _tiers71)
                                 if _next71:
+                                    from ai.negotiator import upsell_hint as _uh71
                                     _vgap71 = round(_next71[0] - _ov71, 0)
                                     _u71 = max(1, int(_vgap71 / agreed) + 1)
-                                    _conf_upsell = (f"\n\n💡 Add Rs.{_vgap71:,.0f} more to your order value "
-                                                    f"(approx. {_u71} more unit(s)) to reach Rs.{_next71[0]:,} "
-                                                    f"and unlock *{_next71[1]}% off*!")
+                                    _conf_upsell = _uh71(incoming, _vgap71, _u71, _next71[0], _next71[1])
                         except Exception as _e71:
                             print(f"[CONFIRM] Upsell calc failed: {_e71}")
                         # ── FIX Bug 3 (Major): only show negotiation labels when
@@ -1280,24 +1306,33 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     parsed["_number_was_list_position"] = True  # threaded downstream to suppress quantity inference
                 else:
                     print(f"[FOLLOW-UP] '{extracted_number}' out of range for list size={len(selection)} — asking for product name")
-                    return (
-                        f"Hi {incoming.sender_name}! That number isn't in the list (1-{len(selection)}). "
-                        f"Could you please reply with the *product name* instead? 😊"
-                    )
+                    try:
+                        return get_prompt(
+                            incoming, "pf_invalid_number_prompt",
+                            sender_name=incoming.sender_name, list_size=len(selection),
+                        )
+                    except RuntimeError:
+                        return (
+                            f"Hi {incoming.sender_name}! That number isn't in the list (1-{len(selection)}). "
+                            f"Could you please reply with the *product name* instead? 😊"
+                        )
 
             elif bot_asked_quantity:
                 # (b) Legitimate quantity context — let existing downstream logic
                 # (Case 3 / quantity injection) handle it normally.
-                print(f"[FOLLOW-UP] Product '{(_neg_for_bare_num or {}).get('product_name')}' awaiting quantity — "
+                print(f"[FOLLOW-UP] Product '{_neg_for_bare_num.get('product_name')}' awaiting quantity — "
                       f"'{extracted_number}' treated as QUANTITY, falling through")
 
             else:
                 # (c) Ambiguous — no product awaiting quantity, no active list.
                 # Do not guess; ask for the product name.
                 print(f"[FOLLOW-UP] Bare number '{extracted_number}' with no list/quantity context — asking for product name instead of guessing")
-                return (
-                    f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
-                    f"you'd like to know more about or order? 😊"
+                try:
+                    return get_prompt(incoming, "pf_no_product_name_prompt", sender_name=incoming.sender_name)
+                except RuntimeError:
+                    return (
+                        f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
+                        f"you'd like to know more about or order? 😊"
                 )
 
     # ── New-search guard before Case 3 ──────────────────────────────────────
@@ -1588,24 +1623,26 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     product_context["auto_offer_disc_pct"]   = _disc
                     product_context["auto_offer_unit_price"] = _disc_price
                     product_context["auto_offer_total"]      = _disc_total
+                    # NOTE: product_context["auto_offer_upsell"] below is set
+                    # but confirmed unused anywhere else in this codebase —
+                    # dead code, same class of finding as product_store.py's
+                    # old floor_price field. Kept consistent with the shared
+                    # helper rather than removed, in case something wires it
+                    # in later; not spending more effort on it than that.
                     if _next_t:
+                        from ai.negotiator import upsell_hint as _uh2
                         # FIX Bug 1: gap must use _disc_total (the DISPLAYED subtotal)
                         # as the base, not _order_val (which is price_num × qty, the
                         # un-discounted value). _ov_check was undefined — using the
                         # wrong value caused gap to be off by (price - disc_price) × qty.
                         _gap2next = round(_next_t[0] - _disc_total, 0)
                         _u2next   = max(1, int(_gap2next / _disc_price) + 1)
-                        product_context["auto_offer_upsell"] = (
-                            f"💡 Add Rs.{_gap2next:,.0f} more to your order value "
-                            f"(approx. {_u2next} more unit(s)) to reach Rs.{_next_t[0]:,} "
-                            f"and unlock *{_next_t[1]}% off*!"
-                        )
+                        product_context["auto_offer_upsell"] = _uh2(incoming, _gap2next, _u2next, _next_t[0], _next_t[1])
                     elif _disc > 0:
+                        from ai.negotiator import max_discount_hint as _mdh2
                         # Customer already at max tier — celebrate it
                         _max_disc2 = max(d for _, d in _tiers)
-                        product_context["auto_offer_upsell"] = (
-                            f"🎉 You've unlocked our *maximum store discount of {_max_disc2}% OFF*!"
-                        )
+                        product_context["auto_offer_upsell"] = _mdh2(incoming, _max_disc2)
                     print(f"[OFFER] Auto-applied {_disc}% to {product_name} x {parsed_qty}")
         except Exception as _aoe:
             print(f"[OFFER] Auto-apply failed: {_aoe}")

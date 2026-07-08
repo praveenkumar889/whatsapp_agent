@@ -23,6 +23,44 @@ DEFAULT_FLOOR_DISC_PCT = 5   # default — see get_negotiation_floor_disc()
 DEFAULT_FLOOR_MULTIPLIER = 0.95   # default — see get_floor_multiplier()
 
 
+def upsell_hint(incoming, value_gap: float, units_needed: int, next_min_val, next_disc_pct: int) -> str:
+    """
+    Shared "add Rs.X more to unlock Y% off" hint — was duplicated as a
+    hardcoded f-string in 4 places (negotiator.py first-offer path,
+    negotiator.py qty-change path, product_followup.py auto-offer path,
+    product_followup.py fresh-order path).
+    """
+    try:
+        return get_prompt(
+            incoming, "neg_upsell_hint_prompt",
+            value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
+            next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct,
+        )
+    except RuntimeError:
+        return (
+            f"\n\n💡 Add Rs.{value_gap:,.0f} more to your order value "
+            f"(approx. {units_needed} more unit(s)) to reach Rs.{next_min_val:,} "
+            f"and unlock *{next_disc_pct}% off*!"
+        )
+
+
+def max_discount_hint(incoming, max_disc: int, just_unlocked: bool = False) -> str:
+    """
+    Shared "you've unlocked our maximum store discount" hint — same
+    duplication pattern as upsell_hint() above. `just_unlocked` preserves
+    the two slightly different original wordings ("unlocked" vs "just
+    unlocked") depending on which call site fires.
+    """
+    qualifier = "just " if just_unlocked else ""
+    try:
+        return get_prompt(
+            incoming, "neg_max_discount_unlocked_prompt",
+            max_disc=max_disc, qualifier=qualifier,
+        )
+    except RuntimeError:
+        return f"\n\n🎉 You've {qualifier}unlocked our *maximum store discount of {max_disc}% OFF*!"
+
+
 def get_max_negotiation_rounds(incoming=None) -> int:
     """
     Tenant-configurable max negotiation rounds before forcing a final price.
@@ -513,14 +551,10 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
             next_min_val, next_disc_pct = next_tier
             value_gap    = round(next_min_val - offer.get("order_value", 0), 0)
             units_needed = max(1, int(value_gap / price_num) + 1)
-            base_reply += (
-                f"\n\n💡 Add Rs.{value_gap:,.0f} more to your order value "
-                f"(approx. {units_needed} more unit(s)) to reach Rs.{next_min_val:,} "
-                f"and unlock *{next_disc_pct}% off*!"
-            )
+            base_reply += upsell_hint(incoming, value_gap, units_needed, next_min_val, next_disc_pct)
         elif offer.get("current_tier_disc", 0) > 0:
             max_disc = max(d for _, d in tiers)
-            base_reply += f"\n\n🎉 You've unlocked our *maximum store discount of {max_disc}% OFF*!"
+            base_reply += max_discount_hint(incoming, max_disc)
 
     return base_reply
 
@@ -992,11 +1026,7 @@ async def handle_negotiation(
             next_min_val, next_disc_pct = next_tier
             value_gap    = round(next_min_val - offer["order_value"], 0)
             units_needed = max(1, int(value_gap / price_num) + 1)
-            upsell_line = (
-                f"\n\n💡 Add Rs.{value_gap:,.0f} more to your order value "
-                f"(approx. {units_needed} more unit(s)) to reach Rs.{next_min_val:,} "
-                f"and unlock *{next_disc_pct}% off*!"
-            )
+            upsell_line = upsell_hint(incoming, value_gap, units_needed, next_min_val, next_disc_pct)
         elif tiers and offer.get("current_tier_disc", 0) > 0:
             # Only show the "maximum tier unlocked" message when the customer
             # JUST crossed into the top tier this message — not on every
@@ -1005,7 +1035,7 @@ async def handle_negotiation(
             prev_tier_disc = negotiation_state.get("current_tier_disc", 0)
             max_disc       = max(d for _, d in tiers)
             if offer.get("current_tier_disc", 0) >= max_disc and offer.get("current_tier_disc", 0) > prev_tier_disc:
-                upsell_line = f"\n\n🎉 You've just unlocked our *maximum store discount of {max_disc}% OFF*!"
+                upsell_line = max_discount_hint(incoming, max_disc, just_unlocked=True)
             # else: already at max tier on previous message — no need to repeat
 
         # ── Bugs 1,3,4,5,6,7 fix: clean single-message quantity-change reply ──
@@ -1096,6 +1126,29 @@ async def handle_negotiation(
     # (either from Phase 2 structured extraction or Phase 1 parallel batches)
 
     if not counter and not more_disc:
+        # BUG FIX: this branch previously repeated the current offer
+        # unconditionally for ANY message that didn't match accept/qty-change/
+        # counter-offer/more-discount — including "I want to speak to a human
+        # agent, this is urgent" and "what is your business address". Neither
+        # is a negotiation continuation; both were incorrectly answered with
+        # "our current offer is Rs.X...". Check with a real classifier before
+        # assuming the customer is still haggling. Only runs in this rare
+        # stalemate branch, not the common negotiation path, so the extra
+        # LLM call only costs latency on genuinely off-topic interruptions.
+        try:
+            from ai.handlers import classify_intent
+            _defer_result = await classify_intent(msg, session_history, incoming)
+        except Exception as e:
+            print(f"[NEGOTIATOR] Deferral classify_intent failed (non-critical): {e}")
+            _defer_result = None
+
+        if _defer_result and _defer_result.intent in ("GREETING", "HUMAN_ESCALATION"):
+            print(f"[NEGOTIATOR] Message not negotiation-related (intent={_defer_result.intent}) "
+                  f"— deferring to normal routing, negotiation state preserved")
+            return {"reply": None, "defer_intent": _defer_result,
+                    "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer),
+                    "order_ready": False, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
+
         try:
             _stalemate_reply = get_prompt(
                 incoming, "neg_stalemate_reply_prompt",

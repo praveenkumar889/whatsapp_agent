@@ -47,7 +47,9 @@ async def dispatch(incoming, result, session_history: list) -> str:
         from ai.handlers import handle_escalation
         return await handle_escalation(incoming)
 
-    if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < 0.50:
+    from ai.handlers import DEFAULT_INTENT_MIN_CONFIDENCE
+    _min_conf = getattr(incoming, "intent_min_confidence", None) or DEFAULT_INTENT_MIN_CONFIDENCE
+    if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
         from ai.graphrag_handler import call_graphrag_api
         return await call_graphrag_api(incoming, session_history)
 
@@ -248,6 +250,22 @@ async def _resume_negotiation(incoming, neg_state: dict, session_history: list) 
         negotiation_state     = resumed,
         global_offers         = global_offers,
     )
+
+    # DEFERRAL: see product_followup.py's identical handling — the negotiator
+    # determined this message isn't negotiation-related (greeting/escalation
+    # arriving while awaiting invoice confirmation). Route it properly
+    # instead of returning ng_result["reply"], which would be None here.
+    if ng_result.get("defer_intent") is not None:
+        await save_negotiation_state(incoming.tenant_id, incoming.session_id, ng_result["state"])
+        _defer_intent = ng_result["defer_intent"].intent
+        incoming._deferred_intent = _defer_intent  # so main.py's debug output reflects the real routing decision
+        print(f"[NEG RESUME] Negotiator deferred (intent={_defer_intent}) — routing directly")
+        if _defer_intent == "GREETING":
+            from ai.handlers import handle_greeting
+            return await handle_greeting(incoming)
+        elif _defer_intent == "HUMAN_ESCALATION":
+            from ai.handlers import handle_escalation
+            return await handle_escalation(incoming)
 
     if ng_result["order_ready"] and ng_result["agreed_price"]:
         negotiator_reply = ng_result.get("reply", "")

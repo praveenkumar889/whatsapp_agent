@@ -109,18 +109,11 @@ def _apply_tenant(incoming: IncomingMessage, info: dict) -> None:
     incoming.gstin        = info.get("gstin")
     incoming.state_code   = info.get("state_code")
     incoming.gst_rate     = float(info.get("gst_rate") or 18) / 100
-    incoming.max_negotiation_rounds = (
-        int(info["max_negotiation_rounds"])
-        if info.get("max_negotiation_rounds") is not None else None
-    )
-    incoming.neg_floor_disc_pct = (
-        int(info["neg_floor_disc_pct"])
-        if info.get("neg_floor_disc_pct") is not None else None
-    )
-    incoming.neg_floor_multiplier = (
-        float(info["neg_floor_multiplier"])
-        if info.get("neg_floor_multiplier") is not None else None
-    )
+    incoming.max_negotiation_rounds = int(info["max_negotiation_rounds"]) if info.get("max_negotiation_rounds") else None
+    incoming.neg_floor_disc_pct     = int(info["neg_floor_disc_pct"]) if info.get("neg_floor_disc_pct") else None
+    incoming.neg_floor_multiplier   = float(info["neg_floor_multiplier"]) if info.get("neg_floor_multiplier") else None
+    incoming.intent_min_confidence  = float(info["intent_min_confidence"]) if info.get("intent_min_confidence") else None
+    incoming.max_image_products     = int(info["max_image_products"]) if info.get("max_image_products") else None
     incoming.valid_intents    = info.get("valid_intents") or None
     incoming.graphrag_api_url = info.get("graphrag_api_url") or None
     incoming.products_api_url = info.get("products_api_url") or None

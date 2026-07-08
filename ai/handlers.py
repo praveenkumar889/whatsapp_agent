@@ -27,6 +27,7 @@ _client = AzureOpenAI(
 )
 
 DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION", "GREETING", "UNKNOWN"}
+DEFAULT_INTENT_MIN_CONFIDENCE = 0.50  # default — see incoming.intent_min_confidence for tenant override
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -68,7 +69,8 @@ async def classify_intent(
         conf   = float(parsed.get("confidence_score", 0.0))
         conf   = max(0.0, min(1.0, conf))
 
-        if intent not in valid_intents or conf < 0.50:
+        _min_conf = getattr(incoming, "intent_min_confidence", None) or DEFAULT_INTENT_MIN_CONFIDENCE
+        if intent not in valid_intents or conf < _min_conf:
             intent, conf = "UNKNOWN", 0.0
 
         print(f"[INTENT ROUTER] '{customer_message[:60]}' => {intent} ({conf:.2f})")
