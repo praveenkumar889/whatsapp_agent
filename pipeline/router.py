@@ -104,7 +104,7 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
             updated = {**pre_neg_state, "awaiting_invoice_confirmation": True,
                        "counter_offer_presented": False, "last_offer_price": pr.negotiated_unit_price}
             await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated)
-            return pr.to_whatsapp_summary(product, incoming.sender_name)
+            return pr.to_whatsapp_summary(product, incoming.sender_name, incoming=incoming)
         else:
             # Customer still negotiating — politely hold our final price
             final_price = float(pre_neg_state.get("last_offer_price", 0))

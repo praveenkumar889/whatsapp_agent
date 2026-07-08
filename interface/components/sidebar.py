@@ -36,11 +36,8 @@ def render_sidebar():
     st.sidebar.markdown("### ⚙️ Session Control")
     
     if st.sidebar.button("🔄 Reset Conversation", use_container_width=True):
-        if not customer_phone:
-            st.sidebar.warning("Please enter a phone number before resetting.")
-        else:
-            with st.spinner("Clearing database history..."):
-                success = reset_session_on_backend(customer_phone)
+        with st.spinner("Clearing database history..."):
+            success = reset_session_on_backend(customer_phone)
             if success:
                 st.session_state.messages = []
                 st.session_state.debug_info = None

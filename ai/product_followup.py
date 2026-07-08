@@ -45,50 +45,6 @@ _client = AzureOpenAI(
 )
 
 
-def normalize_parsed(parsed: dict) -> dict:
-    """
-    Normalizes the follow-up parser's output to one stable schema.
-
-    WHY THIS EXISTS:
-        pf_data_extraction_prompt's real LLM output uses "parsed_order_quantity"
-        for quantity, while the exception-fallback dict inside
-        _parse_followup_message historically used "quantity" — and downstream
-        code read "quantity" directly. Since the LLM path is the normal path,
-        parsed_qty was silently None on every successful parse. This is what
-        caused negotiation_state to never receive a real quantity across turns.
-
-        Call this ONCE at the source (inside _parse_followup_message, below)
-        rather than at every call site — every caller downstream should read
-        parsed["quantity"] and parsed["selected_product_name"] ONLY, never
-        "parsed_order_quantity" or "product_name" directly. This is the single
-        place that class of bug gets fixed, instead of scattered
-        parsed.get(a, parsed.get(b)) fallbacks at every read site.
-    """
-    normalized = dict(parsed)  # preserve any other keys untouched (e.g. is_comparison)
-    normalized["quantity"] = parsed.get("parsed_order_quantity", parsed.get("quantity"))
-    normalized["selected_product_name"] = (
-        parsed.get("selected_product_name") or parsed.get("product_name")
-    )
-    # Tri-state (True/False/None) — these two fields are part of the
-    # consolidated classifier schema (collapsing what used to be 3 separate
-    # LLM calls into this one parse). None means the tenant's
-    # pf_data_extraction_prompt hasn't been updated to include them yet;
-    # callers must treat None as "unknown", not "False" — see the fallback
-    # logic in _try_resolve_product_followup and ai/memory_policy.py.
-    normalized["is_negotiation_request"]  = parsed.get("is_negotiation_request")
-    normalized["needs_long_term_memory"]  = parsed.get("needs_long_term_memory")
-    return normalized
-
-
-# Mem0 retrieval gating now lives in ai/memory_policy.py (MemoryPolicy) —
-# a single reusable decision point shared by this file, negotiator.py,
-# graphrag_handler.py, and any future agent module, instead of each
-# reimplementing its own heuristic. See that module for the full rationale
-# and its documented limitations/extension path.
-from ai.memory_policy import MemoryPolicy, MemoryRequest
-from ai import perf_metrics
-
-
 async def _parse_followup_message(incoming, selection: list, session_history: Optional[list] = None) -> dict:
     """
     Uses LLM to parse the follow-up message to identify if they are:
@@ -98,10 +54,6 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
     - requesting images (asks_for_image)
     - performing a new category search / broad search (is_new_search)
     Zero hardcoding.
-
-    Always returns a dict normalized via normalize_parsed() — callers should
-    read result["quantity"] and result["selected_product_name"], never the
-    raw LLM schema keys.
     """
     product_names = [p.get("product_name") or p.get("name") or "" for p in selection]
     try:
@@ -113,7 +65,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
                 max_tokens  = 200,
                 temperature = 0,
                 messages    = [
-                    {"role": "system", "content": get_prompt(incoming, "pf_data_extraction_prompt", biz_name=incoming.biz_name, product_catalog=json.dumps([p.get("product_name","") for p in (selection or [])], ensure_ascii=False))},
+                    {"role": "system", "content": get_prompt(incoming, "pf_data_extraction_prompt")},
                     *recent_history,
                     {"role": "user", "content": incoming.text},
                 ],
@@ -131,22 +83,19 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
             if lines[-1].startswith("```"):
                 lines = lines[:-1]
             content = "\n".join(lines).strip()
-        return normalize_parsed(json.loads(content))
+        return json.loads(content)
     except Exception as e:
         print(f"[FOLLOW-UP] LLM parser failed: {e}")
-        return normalize_parsed({
+        return {
             "selected_product_name": None,
             "quantity": None,
-            "parsed_order_quantity": None,
             "quantity_unit": None,
             "is_comparison": False,
             "is_recommendation": False,
             "is_offer_inquiry": False,
             "asks_for_image": False,
-            "is_new_search": False,
-            "is_negotiation_request": None,
-            "needs_long_term_memory": None,
-        })
+            "is_new_search": False
+        }
 
 
 async def _get_active_product_context(
@@ -275,8 +224,7 @@ async def _handle_comparison(
 
     system_prompt = get_prompt(
         incoming, "pf_comparison_prompt",
-        biz_name      = incoming.biz_name,
-        sender_name   = incoming.sender_name,
+        sender_name = incoming.sender_name,
         products_data = products_data,
         price_reference = price_reference,
     )
@@ -306,21 +254,6 @@ async def _handle_comparison(
         print(f"[FOLLOW-UP] Comparison/recommendation LLM failed: {e}")
         return "I had trouble with that right now. Which product would you like to know more about?"
 
-
-
-
-async def _save_product_to_mem0(tenant_id: str, session_id: str, product: dict) -> None:
-    """
-    Saves selected product context to Mem0 immediately on selection.
-    Fire-and-forget — never blocks the response.
-    Enables: "is it waterproof?" → Mem0 → product context → answer
-    even after workflow session expires or customer returns next day.
-    """
-    try:
-        from ai.summary_generator import save_last_product
-        await save_last_product(tenant_id, session_id, product)
-    except Exception as e:
-        print(f"[MEM0] Product context save failed (non-critical): {e}")
 
 async def _try_resolve_product_followup(incoming, session_history: list):
     """
@@ -418,42 +351,37 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
-    # ── Negotiation vs. offer-inquiry disambiguation ─────────────────────────
-    # FIX: previously used hardcoded English regex patterns ("Rs.", "budget
-    # is", "can i get...for", etc.) to detect price offers before the offer-
-    # inquiry check ran. That's incompatible with a multi-tenant platform —
-    # a tenant selling in Tamil, or a different domain's phrasing entirely,
-    # would silently defeat every one of those patterns with no way to fix
-    # it short of a code change. Removed entirely. The disambiguation now
-    # comes from the SAME unified LLM parse below (pf_data_extraction_prompt),
-    # which is tenant-configurable DB content like every other prompt in
-    # this app — a tenant can improve its disambiguation by editing their
-    # prompt, never by waiting on a deploy.
+    # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
+    # Runs BEFORE parse and is_negotiation_request.
+    # "Currently is there any offers?" / "is there any offers?" →
+    # is_negotiation_request returns True (sees "offers" as discount).
+    # This focused YES/NO check catches it first and blocks the negotiation path.
     _is_offer_inq = False
+    try:
+        _oiq = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
+                messages=[
+                    {"role": "system", "content": get_prompt(incoming, "pf_offer_inquiry_check_prompt")},
+                    {"role": "user", "content": incoming.text},
+                ],
+            )
+        )
+        _content = _oiq.choices[0].message.content
+        if _content and "YES" in _content.strip().upper():
+            _is_offer_inq = True
+            print(f"[OFFER INQUIRY] Pre-check YES: '{incoming.text}'")
+    except Exception as _oiqe:
+        print(f"[OFFER INQUIRY] Pre-check failed: {_oiqe}")
 
-    # ── Parse the follow-up (single consolidated LLM call) ──────────────────
+    # ── Always parse the follow-up BEFORE the negotiation check ─────────────
     _t_parse_early = time.monotonic()
     quick_parsed = await _parse_followup_message(incoming, selection, session_history)
-    _parse_latency_ms = (time.monotonic() - _t_parse_early) * 1000
-    print(f"[TIMING] early _parse_followup_message: {_parse_latency_ms/1000:.2f}s")
-    perf_metrics.record("pf_data_extraction_prompt", _parse_latency_ms, tenant_id=incoming.tenant_id)
+    print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
 
-    # pf_data_extraction_prompt's schema includes is_negotiation_request
-    # directly — this replaces what used to be a SEPARATE is_negotiation_request()
-    # LLM call plus a regex pre-filter, collapsing them into the one parse
-    # call above. Tri-state on purpose: None means the tenant's DB prompt
-    # hasn't been updated to include this field yet, in which case we fall
-    # back to the standalone (still regex-free, still tenant-configurable)
-    # is_negotiation_request() LLM call rather than silently guessing wrong.
-    _is_neg_req_field = quick_parsed.get("is_negotiation_request")
-
-    # Negotiation always wins over offer-inquiry classification — a specific
-    # price offer is never an "offer inquiry". Only overridden when the
-    # unified field explicitly says True (tri-state None/False don't override).
-    _is_offer_inq = quick_parsed.get("is_offer_inquiry", False)
-    if _is_neg_req_field is True and _is_offer_inq:
-        print(f"[OFFER INQUIRY] Suppressed — unified parse flagged is_negotiation_request=True")
-        _is_offer_inq = False
+    # Merge pre-check with parser
+    _is_offer_inq = _is_offer_inq or quick_parsed.get("is_offer_inquiry", False)
 
     # is_comparison/recommendation/offer_inquiry = never a price negotiation.
     if (quick_parsed.get("is_comparison", False)
@@ -501,16 +429,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                     neg_state = None
 
-    if _is_neg_req_field is not None:
-        _is_neg_req = _is_neg_req_field
-        print(f"[TIMING] is_negotiation_request: 0.00s (from unified parse)")
-    else:
-        _t_neg_check_start = time.monotonic()
-        _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, incoming, session_history)
-        _neg_req_latency_ms = (time.monotonic() - _t_neg_check_start) * 1000
-        print(f"[TIMING] is_negotiation_request: {_neg_req_latency_ms/1000:.2f}s "
-              f"(fallback call — add is_negotiation_request to pf_data_extraction_prompt to remove this)")
-        perf_metrics.record("neg_is_request_prompt_fallback", _neg_req_latency_ms, tenant_id=incoming.tenant_id)
+    _t_neg_check_start = time.monotonic()
+    _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, incoming, session_history)
+    print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
         # 1. Active negotiation state (already has product_name)
@@ -588,27 +509,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         incoming.tenant_id, incoming.session_id, result["state"]
                     )
 
-                    # DEFERRAL: the negotiator determined this message isn't
-                    # negotiation-related after all (e.g. a greeting or an
-                    # escalation request arriving mid-negotiation) — route it
-                    # properly instead of repeating the current offer.
-                    # Negotiation state above is already saved UNCHANGED, so
-                    # the customer can resume negotiating afterward.
-                    if result.get("defer_intent") is not None:
-                        _defer_intent = result["defer_intent"].intent
-                        incoming._deferred_intent = _defer_intent  # so main.py's debug output reflects the real routing decision, not the stale NEG_BYPASS value
-                        print(f"[FOLLOW-UP] Negotiator deferred (intent={_defer_intent}) — routing directly")
-                        if _defer_intent == "GREETING":
-                            from ai.handlers import handle_greeting
-                            return await handle_greeting(incoming)
-                        elif _defer_intent == "HUMAN_ESCALATION":
-                            from ai.handlers import handle_escalation
-                            return await handle_escalation(incoming)
-                        # Fall through to normal product_followup handling below
-                        # for any other deferred intent (shouldn't normally
-                        # reach here — negotiator.py only defers on GREETING/
-                        # HUMAN_ESCALATION today — but fail safe rather than crash).
-
                     if result["order_ready"] and result["agreed_price"]:
                         # FIX BUGS 1,2,3,4: order_ready=True means negotiation is concluded
                         # (floor reached, acceptance detected, or rounds exhausted).
@@ -651,13 +551,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                             new_agreed = float(result["agreed_price"])
                             if abs(old_agreed - new_agreed) < 1.0:
                                 print(f"[NEGOTIATOR] Already awaiting confirmation at Rs.{old_agreed} — skipping duplicate summary")
-                                try:
-                                    return get_prompt(
-                                        incoming, "neg_already_confirmed_prompt",
-                                        old_agreed=f"{old_agreed:,.0f}", sender_name=incoming.sender_name,
-                                    )
-                                except RuntimeError:
-                                    return f"You've already confirmed Rs.{old_agreed:,.0f}/unit, {incoming.sender_name}. Please reply *Confirm* to place your order! 🎉"
+                                return f"You've already confirmed Rs.{old_agreed:,.0f}/unit, {incoming.sender_name}. Please reply *Confirm* to place your order! 🎉"
 
                         # Do NOT create order yet — show summary first and wait for Confirm
                         agreed  = result["agreed_price"]
@@ -685,10 +579,11 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                                 _ov71     = agreed * qty
                                 _next71   = _gnt71(_ov71, _tiers71)
                                 if _next71:
-                                    from ai.negotiator import upsell_hint as _uh71
                                     _vgap71 = round(_next71[0] - _ov71, 0)
                                     _u71 = max(1, int(_vgap71 / agreed) + 1)
-                                    _conf_upsell = _uh71(incoming, _vgap71, _u71, _next71[0], _next71[1])
+                                    _conf_upsell = (f"\n\n💡 Add Rs.{_vgap71:,.0f} more to your order value "
+                                                    f"(approx. {_u71} more unit(s)) to reach Rs.{_next71[0]:,} "
+                                                    f"and unlock *{_next71[1]}% off*!")
                         except Exception as _e71:
                             print(f"[CONFIRM] Upsell calc failed: {_e71}")
                         # ── FIX Bug 3 (Major): only show negotiation labels when
@@ -873,15 +768,34 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Customers must now select products by NAME only.
     is_comparison     = parsed.get("is_comparison", False)
     is_recommendation = parsed.get("is_recommendation", False)
-    # Trust the unified parse's own is_offer_inquiry directly. A second
-    # "layer-2" LLM call used to run here on almost every turn regardless
-    # of the first result — removed. If a tenant's disambiguation needs
-    # improving, that's a DB prompt edit (pf_data_extraction_prompt), not
-    # an extra LLM round-trip baked into the code for every tenant.
     is_offer_inquiry  = _is_offer_inq or parsed.get("is_offer_inquiry", False)
     asks_for_image    = parsed.get("asks_for_image", False)
 
     matched_product = None
+
+    # ── Case 0: Offer inquiry ─────────────────────────────────────────────────
+    # Two-layer detection — layer 2 specifically handles "offers for [product name]"
+    # which layer 1 sometimes misses due to product context.
+    if not is_offer_inquiry:
+        try:
+            _oi = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _client.chat.completions.create(
+                    model       = AZURE_OPENAI_DEPLOYMENT,
+                    max_tokens  = 5,
+                    temperature = 0,
+                    messages    = [
+                        {"role": "system", "content": get_prompt(incoming, "pf_offer_inquiry_check_l2_prompt")},
+                        {"role": "user", "content": incoming.text},
+                    ],
+                )
+            )
+            content = _oi.choices[0].message.content
+            if content and "YES" in content.strip().upper():
+                is_offer_inquiry = True
+                print(f"[OFFER INQUIRY] Detected via layer-2: '{incoming.text}'")
+        except Exception as _e:
+            print(f"[OFFER INQUIRY] Layer-2 check failed: {_e}")
 
     if is_offer_inquiry:
         _offers_text = None
@@ -909,19 +823,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         if not _offers_text:
             # Extract product name from the message (e.g. "any offers for Romy 12W?")
             try:
-                _named_product_list_str = "\n".join(
-                    f"- {p.get('product_name') or p.get('name') or ''}" for p in selection
-                )
                 _pm = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: _client.chat.completions.create(
                         model=AZURE_OPENAI_DEPLOYMENT, max_tokens=30, temperature=0,
                         messages=[
-                            {"role": "system", "content": get_prompt(
-                                incoming, "pf_named_product_extractor_prompt",
-                                product_list=_named_product_list_str,
-                                customer_message=incoming.text,
-                            )},
+                            {"role": "system", "content": get_prompt(incoming, "pf_named_product_extractor_prompt")},
                             {"role": "user", "content": incoming.text},
                         ],
                     )
@@ -993,7 +900,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         max_tokens  = 350,
                         temperature = 0.3,
                         messages    = [
-                            {"role": "system", "content": get_prompt(incoming, "pf_offers_formatter_prompt", biz_name=incoming.biz_name, sender_name=incoming.sender_name, offers_data=_offers_text, product_context=product_name or "")},
+                            {"role": "system", "content": get_prompt(incoming, "pf_offers_formatter_prompt")},
                             {"role": "user", "content": incoming.text},
                         ],
                     )
@@ -1263,35 +1170,22 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         bare_number_only = re.fullmatch(r"\s*\d{1,4}\s*", incoming.text.strip()) is not None
         if bare_number_only and not parsed.get("selected_product_name"):
 
-            extracted_number = int(incoming.text.strip())
+            last_bot_msg = ""
+            if session_history:
+                assistant_msgs = [m["content"] for m in session_history if m.get("role") == "assistant"]
+                if assistant_msgs:
+                    last_bot_msg = assistant_msgs[-1].lower()
 
-            # Ground truth from STATE, not from parsing the bot's own prior
-            # message text. The old approach checked for English substrings
-            # like "reply with the product" / "how many units" in the last
-            # assistant message — that silently breaks for any tenant whose
-            # prompts are customized or in a different language, since the
-            # check can never match text it wasn't written to expect.
-            #
-            # Signal used instead:
-            #   - A single product already "in focus" with no quantity yet
-            #     (active negotiation_state.product_name set, quantity unset)
-            #     → the bot is almost certainly waiting on a quantity, so the
-            #       bare number is treated as one.
-            #   - Otherwise, if a fresh multi-item product list is loaded for
-            #     this session (selection has more than one option) → treat
-            #     the number as a 1-based position in that list.
-            #   - Neither condition → ambiguous, ask for the product name
-            #     (unchanged from before).
-            _neg_for_bare_num = getattr(incoming, "_cached_neg_state", None) or \
-                await get_negotiation_state(incoming.tenant_id, incoming.session_id)
-            _product_awaiting_qty = bool(
-                _neg_for_bare_num
-                and _neg_for_bare_num.get("product_name")
-                and not _neg_for_bare_num.get("quantity")
+            # Unique marker text that ONLY appears on a freshly-shown product list —
+            # guarantees this number is the customer's first reply to THAT exact list.
+            bot_just_showed_list = "reply with the product" in last_bot_msg and ("name" in last_bot_msg or "number" in last_bot_msg)
+
+            bot_asked_quantity = (
+                "how many units" in last_bot_msg
+                or "how many would you like" in last_bot_msg
             )
 
-            bot_asked_quantity   = _product_awaiting_qty
-            bot_just_showed_list = (not _product_awaiting_qty) and bool(selection) and len(selection) > 1
+            extracted_number = int(incoming.text.strip())
 
             if bot_just_showed_list:
                 # (a) Map number -> product by 1-based position in the SAME list
@@ -1302,37 +1196,26 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     print(f"[FOLLOW-UP] List-position pick: '{extracted_number}' -> {matched_product.get('product_name') or matched_product.get('name')} (list size={len(selection)})")
                     # Force quantity to remain unset — never reuse this number as quantity.
                     parsed["quantity"] = None
-                    parsed["parsed_order_quantity"] = None
                     parsed["_number_was_list_position"] = True  # threaded downstream to suppress quantity inference
                 else:
                     print(f"[FOLLOW-UP] '{extracted_number}' out of range for list size={len(selection)} — asking for product name")
-                    try:
-                        return get_prompt(
-                            incoming, "pf_invalid_number_prompt",
-                            sender_name=incoming.sender_name, list_size=len(selection),
-                        )
-                    except RuntimeError:
-                        return (
-                            f"Hi {incoming.sender_name}! That number isn't in the list (1-{len(selection)}). "
-                            f"Could you please reply with the *product name* instead? 😊"
-                        )
+                    return (
+                        f"Hi {incoming.sender_name}! That number isn't in the list (1-{len(selection)}). "
+                        f"Could you please reply with the *product name* instead? 😊"
+                    )
 
             elif bot_asked_quantity:
                 # (b) Legitimate quantity context — let existing downstream logic
                 # (Case 3 / quantity injection) handle it normally.
-                print(f"[FOLLOW-UP] Product '{_neg_for_bare_num.get('product_name')}' awaiting quantity — "
-                      f"'{extracted_number}' treated as QUANTITY, falling through")
+                print(f"[FOLLOW-UP] Bot asked quantity — '{extracted_number}' treated as QUANTITY, falling through")
 
             else:
-                # (c) Ambiguous — no product awaiting quantity, no active list.
-                # Do not guess; ask for the product name.
+                # (c) Ambiguous — bot's last message was neither a list nor a
+                # quantity question. Do not guess; ask for the product name.
                 print(f"[FOLLOW-UP] Bare number '{extracted_number}' with no list/quantity context — asking for product name instead of guessing")
-                try:
-                    return get_prompt(incoming, "pf_no_product_name_prompt", sender_name=incoming.sender_name)
-                except RuntimeError:
-                    return (
-                        f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
-                        f"you'd like to know more about or order? 😊"
+                return (
+                    f"Hi {incoming.sender_name}! Could you please reply with the *product name* "
+                    f"you'd like to know more about or order? 😊"
                 )
 
     # ── New-search guard before Case 3 ──────────────────────────────────────
@@ -1370,29 +1253,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         except Exception as e:
             print(f"[FOLLOW-UP] LLM guard failed ({e}) — defaulting to FOLLOW_UP")
 
-    # ── Case 2b: Workflow session selected_product_name (HIGHEST TRUST) ──────
-    # Check workflow state for the product the customer explicitly selected.
-    # This is more reliable than fuzzy history matching which can confuse
-    # "Lexa Lens" with "Lexa Eco" because both start with "lexa".
-    if not matched_product:
-        try:
-            # get_negotiation_state already imported at top of file (line 21)
-            _neg = getattr(incoming, "_cached_neg_state", None) or \
-                   await get_negotiation_state(incoming.tenant_id, incoming.session_id)
-            _selected = _neg.get("product_name") if _neg else None
-            if _selected:
-                for p in selection:
-                    pname = (p.get("product_name") or p.get("name") or "")
-                    if pname.lower() == _selected.lower():
-                        matched_product = p
-                        print(f"[FOLLOW-UP] Workflow state match: '{_selected}'")
-                        break
-        except Exception as _wse:
-            print(f"[FOLLOW-UP] Workflow state lookup failed: {_wse}")
-
-    # ── Case 3: Pure follow-up — scan bot history (with strict matching) ────
-    # Bug fix: require at least 2 words to match, not just "lexa" which
-    # matches BOTH "Lexa Lens" and "Lexa Eco". Use 2-word prefix for safety.
+    # ── Case 3: Pure follow-up — scan bot history ───────────────────────────
     if not matched_product and session_history:
         recent_bot_msgs = [
             m["content"] for m in session_history[-6:]
@@ -1401,12 +1262,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         combined_bot_text = " ".join(recent_bot_msgs).lower()
         for p in selection:
             pname      = (p.get("product_name") or p.get("name") or "").lower()
-            words      = pname.split()
-            # Use first 2 words as match key (e.g. "lexa eco" not just "lexa")
-            match_key  = " ".join(words[:2]) if len(words) >= 2 else words[0] if words else ""
-            if match_key and len(match_key) > 5 and match_key in combined_bot_text:
+            first_word = pname.split()[0] if pname else ""
+            if first_word and len(first_word) > 3 and first_word in combined_bot_text:
                 matched_product = p
-                print(f"[FOLLOW-UP] Bot history match (2-word): '{match_key}' -> {pname}")
+                print(f"[FOLLOW-UP] Bot history match: '{first_word}' -> {pname}")
                 break
 
     # ── Case 4: last_discussed_product DB fallback ───────────────────────────
@@ -1435,35 +1294,13 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     if not product_name:
         return None
     
-    # Save as the last discussed product in the database so context is retained.
-    # Check the PREVIOUS value first so we only write a fresh Mem0 memory when
-    # the product actually changed — previously this fired on every follow-up
-    # turn ("brief", "installation guide", "offers", "order") even when it was
-    # the same product each time, creating a duplicate memory per turn.
-    try:
-        _previous_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
-    except Exception:
-        _previous_product = None
-    _product_changed = (_previous_product or "").strip().lower() != (product_name or "").strip().lower()
-
+    # Save as the last discussed product in the database so context is retained
     try:
         await save_last_discussed_product(incoming.tenant_id, incoming.session_id, product_name)
     except Exception as e:
         print(f"[FOLLOW-UP] Failed to save last discussed product: {e}")
 
     cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
-
-    # Point 6 (architect): save product to Mem0 IMMEDIATELY on selection —
-    # not after invoice. This makes "is it waterproof?" work even if
-    # workflow expires or customer comes back tomorrow.
-    # Fire-and-forget so it never blocks the response path.
-    # Only when the product actually changed — see _product_changed above.
-    if cached_product and _product_changed:
-        asyncio.create_task(_save_product_to_mem0(
-            tenant_id  = incoming.tenant_id,
-            session_id = incoming.session_id,
-            product    = cached_product,
-        ))
 
     if not cached_product:
         print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — falling through to GraphRAG")
@@ -1586,12 +1423,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         product_context["customer_just_selected_by_number"] = True
         print(f"[FOLLOW-UP] Number was used for list-position selection — suppressing quantity inference for this turn")
     else:
-        # pf_data_extraction_prompt's real schema returns "parsed_order_quantity",
-        # not "quantity" — only the exception-fallback dict uses "quantity".
-        # Check both so this works regardless of which path produced `parsed`.
-        # normalize_parsed() (applied inside _parse_followup_message) guarantees
-        # "quantity" is always the correct value here, regardless of which
-        # underlying schema (LLM success path or exception fallback) produced it.
         parsed_qty = parsed.get("quantity")
     parsed_unit = parsed.get("quantity_unit") or "units"
 
@@ -1623,108 +1454,29 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     product_context["auto_offer_disc_pct"]   = _disc
                     product_context["auto_offer_unit_price"] = _disc_price
                     product_context["auto_offer_total"]      = _disc_total
-                    # NOTE: product_context["auto_offer_upsell"] below is set
-                    # but confirmed unused anywhere else in this codebase —
-                    # dead code, same class of finding as product_store.py's
-                    # old floor_price field. Kept consistent with the shared
-                    # helper rather than removed, in case something wires it
-                    # in later; not spending more effort on it than that.
                     if _next_t:
-                        from ai.negotiator import upsell_hint as _uh2
                         # FIX Bug 1: gap must use _disc_total (the DISPLAYED subtotal)
                         # as the base, not _order_val (which is price_num × qty, the
                         # un-discounted value). _ov_check was undefined — using the
                         # wrong value caused gap to be off by (price - disc_price) × qty.
                         _gap2next = round(_next_t[0] - _disc_total, 0)
                         _u2next   = max(1, int(_gap2next / _disc_price) + 1)
-                        product_context["auto_offer_upsell"] = _uh2(incoming, _gap2next, _u2next, _next_t[0], _next_t[1])
+                        product_context["auto_offer_upsell"] = (
+                            f"💡 Add Rs.{_gap2next:,.0f} more to your order value "
+                            f"(approx. {_u2next} more unit(s)) to reach Rs.{_next_t[0]:,} "
+                            f"and unlock *{_next_t[1]}% off*!"
+                        )
                     elif _disc > 0:
-                        from ai.negotiator import max_discount_hint as _mdh2
                         # Customer already at max tier — celebrate it
                         _max_disc2 = max(d for _, d in _tiers)
-                        product_context["auto_offer_upsell"] = _mdh2(incoming, _max_disc2)
+                        product_context["auto_offer_upsell"] = (
+                            f"🎉 You've unlocked our *maximum store discount of {_max_disc2}% OFF*!"
+                        )
                     print(f"[OFFER] Auto-applied {_disc}% to {product_name} x {parsed_qty}")
         except Exception as _aoe:
             print(f"[OFFER] Auto-apply failed: {_aoe}")
 
     recent_history = session_history[-6:] if session_history else []
-
-    # Bug 2 fix: retrieve Mem0 context before the main LLM call — but ONLY
-    # when the message plausibly needs long-term/cross-session memory.
-    # PostgreSQL/workflow_sessions already covers current product, current
-    # negotiation, pending order, and conversation history — Mem0 added
-    # nothing for "is it waterproof?", "add 3 units", "compare 2 and 3", etc,
-    # and every one of those calls was pure overhead (a network round-trip
-    # with no payoff). See ai/memory_policy.py's MemoryPolicy for the gate.
-    _mem0_ctx: dict = {"product_context": "", "customer_preferences": "",
-                       "negotiation_profile": "", "workflow_context": ""}
-    # Workflow proxy: this point in the function is only reached after all
-    # negotiation branches have already returned, so "ORDERING" (a quantity
-    # was just parsed) vs "BROWSING" (plain product Q&A) covers what's left.
-    _mem_ctx = MemoryRequest(
-        text                    = incoming.text,
-        workflow                = "ORDERING" if parsed_qty is not None else "BROWSING",
-        tenant_id               = incoming.tenant_id,
-        session_id              = incoming.session_id,
-        current_product         = product_name,
-        negotiation_active      = False,  # negotiation branches already returned before this point
-        needs_long_term_memory  = parsed.get("needs_long_term_memory"),
-    )
-    _mem_decision = MemoryPolicy.evaluate(_mem_ctx)
-    if _mem_decision.retrieve:
-        try:
-            import time as _time_mem0
-            from ai.memory_manager import MemoryManager
-            _mem_query = product_name or incoming.text
-            _mem_t0    = _time_mem0.monotonic()
-            _mm        = MemoryManager(incoming.tenant_id, incoming.session_id)
-            _mem_by_type = await _mm.search(
-                _mem_decision.types, query=_mem_query, max_results=_mem_decision.max_results,
-            )
-            _mem_latency_ms = round((_time_mem0.monotonic() - _mem_t0) * 1000)
-            _total_hits = sum(len(v) for v in _mem_by_type.values())
-
-            # MemoryManager.search() returns {memory_type: [ranked memories]},
-            # already deduped/ranked/expiry-filtered — no more string-matching
-            # markers like "PRODUCT_CONTEXT:" across an undifferentiated list.
-            _product_mems = _mem_by_type.get("product_context", [])
-            _pref_mems    = _mem_by_type.get("customer_preference", [])
-            _neg_mems     = _mem_by_type.get("negotiation_outcome", [])
-
-            if _product_mems:
-                _mem0_ctx["product_context"]      = _product_mems[0].get("memory", "")[:200]
-            if _pref_mems:
-                _mem0_ctx["customer_preferences"] = "; ".join(m.get("memory", "") for m in _pref_mems)[:200]
-            if _neg_mems:
-                _mem0_ctx["negotiation_profile"]  = _neg_mems[0].get("memory", "")[:150]
-
-            print(f"[MEM0] Query='{_mem_query[:40]}' reason={_mem_decision.reason} "
-                  f"types={_mem_decision.types} search_time={_mem_latency_ms}ms results={_total_hits}")
-            for _mtype, _mems in _mem_by_type.items():
-                for _m in _mems:
-                    _score   = round(float(_m.get("score", 0) or 0), 2)
-                    _preview = str(_m.get("memory", ""))[:60].replace("\n", " ")
-                    print(f"  [{_mtype}] score={_score}  '{_preview}...'")
-
-        except Exception as _me:
-            print(f"[MEM0] Retrieval failed (non-critical): {_me}")
-    else:
-        print(f"[MEM0] Skipped (reason={_mem_decision.reason}): '{incoming.text[:50]}'")
-
-    # Build workflow_context as an explicit, unambiguous string — never embed
-    # a bare "qty=None". A literal "None" in the prompt was one contributor
-    # to the LLM occasionally treating an unrelated number from earlier
-    # conversation history as if it were a known quantity (see migration 020
-    # for the other half of this fix — an explicit prompt instruction not to
-    # infer quantity from conversation history at all).
-    if product_name:
-        _workflow_context_str = (
-            f"product={product_name}, quantity not yet specified"
-            if parsed_qty is None else
-            f"product={product_name}, qty={parsed_qty}"
-        )
-    else:
-        _workflow_context_str = ""
 
     try:
         _t_final_start = time.monotonic()
@@ -1735,7 +1487,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 max_tokens  = 400,
                 temperature = 0.3,
                 messages    = [
-                    {"role": "system", "content": get_prompt(incoming, "pf_main_followup_prompt", biz_name=incoming.biz_name, sender_name=incoming.sender_name, product_name=product_name or "", product_context=_mem0_ctx.get("product_context") or json.dumps(product_context, ensure_ascii=False), catalog_data=json.dumps(product_context, ensure_ascii=False), workflow_context=_workflow_context_str, customer_preferences=_mem0_ctx.get("customer_preferences",""), parsed_intent=parsed.get("intent","") if isinstance(parsed, dict) else "")},
+                    {"role": "system", "content": get_prompt(incoming, "pf_main_followup_prompt", catalog_data=json.dumps(product_context, ensure_ascii=False))},
                     *recent_history,
                     {"role": "user", "content": incoming.text},
                 ],
@@ -1745,10 +1497,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         if not content:
             raise ValueError("Empty or None response content")
         reply = content.strip()
-        _final_latency_ms = (time.monotonic() - _t_final_start) * 1000
-        print(f"[TIMING] Final answer LLM call: {_final_latency_ms/1000:.2f}s")
-        perf_metrics.record("pf_main_followup_prompt", _final_latency_ms, tenant_id=incoming.tenant_id,
-                             workflow="ORDERING" if parsed_qty is not None else "BROWSING")
+        print(f"[TIMING] Final answer LLM call: {time.monotonic() - _t_final_start:.2f}s")
         print(f"[FOLLOW-UP] LLM answered for product '{product_name}'")
 
         incoming._graphrag_raw = json.dumps({

@@ -98,48 +98,108 @@ class PricingResult:
     def gst_pct(self) -> int:
         return int(self.gst_rate * 100)
 
-    def to_whatsapp_summary(self, product_name: str, sender_name: str) -> str:
+    def to_whatsapp_summary(self, product_name: str, sender_name: str, incoming=None) -> str:
         """
         Renders the pre-confirm order summary in WhatsApp format.
         Single source — used by both the negotiation acceptance path and
         the plain-order confirmation path.
-        """
-        lines = [
-            f"Here's your order summary, {sender_name}! Please review:",
-            "",
-            f"• *Product:* {product_name}",
-            f"• *Quantity:* {self.quantity} units",
-            f"• *Regular price:* Rs.{self.regular_unit_price:,.0f}/unit",
-        ]
-        if self.was_negotiated:
-            lines += [
-                f"• *Store offer {self.store_disc_pct}% OFF:* Rs.{self.store_unit_price:,.0f}/unit",
-                f"• *Negotiated price:* Rs.{self.negotiated_unit_price:,.0f}/unit",
-            ]
-        elif self.store_disc_pct > 0:
-            lines.append(f"• *Store offer {self.store_disc_pct}% OFF:* Rs.{self.negotiated_unit_price:,.0f}/unit")
-        else:
-            lines.append(f"• *Price per unit:* Rs.{self.negotiated_unit_price:,.0f}")
 
-        lines += [
-            f"• *Subtotal:* Rs.{self.subtotal:,.2f}",
-            f"• *GST ({self.gst_pct}%):* Rs.{self.gst_amount:,.2f}",
-            f"• *Total Payable:* Rs.{self.total_payable:,.2f}",
-        ]
+        `incoming` is optional (kept backward compatible for any caller
+        that hasn't been updated) but should always be passed — without it,
+        this always falls back to the hardcoded English text below rather
+        than ever attempting the tenant's DB prompt.
+        """
+        def _prompt(key: str, fallback: str, **kwargs) -> str:
+            if incoming is None:
+                return fallback
+            try:
+                from db.prompt_store import get_prompt
+                return get_prompt(incoming, key, **kwargs)
+            except RuntimeError:
+                return fallback
+
+        if self.was_negotiated:
+            body = _prompt(
+                "pricing_order_summary_full_discount_prompt",
+                (
+                    f"Here's your order summary, {sender_name}! Please review:\n\n"
+                    f"• *Product:* {product_name}\n"
+                    f"• *Quantity:* {self.quantity} units\n"
+                    f"• *Regular price:* Rs.{self.regular_unit_price:,.0f}/unit\n"
+                    f"• *Store offer {self.store_disc_pct}% OFF:* Rs.{self.store_unit_price:,.0f}/unit\n"
+                    f"• *Negotiated price:* Rs.{self.negotiated_unit_price:,.0f}/unit\n"
+                    f"• *Subtotal:* Rs.{self.subtotal:,.2f}\n"
+                    f"• *GST ({self.gst_pct}%):* Rs.{self.gst_amount:,.2f}\n"
+                    f"• *Total Payable:* Rs.{self.total_payable:,.2f}"
+                ),
+                sender_name=sender_name, product_name=product_name, quantity=self.quantity,
+                regular_unit_price=f"{self.regular_unit_price:,.0f}", store_disc_pct=self.store_disc_pct,
+                store_unit_price=f"{self.store_unit_price:,.0f}", negotiated_unit_price=f"{self.negotiated_unit_price:,.0f}",
+                subtotal=f"{self.subtotal:,.2f}", gst_pct=self.gst_pct, gst_amount=f"{self.gst_amount:,.2f}",
+                total_payable=f"{self.total_payable:,.2f}",
+            )
+        elif self.store_disc_pct > 0:
+            body = _prompt(
+                "pricing_order_summary_store_discount_only_prompt",
+                (
+                    f"Here's your order summary, {sender_name}! Please review:\n\n"
+                    f"• *Product:* {product_name}\n"
+                    f"• *Quantity:* {self.quantity} units\n"
+                    f"• *Regular price:* Rs.{self.regular_unit_price:,.0f}/unit\n"
+                    f"• *Store offer {self.store_disc_pct}% OFF:* Rs.{self.negotiated_unit_price:,.0f}/unit\n"
+                    f"• *Subtotal:* Rs.{self.subtotal:,.2f}\n"
+                    f"• *GST ({self.gst_pct}%):* Rs.{self.gst_amount:,.2f}\n"
+                    f"• *Total Payable:* Rs.{self.total_payable:,.2f}"
+                ),
+                sender_name=sender_name, product_name=product_name, quantity=self.quantity,
+                regular_unit_price=f"{self.regular_unit_price:,.0f}", store_disc_pct=self.store_disc_pct,
+                negotiated_unit_price=f"{self.negotiated_unit_price:,.0f}",
+                subtotal=f"{self.subtotal:,.2f}", gst_pct=self.gst_pct, gst_amount=f"{self.gst_amount:,.2f}",
+                total_payable=f"{self.total_payable:,.2f}",
+            )
+        else:
+            body = _prompt(
+                "pricing_order_summary_plain_price_prompt",
+                (
+                    f"Here's your order summary, {sender_name}! Please review:\n\n"
+                    f"• *Product:* {product_name}\n"
+                    f"• *Quantity:* {self.quantity} units\n"
+                    f"• *Price per unit:* Rs.{self.negotiated_unit_price:,.0f}\n"
+                    f"• *Subtotal:* Rs.{self.subtotal:,.2f}\n"
+                    f"• *GST ({self.gst_pct}%):* Rs.{self.gst_amount:,.2f}\n"
+                    f"• *Total Payable:* Rs.{self.total_payable:,.2f}"
+                ),
+                sender_name=sender_name, product_name=product_name, quantity=self.quantity,
+                negotiated_unit_price=f"{self.negotiated_unit_price:,.0f}",
+                subtotal=f"{self.subtotal:,.2f}", gst_pct=self.gst_pct, gst_amount=f"{self.gst_amount:,.2f}",
+                total_payable=f"{self.total_payable:,.2f}",
+            )
 
         if self.total_discount_amount > 0:
-            lines.append("")
             if self.was_negotiated and self.store_discount_amount > 0:
-                lines += [
-                    f"🎁 *Total savings: Rs.{self.total_discount_amount:,.0f}*",
-                    f"   • Store offer: Rs.{self.store_discount_amount:,.0f}",
-                    f"   • Negotiation: Rs.{self.negotiation_discount_amount:,.0f}",
-                ]
+                body += "\n\n" + _prompt(
+                    "pricing_order_summary_savings_breakdown_prompt",
+                    (
+                        f"🎁 *Total savings: Rs.{self.total_discount_amount:,.0f}*\n"
+                        f"   • Store offer: Rs.{self.store_discount_amount:,.0f}\n"
+                        f"   • Negotiation: Rs.{self.negotiation_discount_amount:,.0f}"
+                    ),
+                    total_discount_amount=f"{self.total_discount_amount:,.0f}",
+                    store_discount_amount=f"{self.store_discount_amount:,.0f}",
+                    negotiation_discount_amount=f"{self.negotiation_discount_amount:,.0f}",
+                )
             else:
-                lines.append(f"🎁 *You save Rs.{self.total_discount_amount:,.0f} on this order!*")
+                body += "\n\n" + _prompt(
+                    "pricing_order_summary_savings_prompt",
+                    f"🎁 *You save Rs.{self.total_discount_amount:,.0f} on this order!*",
+                    total_discount_amount=f"{self.total_discount_amount:,.0f}",
+                )
 
-        lines += ["", "Reply *Confirm* to place your order and receive your invoice! 🎉"]
-        return "\n".join(lines)
+        body += "\n\n" + _prompt(
+            "pricing_order_summary_footer_prompt",
+            "Reply *Confirm* to place your order and receive your invoice! 🎉",
+        )
+        return body
 
     def to_invoice_fields(self) -> dict:
         """

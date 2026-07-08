@@ -4,7 +4,7 @@ from typing import Optional, Any, Dict
 
 # All defaults loaded from env — no hardcoded tenant/phone/URL values.
 # Set these in .env for local dev; override in production deployment config.
-BACKEND_URL          = os.getenv("BACKEND_URL",             "http://localhost:8000")
+BACKEND_URL          = os.getenv("BACKEND_URL",             "http://localhost:8502")
 DEFAULT_PHONE_ID     = os.getenv("DEFAULT_PHONE_NUMBER_ID", "1124766240726230")
 DEFAULT_TENANT_ID    = os.getenv("DEFAULT_TENANT_ID",       "tenant_inventaa_led_001")
 DEFAULT_SENDER_NAME  = os.getenv("DEFAULT_SENDER_NAME",     "Test User")

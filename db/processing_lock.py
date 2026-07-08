@@ -56,7 +56,7 @@ async def acquire_lock(session_id: str, tenant_id: str) -> bool:
         return False
 
 
-async def release_lock(session_id: str, tenant_id: Optional[str] = None) -> None:
+async def release_lock(session_id: str, tenant_id: str = None) -> None:
     """
     Release the processing lock after pipeline completes.
     Called in the finally block — always runs even if pipeline crashes.

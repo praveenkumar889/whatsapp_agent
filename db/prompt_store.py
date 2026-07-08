@@ -338,6 +338,13 @@ PROMPT_KEYS: dict = {
     "neg_qty_update_footer_prompt":               "neg_qty_update_footer_prompt",
     "neg_stalemate_reply_prompt":                 "neg_stalemate_reply_prompt",
 
+    # Migration 023 — remaining hardcoded strings
+    "neg_upsell_hint_prompt":                     "neg_upsell_hint_prompt",
+    "neg_max_discount_unlocked_prompt":           "neg_max_discount_unlocked_prompt",
+    "neg_already_confirmed_prompt":               "neg_already_confirmed_prompt",
+    "pf_invalid_number_prompt":                   "pf_invalid_number_prompt",
+    "pf_no_product_name_prompt":                  "pf_no_product_name_prompt",
+
     # Migration 021 — order summary (pipeline/router.py::_build_order_summary)
     "order_summary_full_discount_prompt":         "order_summary_full_discount_prompt",
     "order_summary_store_discount_only_prompt":   "order_summary_store_discount_only_prompt",
@@ -345,10 +352,11 @@ PROMPT_KEYS: dict = {
     "order_summary_savings_line_prompt":          "order_summary_savings_line_prompt",
     "order_summary_footer_prompt":                "order_summary_footer_prompt",
 
-    # Migration 023 — remaining hardcoded strings
-    "neg_upsell_hint_prompt":                     "neg_upsell_hint_prompt",
-    "neg_max_discount_unlocked_prompt":           "neg_max_discount_unlocked_prompt",
-    "neg_already_confirmed_prompt":               "neg_already_confirmed_prompt",
-    "pf_invalid_number_prompt":                   "pf_invalid_number_prompt",
-    "pf_no_product_name_prompt":                  "pf_no_product_name_prompt",
+    # Migration 024 — pricing.py::to_whatsapp_summary (last Category-2 item)
+    "pricing_order_summary_full_discount_prompt":       "pricing_order_summary_full_discount_prompt",
+    "pricing_order_summary_store_discount_only_prompt": "pricing_order_summary_store_discount_only_prompt",
+    "pricing_order_summary_plain_price_prompt":         "pricing_order_summary_plain_price_prompt",
+    "pricing_order_summary_savings_breakdown_prompt":   "pricing_order_summary_savings_breakdown_prompt",
+    "pricing_order_summary_savings_prompt":             "pricing_order_summary_savings_prompt",
+    "pricing_order_summary_footer_prompt":              "pricing_order_summary_footer_prompt",
 }

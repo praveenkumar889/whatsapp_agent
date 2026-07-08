@@ -1,7 +1,7 @@
 # ai/handlers.py — All AI handlers using DB prompts only
 #
-# REPLACES: ai/intent_router.py, ai/response_handlers.py
-# (entity extraction was removed as dead code — extract_entities/EntityResult had zero callers anywhere in the live pipeline)
+# REPLACES: ai/intent_router.py, ai/response_handlers.py, ai/entity_extractor.py
+#           (the prompt-fetching parts — core logic unchanged)
 #
 # RULE: No prompt string exists in this file.
 #       Every prompt is fetched via get_prompt(incoming, key).
@@ -9,13 +9,13 @@
 
 import asyncio
 import json
-from datetime import datetime, timezone
-from typing import List, Optional, Any
+from datetime import datetime, timezone, timedelta
+from typing import List, Optional, Any, cast
 
 from openai import AzureOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from config import AZURE_AI_ENDPOINT, AZURE_AI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION
-from models.schemas import IntentResult, IncomingMessage
+from models.schemas import IntentResult, EntityResult, OrderItem, IncomingMessage
 from db.prompt_store import get_prompt
 
 _client = AzureOpenAI(
@@ -27,7 +27,7 @@ _client = AzureOpenAI(
 )
 
 DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION", "GREETING", "UNKNOWN"}
-DEFAULT_INTENT_MIN_CONFIDENCE = 0.50  # default — see incoming.intent_min_confidence for tenant override
+DEFAULT_INTENT_MIN_CONFIDENCE = 0.50
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -36,7 +36,7 @@ DEFAULT_INTENT_MIN_CONFIDENCE = 0.50  # default — see incoming.intent_min_conf
 
 async def classify_intent(
     customer_message: str,
-    session_history:  Optional[List[ChatCompletionMessageParam]] = None,
+    session_history:  Optional[List[Any]] = None,
     incoming: Optional[IncomingMessage] = None,
 ) -> IntentResult:
     """
@@ -44,7 +44,7 @@ async def classify_intent(
     Raises RuntimeError if prompt not set in DB.
     """
     system_prompt  = get_prompt(incoming, "intent_system_prompt")
-    valid_intents  = set(incoming.valid_intents) if incoming and incoming.valid_intents else DEFAULT_VALID_INTENTS
+    valid_intents  = set(incoming.valid_intents) if (incoming and incoming.valid_intents) else DEFAULT_VALID_INTENTS
     raw = ""
     try:
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
@@ -194,3 +194,136 @@ async def handle_unknown(incoming: IncomingMessage) -> str:
         raise
     except Exception as e:
         raise RuntimeError(f"[UNKNOWN] Failed to generate reply: {e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTITY EXTRACTOR
+# ══════════════════════════════════════════════════════════════════════════════
+
+NEW_ORDER_TRIGGERS = [
+    "i want to order", "i want to place", "place an order",
+    "new order", "i want to buy", "i need to order", "can i order",
+]
+
+def _get_relevant_history(session_history: List[Any], current_message: str) -> List[Any]:
+    if not session_history:
+        return []
+    if any(t in current_message.lower() for t in NEW_ORDER_TRIGGERS):
+        return []
+    last_idx = -1
+    for i, msg in enumerate(session_history):
+        if msg.get("role") == "user" and any(t in msg.get("content","").lower() for t in NEW_ORDER_TRIGGERS):
+            last_idx = i
+    if last_idx >= 0:
+        return session_history[last_idx:]
+    return session_history[-6:] if len(session_history) > 6 else session_history
+
+
+def _default_delivery_date() -> str:
+    ist = timezone(timedelta(hours=5, minutes=30))
+    return (datetime.now(ist) + timedelta(days=5)).strftime("%Y-%m-%d")
+
+
+async def extract_entities(
+    customer_message: str,
+    incoming: IncomingMessage,
+    session_history:  Optional[List[Any]] = None,
+    force_new_order:  bool = False,
+    cached_items:     Optional[List[Any]] = None,
+) -> EntityResult:
+    """
+    Extracts products and quantities.
+    Uses entity_system_prompt from DB (via incoming object).
+    Raises RuntimeError if prompt not set in DB.
+    """
+    raw = ""
+    try:
+        relevant_history = [] if force_new_order else _get_relevant_history(
+            session_history or [], customer_message
+        )
+
+        base_prompt = get_prompt(incoming, "entity_system_prompt")
+
+        # Append pending items context if multi-product workflow
+        if cached_items:
+            pending = "\n".join([
+                f"  - {i.product_name or 'Unknown'} (qty: {i.quantity_value or 'not specified'})"
+                for i in cached_items
+            ])
+            system_prompt = base_prompt + f"""
+
+IMPORTANT — Products pending in this order:
+{pending}
+
+If customer gives a quantity without specifying products, extract quantity for EACH pending product.
+Example:
+  Pending: [Aeris Gate Light, Villa Gate Light]
+  Customer: "I want 2 units"
+  → [{{"product_name": "Aeris Gate Light", "quantity_value": 2, "quantity_unit": "units"}},
+     {{"product_name": "Villa Gate Light",  "quantity_value": 2, "quantity_unit": "units"}}]"""
+        else:
+            system_prompt = base_prompt
+
+        messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
+        if relevant_history:
+            messages.extend(relevant_history)
+        messages.append({"role": "user", "content": f"[tenant: {incoming.tenant_id}]\n{customer_message}"})
+
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=500, temperature=0,
+                messages=messages,
+            )
+        )
+        content = response.choices[0].message.content
+        if not content:
+            raise ValueError("Empty or None response content")
+        raw    = content.strip()
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = [parsed]
+
+        items = []
+        for p in parsed:
+            qty = p.get("quantity_value")
+            if qty is not None:
+                try:    qty = int(qty)
+                except: qty = None
+            # Keep product name exactly as customer said — no SKU filtering
+            items.append(OrderItem(
+                product_name   = p.get("product_name") or None,
+                quantity_value = qty,
+                quantity_unit  = p.get("quantity_unit"),
+            ))
+
+        if not items:
+            items = [OrderItem(None, None, None)]
+
+        missing = []
+        for i, item in enumerate(items):
+            prefix = f"item_{i+1}_" if len(items) > 1 else ""
+            if not item.product_name:       missing.append(f"{prefix}product_name")
+            if item.quantity_value is None: missing.append(f"{prefix}quantity")
+
+        print(f"[ENTITY] items={len(items)} missing={missing}")
+        return EntityResult(
+            items=items, delivery_date=_default_delivery_date(),
+            invoice_number=None, payment_reference=None,
+            missing_entities=missing, raw_text=customer_message,
+            tenant_id=incoming.tenant_id,
+        )
+
+    except RuntimeError:
+        raise
+    except json.JSONDecodeError as e:
+        print(f"[ENTITY] JSON parse error: {e} | raw='{raw}'")
+    except Exception as e:
+        print(f"[ENTITY ERROR] {e}")
+
+    return EntityResult(
+        items=[OrderItem(None, None, None)], delivery_date=_default_delivery_date(),
+        invoice_number=None, payment_reference=None,
+        missing_entities=["product_name", "quantity"], raw_text=customer_message,
+        tenant_id=incoming.tenant_id,
+    )

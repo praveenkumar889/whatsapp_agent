@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, cast
 from supabase import create_client, Client  # type: ignore[import]
-from models.schemas import IncomingMessage
+from models.schemas import IncomingMessage, EntityResult
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 
 _supabase: Optional[Client] = None
@@ -166,11 +166,26 @@ async def update_intent(message_id: str, intent: str, confidence: float, tenant_
         return False
 
 
-# update_entities() removed — confirmed dead code. Its only caller,
-# ai/handlers.py::extract_entities(), was itself confirmed dead (zero
-# callers anywhere in the live pipeline) and has been removed. Both were
-# part of a first-generation entity-extraction architecture superseded by
-# the current GraphRAG-first flow (PRODUCT_SELECTION + negotiation_state).
+async def update_entities(message_id: str, entities: EntityResult) -> bool:
+    """Stores extracted entities after entity extraction engine runs."""
+    try:
+        _get_client().table("messages") \
+            .update({
+                "product_name":      entities.product_name,
+                "quantity_value":    entities.quantity_value,
+                "quantity_unit":     entities.quantity_unit,
+                "delivery_date":     entities.delivery_date,
+                "invoice_number":    entities.invoice_number,
+                "payment_reference": entities.payment_reference,
+                "missing_entities":  json.dumps(entities.missing_entities),
+            }) \
+            .eq("message_id", message_id) \
+            .execute()
+        print(f"[DB] Entities updated — product={entities.product_name} qty_value={entities.quantity_value} qty_unit={entities.quantity_unit}")
+        return True
+    except Exception as e:
+        print(f"[DB] Entities update failed: {e}")
+        return False
 
 
 async def update_reply(
@@ -521,30 +536,20 @@ async def save_product_api_responses_batch(
                 return (first.get("product_name") or first.get("name") or "").lower()
             return ""
 
-        # Bug 3 fix: deduplicate by SKU before building rows.
-        # GraphRAG can return the same SKU twice in one response (e.g. LOS06Y(M2)).
-        # A batch UPSERT with duplicate SKUs causes:
-        #   "ON CONFLICT DO UPDATE cannot affect row a second time"
-        # Dedup: last occurrence of each SKU wins (most complete data).
-        seen_skus: dict = {}
-        for item in items:
-            sku = item.get("sku", "").upper()
-            if sku:
-                seen_skus[sku] = item   # last write wins
-        deduped_items = list(seen_skus.values())
-        if len(deduped_items) < len(items):
-            print(f"[DB] Deduped {len(items)} → {len(deduped_items)} products "
-                  f"(removed {len(items)-len(deduped_items)} duplicate SKUs)")
-
         rows = [
             {
                 "tenant_id":    tenant_id,
                 "sku":          item["sku"].upper(),
                 "api_response": _json.dumps(item["api_response"]),
                 "cached_at":    now_iso,
+                # product_name enables fast server-side indexed lookup instead
+                # of full in-memory scan. Previously missing → caused every
+                # get_cached_product_by_name() call to fail the indexed query
+                # and fall back to scanning all rows for the tenant.
                 "product_name": _extract_product_name(item["api_response"]),
             }
-            for item in deduped_items
+            for item in items
+            if item.get("sku")
         ]
 
         if not rows:
@@ -630,61 +635,28 @@ async def get_cached_product_by_name(
     """
     name_lower = product_name.lower().strip()
 
-    # Tiered lookup strategy — most precise to least precise.
-    # Stops at first match so "LED" doesn't accidentally return all LED products.
-    #
-    # Tier 1: Exact match         WHERE product_name = 'romy 12w bollard'
-    # Tier 2: Prefix match        WHERE product_name LIKE 'romy 12w%'
-    # Tier 3: Trigram ILIKE       WHERE product_name ILIKE '%romy 12w%'
-    # Tier 4: Fallback in-memory  (below, in case DB column missing)
+    # Primary path: server-side ilike filter — O(log n) with a column index.
+    # This avoids a full table scan that scales badly as the cache grows.
+    try:
+        result = _get_client().table("product_cache") \
+            .select("sku, api_response, cached_at") \
+            .eq("tenant_id", tenant_id) \
+            .ilike("product_name", name_lower) \
+            .limit(1) \
+            .execute()
 
-    def _parse_row(row: dict) -> Optional[dict]:
-        raw  = cast(dict, row).get("api_response")
-        data = _json.loads(raw) if isinstance(raw, str) else raw
-        if not isinstance(data, list):
-            data = [data]
-        return cast(dict, data[0]) if data else None
-
-    # Tier 1 + 2: exact and prefix — limit 1 (only one sensible match possible)
-    # Tier 3: trigram — fetch up to 5 candidates, pick the BEST match.
-    #   "Best" = longest product_name that still contains the query string,
-    #   because a longer match is more specific (e.g. "Romy 12W Bollard" over "Romy").
-    #   Ties broken by lexicographic order for determinism.
-    tiers = [
-        ("exact",   "eq",   lambda n: n,       1),
-        ("prefix",  "ilike",lambda n: f"{n}%", 1),
-        ("trigram", "ilike",lambda n: f"%{n}%",5),
-    ]
-
-    for tier_name, method, val_fn, limit in tiers:
-        try:
-            q = _get_client().table("product_cache") \
-                .select("sku, api_response, cached_at, product_name") \
-                .eq("tenant_id", tenant_id) \
-                .limit(limit)
-            q = q.eq("product_name", val_fn(name_lower)) if method == "eq" \
-                else q.ilike("product_name", val_fn(name_lower))
-            result = q.execute()
-            if result.data:
-                if tier_name == "trigram" and len(result.data) > 1:
-                    # Pick best: most specific = longest name that contains query
-                    # (longer = more words matched = less ambiguous)
-                    def _score_row(r: dict) -> int:
-                        rn = r.get("product_name", "") or ""
-                        # Higher score = longer name = more specific match
-                        return len(rn)
-                    best_row = max(cast(list[dict], result.data), key=_score_row)
-                else:
-                    best_row = cast(dict, result.data[0])
-                item = _parse_row(best_row)
-                if item:
-                    matched_name = best_row.get("product_name", "")
-                    print(f"[DB] Product found in cache ({tier_name}) — "
-                          f"'{product_name}' -> '{matched_name}' SKU={item.get('sku')}")
-                    return item
-        except Exception as e:
-            print(f"[DB] Tier '{tier_name}' lookup failed: {e}")
-            break   # DB error — go to fallback scan
+        if result.data:
+            row  = cast(dict, result.data[0])
+            raw  = row.get("api_response")
+            data = _json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(data, list):
+                data = [data]
+            if data:
+                first_item = cast(dict, data[0])
+                print(f"[DB] Product found in cache by name (indexed) — '{product_name}' -> SKU={first_item.get('sku')}")
+                return first_item
+    except Exception as e:
+        print(f"[DB] Server-side product_name search failed: {e}. Falling back to in-memory scan.")
 
     # Fallback path: in-memory scan for schemas without product_name column.
     # Fetches all rows for this tenant only (tenant_id scoped).
@@ -968,67 +940,6 @@ async def clear_category_selection(
         return False
 
 
-async def clear_last_discussed_product(
-    tenant_id:  str,
-    session_id: str,
-) -> bool:
-    """Clears the LAST_DISCUSSED_PRODUCT marker, e.g. after an order is confirmed."""
-    try:
-        _get_client().table("workflow_sessions") \
-            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "LAST_DISCUSSED_PRODUCT") \
-            .execute()
-        print(f"[DB] LAST_DISCUSSED_PRODUCT cleared for {session_id}")
-        return True
-    except Exception as e:
-        print(f"[DB] clear_last_discussed_product failed: {e}")
-        return False
-
-
-async def clear_product_selection(
-    tenant_id:  str,
-    session_id: str,
-) -> bool:
-    """Clears the PRODUCT_SELECTION (numbered list) state, e.g. after an order is confirmed."""
-    try:
-        _get_client().table("workflow_sessions") \
-            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "PRODUCT_SELECTION") \
-            .execute()
-        print(f"[DB] PRODUCT_SELECTION cleared for {session_id}")
-        return True
-    except Exception as e:
-        print(f"[DB] clear_product_selection failed: {e}")
-        return False
-
-
-async def clear_post_order_context(
-    tenant_id:  str,
-    session_id: str,
-) -> None:
-    """
-    Convenience wrapper: clears everything that should NOT survive into a
-    fresh shopping session after an order is confirmed and invoiced —
-    last discussed product, the numbered product-selection list, and any
-    pending (unconfirmed) order. Negotiation state is cleared separately by
-    the caller (clear_negotiation_state), since it's cleared earlier in the
-    confirm flow, before the invoice is generated.
-
-    Best-effort: each clear runs independently so one failure doesn't block
-    the others. Never raises — this runs after the customer already has
-    their invoice, so nothing here should be able to disrupt that response.
-    """
-    for _clear_fn in (clear_last_discussed_product, clear_product_selection, delete_pending_order):
-        try:
-            await _clear_fn(tenant_id, session_id)
-        except Exception as e:
-            print(f"[DB] clear_post_order_context: {_clear_fn.__name__} failed (non-critical): {e}")
-
-
 # ── Negotiation State ─────────────────────────────────────────────────────────
 # Stores active negotiation state in workflow_sessions table.
 # Status: NEGOTIATING (active) — expires after 30 minutes of inactivity.
@@ -1115,6 +1026,54 @@ async def clear_negotiation_state(
         return True
     except Exception as e:
         print(f"[DB] clear_negotiation_state failed: {e}")
+        return False
+
+
+async def clear_post_order_context(tenant_id: str, session_id: str) -> bool:
+    """
+    Clears stale conversational context after an order is successfully confirmed.
+
+    This includes updating statuses to 'COMPLETED' in workflow_sessions for:
+      - LAST_DISCUSSED_PRODUCT
+      - PRODUCT_SELECTION
+      - ORDER_PENDING
+      - WORKFLOW_PENDING
+      - CATEGORY_SELECTION
+
+    It also updates the Mem0 workflow snapshot state to 'INVOICED'.
+    """
+    try:
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # 1. Update Supabase states
+        statuses_to_clear = [
+            "LAST_DISCUSSED_PRODUCT",
+            "PRODUCT_SELECTION",
+            "ORDER_PENDING",
+            "WORKFLOW_PENDING",
+            "CATEGORY_SELECTION"
+        ]
+
+        _get_client().table("workflow_sessions") \
+            .update({"status": "COMPLETED", "updated_at": now_iso}) \
+            .eq("tenant_id", tenant_id) \
+            .eq("session_id", session_id) \
+            .in_("status", statuses_to_clear) \
+            .execute()
+
+        print(f"[DB] Supabase post-order context cleared for {session_id}")
+
+        # 2. Update Mem0 workflow snapshot
+        try:
+            from db.memory_store import save_workflow_snapshot
+            await save_workflow_snapshot(tenant_id, session_id, "INVOICED")
+            print(f"[DB] Mem0 workflow snapshot updated to INVOICED for {session_id}")
+        except Exception as mem_err:
+            print(f"[DB] Mem0 snapshot update failed during context clear: {mem_err}")
+
+        return True
+    except Exception as e:
+        print(f"[DB] clear_post_order_context failed: {e}")
         return False
 
 
