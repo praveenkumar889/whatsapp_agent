@@ -83,7 +83,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable, Any
 
 from ai import memory_metrics
 
@@ -99,6 +99,7 @@ class MemoryContext(Protocol):
     intent:                 Optional[str]
     workflow:               Optional[str]
     needs_long_term_memory: Optional[bool]
+    incoming:               Optional[Any]
 
 
 @dataclass
@@ -123,6 +124,7 @@ class MemoryRequest:
     current_product:         Optional[str] = None
     negotiation_active:      bool = False
     needs_long_term_memory:  Optional[bool] = None
+    incoming:                Optional[Any] = None
 
 
 @dataclass
@@ -185,6 +187,13 @@ class MemoryPolicy:
         intent    = getattr(context, "intent", None)
         workflow  = getattr(context, "workflow", None)
         upstream  = getattr(context, "needs_long_term_memory", None)
+        incoming  = getattr(context, "incoming", None)
+
+        # Dynamic configuration from tenant overrides
+        deny_workflows = getattr(incoming, "memory_deny_workflows", None) or cls._DENY_WORKFLOWS
+        allow_intents = getattr(incoming, "memory_allow_intents", None) or cls._ALLOW_INTENTS
+        types_by_intent = getattr(incoming, "memory_types_by_intent", None) or cls._TYPES_BY_INTENT
+        default_types = getattr(incoming, "memory_default_types", None) or cls._DEFAULT_TYPES
 
         if upstream is None:
             # No upstream classification yet for this tenant/call site.
@@ -196,13 +205,13 @@ class MemoryPolicy:
 
         worthy = bool(upstream)
 
-        if workflow in cls._DENY_WORKFLOWS and not worthy:
+        if workflow in deny_workflows and not worthy:
             decision = MemoryDecision(retrieve=False, reason="deny_workflow")
-        elif intent in cls._ALLOW_INTENTS:
-            types, max_results = cls._TYPES_BY_INTENT.get(intent, cls._DEFAULT_TYPES)
+        elif isinstance(intent, str) and intent in allow_intents:
+            types, max_results = types_by_intent.get(intent, default_types)
             decision = MemoryDecision(retrieve=True, types=types, max_results=max_results, reason="allow_intent")
         elif worthy:
-            types, max_results = cls._DEFAULT_TYPES
+            types, max_results = default_types
             decision = MemoryDecision(retrieve=True, types=types, max_results=max_results, reason="worthy")
         else:
             decision = MemoryDecision(retrieve=False, reason="not_worthy")

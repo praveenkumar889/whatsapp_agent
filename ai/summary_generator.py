@@ -105,7 +105,7 @@ Summary:"""
             return
         summary = content.strip()
 
-        mm = MemoryManager(tenant_id, session_id)
+        mm = MemoryManager(tenant_id, session_id, incoming)
         await mm._async_save(
             f"CONVERSATION_SUMMARY: {summary}",
             "conversation_summary",
@@ -125,6 +125,7 @@ async def save_purchase_summary(
     order_id:     str,
     store_disc:   float = 0,
     neg_disc:     float = 0,
+    incoming:     Optional[IncomingMessage] = None,
 ) -> None:
     """
     Step 11 — Order Completed event:
@@ -148,7 +149,7 @@ async def save_purchase_summary(
             "store_disc":   store_disc,
             "neg_disc":     neg_disc,
         }
-        mm = MemoryManager(tenant_id, session_id)
+        mm = MemoryManager(tenant_id, session_id, incoming)
         await mm._async_save(
             f"PURCHASE_SUMMARY: {json.dumps(summary)}",
             "purchase_summary",
@@ -163,6 +164,7 @@ async def save_last_product(
     tenant_id:    str,
     session_id:   str,
     product:      dict,
+    incoming:     Optional[IncomingMessage] = None,
 ) -> None:
     """
     Step 11 — Product Selected event:
@@ -173,7 +175,7 @@ async def save_last_product(
     """
     try:
         from ai.memory_manager import MemoryManager
-        mm = MemoryManager(tenant_id, session_id)
+        mm = MemoryManager(tenant_id, session_id, incoming)
         await mm.save_product_context(product)
         print(f"[SUMMARY] Last product updated: {product.get('product_name', '?')}")
     except Exception as e:
@@ -186,6 +188,7 @@ async def save_customer_preference(
     pref_type:    str,
     value:        str,
     confidence:   float = 0.8,
+    incoming:     Optional[IncomingMessage] = None,
 ) -> None:
     """
     Step 11 — Customer Preference event:
@@ -198,7 +201,7 @@ async def save_customer_preference(
     """
     try:
         from ai.memory_manager import MemoryManager
-        mm = MemoryManager(tenant_id, session_id)
+        mm = MemoryManager(tenant_id, session_id, incoming)
         await mm.save_preference(pref_type, value, confidence)
     except Exception as e:
         print(f"[SUMMARY] save_customer_preference failed: {e}")
@@ -213,6 +216,7 @@ async def update_negotiation_profile(
     rounds:        int,
     accepted:      bool,
     quantity:      int,
+    incoming:      Optional[IncomingMessage] = None,
 ) -> None:
     """
     Step 11 — Negotiation Completed event:
@@ -224,7 +228,7 @@ async def update_negotiation_profile(
     """
     try:
         from ai.memory_manager import MemoryManager
-        mm = MemoryManager(tenant_id, session_id)
+        mm = MemoryManager(tenant_id, session_id, incoming)
         await mm.save_negotiation_outcome(
             product, opening_price, final_price, rounds, accepted, quantity
         )
