@@ -17,7 +17,8 @@ async def query_mcp_catalog(
     session_id: Optional[str] = None,
     tenant_id: Optional[str] = None,
     limit: int = 15,
-    server_url: Optional[str] = None
+    server_url: Optional[str] = None,
+    intent_data: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Calls the `search_catalog` tool on the FastMCP server.
@@ -42,6 +43,8 @@ async def query_mcp_catalog(
             }
             if tenant_id:
                 tool_args["tenant_id"] = tenant_id
+            if intent_data:
+                tool_args["intent_data"] = intent_data
             res = await client.call_tool("search_catalog", tool_args)
             # res.data contains the tool return value (dict) when calling via FastMCP
             data = getattr(res, "data", None)
@@ -100,3 +103,30 @@ async def get_product_details_mcp(
         print(f"[MCP-CLIENT] Failed to call 'get_product_details' for SKU '{sku}': {e}")
         return None
 
+async def get_taxonomy_context_mcp(
+    query: str,
+    threshold: float = 0.80,
+    server_url: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Calls the `get_taxonomy_context` tool on the FastMCP server to map natural language to exact DB items.
+    """
+    url = server_url or MCP_SERVER_URL
+    try:
+        async with Client(url) as client:
+            res = await client.call_tool("get_taxonomy_context", {"query": query, "threshold": threshold})
+            data = getattr(res, "data", None)
+            if data is not None and isinstance(data, dict):
+                return data.get("taxonomy", {})
+            content = getattr(res, "content", None)
+            if isinstance(content, list) and len(content) > 0:
+                for item in content:
+                    if hasattr(item, "text") and item.text:
+                        try:
+                            return json.loads(item.text).get("taxonomy", {})
+                        except Exception:
+                            pass
+            return None
+    except Exception as e:
+        print(f"[MCP-CLIENT] Failed to call 'get_taxonomy_context': {e}")
+        return None

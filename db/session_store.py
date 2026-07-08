@@ -547,20 +547,30 @@ async def save_product_api_responses_batch(
                 return (first.get("product_name") or first.get("name") or "").lower()
             return ""
 
+        # Bug 3 fix: deduplicate by SKU before building rows.
+        # GraphRAG can return the same SKU twice in one response (e.g. LOS06Y(M2)).
+        # A batch UPSERT with duplicate SKUs causes:
+        #   "ON CONFLICT DO UPDATE cannot affect row a second time"
+        # Dedup: last occurrence of each SKU wins (most complete data).
+        seen_skus: dict = {}
+        for item in items:
+            sku = item.get("sku", "").upper()
+            if sku:
+                seen_skus[sku] = item   # last write wins
+        deduped_items = list(seen_skus.values())
+        if len(deduped_items) < len(items):
+            print(f"[DB] Deduped {len(items)} → {len(deduped_items)} products "
+                  f"(removed {len(items)-len(deduped_items)} duplicate SKUs)")
+
         rows = [
             {
                 "tenant_id":    tenant_id,
                 "sku":          item["sku"].upper(),
                 "api_response": _json.dumps(item["api_response"]),
                 "cached_at":    now_iso,
-                # product_name enables fast server-side indexed lookup instead
-                # of full in-memory scan. Previously missing → caused every
-                # get_cached_product_by_name() call to fail the indexed query
-                # and fall back to scanning all rows for the tenant.
                 "product_name": _extract_product_name(item["api_response"]),
             }
-            for item in items
-            if item.get("sku")
+            for item in deduped_items
         ]
 
         if not rows:
@@ -646,28 +656,61 @@ async def get_cached_product_by_name(
     """
     name_lower = product_name.lower().strip()
 
-    # Primary path: server-side ilike filter — O(log n) with a column index.
-    # This avoids a full table scan that scales badly as the cache grows.
-    try:
-        result = _get_client().table("product_cache") \
-            .select("sku, api_response, cached_at") \
-            .eq("tenant_id", tenant_id) \
-            .ilike("product_name", name_lower) \
-            .limit(1) \
-            .execute()
+    # Tiered lookup strategy — most precise to least precise.
+    # Stops at first match so "LED" doesn't accidentally return all LED products.
+    #
+    # Tier 1: Exact match         WHERE product_name = 'romy 12w bollard'
+    # Tier 2: Prefix match        WHERE product_name LIKE 'romy 12w%'
+    # Tier 3: Trigram ILIKE       WHERE product_name ILIKE '%romy 12w%'
+    # Tier 4: Fallback in-memory  (below, in case DB column missing)
 
-        if result.data:
-            row  = cast(dict, result.data[0])
-            raw  = row.get("api_response")
-            data = _json.loads(raw) if isinstance(raw, str) else raw
-            if not isinstance(data, list):
-                data = [data]
-            if data:
-                first_item = cast(dict, data[0])
-                print(f"[DB] Product found in cache by name (indexed) — '{product_name}' -> SKU={first_item.get('sku')}")
-                return first_item
-    except Exception as e:
-        print(f"[DB] Server-side product_name search failed: {e}. Falling back to in-memory scan.")
+    def _parse_row(row: dict) -> Optional[dict]:
+        raw  = row.get("api_response")
+        data = _json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(data, list):
+            data = [data]
+        return cast(dict, data[0]) if data else None
+
+    # Tier 1 + 2: exact and prefix — limit 1 (only one sensible match possible)
+    # Tier 3: trigram — fetch up to 5 candidates, pick the BEST match.
+    #   "Best" = longest product_name that still contains the query string,
+    #   because a longer match is more specific (e.g. "Romy 12W Bollard" over "Romy").
+    #   Ties broken by lexicographic order for determinism.
+    tiers = [
+        ("exact",   "eq",   lambda n: n,       1),
+        ("prefix",  "ilike",lambda n: f"{n}%", 1),
+        ("trigram", "ilike",lambda n: f"%{n}%",5),
+    ]
+
+    for tier_name, method, val_fn, limit in tiers:
+        try:
+            q = _get_client().table("product_cache") \
+                .select("sku, api_response, cached_at, product_name") \
+                .eq("tenant_id", tenant_id) \
+                .limit(limit)
+            q = q.eq("product_name", val_fn(name_lower)) if method == "eq" \
+                else q.ilike("product_name", val_fn(name_lower))
+            result = q.execute()
+            if result.data:
+                if tier_name == "trigram" and len(result.data) > 1:
+                    # Pick best: most specific = longest name that contains query
+                    # (longer = more words matched = less ambiguous)
+                    def _score_row(r: dict) -> int:
+                        rn = r.get("product_name", "") or ""
+                        # Higher score = longer name = more specific match
+                        return len(rn)
+                    best_row = max(cast(list[dict], result.data), key=_score_row)
+                else:
+                    best_row = cast(dict, result.data[0])
+                item = _parse_row(best_row)
+                if item:
+                    matched_name = best_row.get("product_name", "")
+                    print(f"[DB] Product found in cache ({tier_name}) — "
+                          f"'{product_name}' -> '{matched_name}' SKU={item.get('sku')}")
+                    return item
+        except Exception as e:
+            print(f"[DB] Tier '{tier_name}' lookup failed: {e}")
+            break   # DB error — go to fallback scan
 
     # Fallback path: in-memory scan for schemas without product_name column.
     # Fetches all rows for this tenant only (tenant_id scoped).
@@ -1124,7 +1167,68 @@ async def get_last_discussed_product(tenant_id: str, session_id: str) -> Optiona
         return None
 
 
-        #
+async def save_dialog_state(tenant_id: str, session_id: str, state: dict) -> bool:
+    """Saves unified Dialog State Tracking (DST) JSON object in workflow_sessions table."""
+    try:
+        now_utc = datetime.now(timezone.utc)
+        expires_at = (now_utc + timedelta(hours=24)).isoformat()
+        row = {
+            "tenant_id":  tenant_id,
+            "session_id": session_id,
+            "status":     "DIALOG_STATE",
+            "items_json": json.dumps(state),
+            "expires_at": expires_at,
+            "updated_at": now_utc.isoformat(),
+        }
+        print(f"[DEBUG-DST-DB] Saving dialog state for session='{session_id}' | tenant='{tenant_id}'")
+        print(f"[DEBUG-DST-DB] Payload -> {json.dumps(state, indent=2)}")
+        existing = _get_client().table("workflow_sessions") \
+            .select("id") \
+            .eq("tenant_id", tenant_id) \
+            .eq("session_id", session_id) \
+            .eq("status", "DIALOG_STATE") \
+            .limit(1) \
+            .execute()
+        if existing.data:
+            row_id = cast(dict, existing.data[0])["id"]
+            _get_client().table("workflow_sessions").update(row).eq("id", row_id).execute()
+            print(f"[DEBUG-DST-DB] Updated existing DIALOG_STATE row id={row_id}")
+        else:
+            res = _get_client().table("workflow_sessions").insert(row).execute()
+            print(f"[DEBUG-DST-DB] Inserted new DIALOG_STATE row into workflow_sessions.")
+        return True
+    except Exception as e:
+        print(f"[DEBUG-DST-DB] ERROR save_dialog_state failed: {e}")
+        return False
+
+
+async def get_dialog_state(tenant_id: str, session_id: str) -> Optional[dict]:
+    """Retrieves unified Dialog State Tracking (DST) JSON object from workflow_sessions table."""
+    try:
+        print(f"[DEBUG-DST-DB] Fetching current dialog state for session='{session_id}' | tenant='{tenant_id}'")
+        now_utc = datetime.now(timezone.utc).isoformat()
+        result = _get_client().table("workflow_sessions") \
+            .select("items_json") \
+            .eq("tenant_id", tenant_id) \
+            .eq("session_id", session_id) \
+            .eq("status", "DIALOG_STATE") \
+            .gt("expires_at", now_utc) \
+            .order("updated_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            row = cast(dict, result.data[0])
+            raw = row.get("items_json")
+            if raw:
+                parsed = json.loads(raw)
+                print(f"[DEBUG-DST-DB] Loaded active dialog state:\n{json.dumps(parsed, indent=2)}")
+                return parsed
+        print(f"[DEBUG-DST-DB] No active dialog state found in DB for session='{session_id}'. Returning None.")
+        return None
+    except Exception as e:
+        print(f"[DEBUG-DST-DB] ERROR get_dialog_state failed: {e}")
+        return None
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TENANT OFFERS TABLE

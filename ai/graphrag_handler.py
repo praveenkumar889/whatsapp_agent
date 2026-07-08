@@ -33,6 +33,8 @@ from db.session_store import (
     save_category_selection,
     get_category_selection,
     clear_category_selection,
+    save_dialog_state,
+    get_dialog_state,
 )
 
 def _load_category_prompt(incoming, cat_list: str) -> str:
@@ -222,6 +224,39 @@ def _coerce_pythonic_dict(value):
     return value
 
 
+
+
+def _clean_category_name(cat: str) -> str:
+    if not cat:
+        return ""
+    # Strip descriptions after en-dash (–), em-dash (—), hyphen (-), or colon (:)
+    cleaned = re.split(r'\s*[–—\-:]\s+(?=[a-z])|\s+[–—\-:]\s*', cat)[0].strip()
+    return cleaned.strip('*').strip()
+
+
+def _extract_category_options(text: str) -> Optional[list]:
+    """
+    Extracts a list of category options from a GraphRAG BROWSE_CATEGORY reply.
+    """
+    if not text:
+        return None
+
+    categories = []
+    for line in text.split("\n"):
+        line = line.strip()
+        m = re.match(r'^[•\-\*·]\s+(.+)$', line)
+        if not m:
+            m = re.match(r'^\*\*\d+\.\*\*\s+(.+)$', line)
+        if not m:
+            m = re.match(r'^\d+[.)]\s+(.+)$', line)
+        if m:
+            cat = _clean_category_name(m.group(1).strip())
+            if cat:
+                categories.append(cat)
+
+    return categories if len(categories) >= 2 else None
+
+
 def _parse_plaintext_categories(text: str) -> Optional[list]:
     """
     Detects and parses a plain-text bullet list of category options from a GraphRAG
@@ -237,22 +272,7 @@ def _parse_plaintext_categories(text: str) -> Optional[list]:
     if not any(kw in text.lower() for kw in _clarify_keywords):
         return None
 
-    categories = []
-    for line in text.split("\n"):
-        line = line.strip()
-        m = re.match(r'^[•\-\*·]\s+(.+)$', line)
-        if not m:
-            m = re.match(r'^\*\*\d+\.\*\*\s+(.+)$', line)
-        if not m:
-            m = re.match(r'^\d+[.)]\s+(.+)$', line)
-        if m:
-            cat = m.group(1).strip()
-            cat = re.split(r'\s+[—\-]\s+', cat)[0].strip()
-            cat = cat.strip('*').strip()
-            if cat:
-                categories.append(cat)
-
-    return categories if len(categories) >= 2 else None
+    return _extract_category_options(text)
 
 
 async def _resolve_category_from_message(incoming, text: str, categories: list) -> Optional[str]:
@@ -273,19 +293,22 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
     if m:
         idx = int(m.group(1)) - 1
         if 0 <= idx < len(categories):
-            print(f"[CATEGORY] Index match: {idx+1} → '{categories[idx]}'")
-            return categories[idx]
+            cleaned = _clean_category_name(categories[idx])
+            print(f"[CATEGORY] Index match: {idx+1} → '{cleaned}'")
+            return cleaned
 
     # 2. String match
     text_lower = text_stripped.lower()
     for cat in categories:
         if cat.lower() == text_lower:
-            print(f"[CATEGORY] Exact match: '{cat}'")
-            return cat
+            cleaned = _clean_category_name(cat)
+            print(f"[CATEGORY] Exact match: '{cleaned}'")
+            return cleaned
     for cat in categories:
         if cat.lower() in text_lower or text_lower in cat.lower():
-            print(f"[CATEGORY] Substring match: '{cat}'")
-            return cat
+            cleaned = _clean_category_name(cat)
+            print(f"[CATEGORY] Substring match: '{cleaned}'")
+            return cleaned
     text_words = {w for w in text_lower.split() if len(w) > 3}
     best_cat, best_overlap = None, 0
     for cat in categories:
@@ -294,8 +317,9 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
         if overlap > best_overlap:
             best_overlap, best_cat = overlap, cat
     if best_overlap >= 2 or (best_overlap >= 1 and len(text_words) <= 2):
-        print(f"[CATEGORY] Word-overlap match ({best_overlap} words): '{best_cat}'")
-        return best_cat
+        cleaned = _clean_category_name(best_cat)
+        print(f"[CATEGORY] Word-overlap match ({best_overlap} words): '{cleaned}'")
+        return cleaned
 
     # 3. LLM semantic fallback
     try:
@@ -318,8 +342,9 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
         if llm_choice and llm_choice.upper() != "NONE":
             for cat in categories:
                 if cat.lower() == llm_choice.lower() or llm_choice.lower() in cat.lower():
-                    print(f"[CATEGORY] LLM match: '{cat}'")
-                    return cat
+                    cleaned = _clean_category_name(cat)
+                    print(f"[CATEGORY] LLM match: '{cleaned}'")
+                    return cleaned
     except Exception as e:
         print(f"[CATEGORY] LLM mapping failed: {e}")
 
@@ -372,13 +397,20 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # If GraphRAG previously returned a category clarification list, the customer's
         # next message is their category pick — match it and rewrite the query so
         # GraphRAG returns products for that specific category.
+        _client_intent_data = None
         _cat_options = await get_category_selection(incoming.tenant_id, incoming.session_id)
         if _cat_options:
             _matched_cat = await _resolve_category_from_message(incoming, incoming.text, _cat_options)
             if _matched_cat:
-                print(f"[CATEGORY] Resolved '{_matched_cat}' — rewriting query")
+                clean_cat = _clean_category_name(_matched_cat)
+                print(f"[CATEGORY] Resolved '{clean_cat}' — rewriting query and setting client intent_data")
                 await clear_category_selection(incoming.tenant_id, incoming.session_id)
-                graphrag_text = f"Show products in {_matched_cat}"
+                graphrag_text = f"Show products in {clean_cat}"
+                _client_intent_data = {
+                    "intent": "find_product",
+                    "category_keywords": [clean_cat],
+                    "filters": {"category": clean_cat}
+                }
             else:
                 print(f"[CATEGORY] No match found — clearing state, proceeding with original query")
                 await clear_category_selection(incoming.tenant_id, incoming.session_id)
@@ -421,12 +453,47 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         if USE_MCP_SERVER or (effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url)):
             mcp_url = effective_graphrag_url if effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url) else MCP_SERVER_URL
             print(f"[GRAPHRAG-MCP] Routing via MCP Server at {mcp_url}")
-            from ai.mcp_client import query_mcp_catalog
+            from ai.mcp_client import query_mcp_catalog, get_taxonomy_context_mcp
+            
+            if _client_intent_data is None:
+                existing_state = await get_dialog_state(incoming.tenant_id, incoming.session_id) or {}
+                print(f"\n[DEBUG-DST] === DIALOG STATE TRACKER START ===")
+                print(f"[DEBUG-DST] Session ID    : {incoming.session_id}")
+                print(f"[DEBUG-DST] Tenant ID     : {incoming.tenant_id}")
+                print(f"[DEBUG-DST] Previous State: {json.dumps(existing_state, indent=2)}")
+                
+                history_text = "\n".join([f"{m.get('sender', 'user')}: {m.get('text', '')}" for m in (session_history or [])[-4:] if isinstance(m, dict)])
+                if existing_state:
+                    history_text = f"Current Dialog State: {json.dumps(existing_state)}\n" + history_text
+                taxonomy_hints = await get_taxonomy_context_mcp(graphrag_text, server_url=mcp_url)
+                print(f"[DEBUG-DST] Taxonomy Hints: {json.dumps(taxonomy_hints)}")
+                
+                from ai.intent_classifier import classify_user_intent_client_side
+                _client_intent_data = await classify_user_intent_client_side(
+                    query=graphrag_text,
+                    history_context=history_text,
+                    taxonomy_hints=taxonomy_hints
+                )
+                print(f"[DEBUG-DST] Extracted Client Intent -> {json.dumps(_client_intent_data, indent=2)}")
+                
+                # Update Dialog State in workflow_sessions table
+                updated_state = {
+                    "follow_up": _client_intent_data.get("intent") in ["get_product_info", "check_policy"],
+                    "negotiation": existing_state.get("negotiation", False),
+                    "product": _client_intent_data.get("product_name") or existing_state.get("product"),
+                    "category": (_client_intent_data.get("category_keywords") or [existing_state.get("category", None)])[0],
+                    "tenant_id": incoming.tenant_id
+                }
+                await save_dialog_state(incoming.tenant_id, incoming.session_id, updated_state)
+                print(f"[DEBUG-DST] Transitioned State -> {json.dumps(updated_state, indent=2)}")
+                print(f"[DEBUG-DST] === DIALOG STATE TRACKER END ===\n")
+
             mcp_res = await query_mcp_catalog(
                 query=graphrag_text,
                 session_id=incoming.session_id,
                 tenant_id=incoming.tenant_id,
-                server_url=mcp_url
+                server_url=mcp_url,
+                intent_data=_client_intent_data
             )
             if mcp_res and mcp_res.get("status") == "success":
                 products = mcp_res.get("products", [])
