@@ -145,7 +145,17 @@ class _PromptRenderer:
         NEVER format_map(): prompts contain literal JSON {"type":"X"} that
         format_map() would crash on. str.replace() only touches explicit kwargs.
         """
-        result = pt.template
+        # Normalize literal \n / \t to real newline/tab characters. PostgreSQL
+        # plain '...' string literals do NOT interpret \n as an escape sequence
+        # (only E'...' strings do) — any prompt authored with \n notation
+        # instead of an actual line break — including a tenant admin typing
+        # it directly into Supabase Studio, which is the natural expectation —
+        # stores the literal two-character sequence, reaching customers as
+        # visible "\n" text instead of a line break. Safe for every tenant:
+        # a prompt with a genuine actual newline is completely unaffected;
+        # this only touches the literal backslash-n/backslash-t sequence.
+        template = pt.template.replace("\\n", "\n").replace("\\t", "\t")
+        result = template
         for k, v in vars.items():
             result = result.replace("{" + k + "}", str(v))
         remaining = re.findall(r'\{([a-zA-Z_][a-zA-Z0-9_]*)\}', result)

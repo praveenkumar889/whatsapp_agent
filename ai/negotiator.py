@@ -6,6 +6,7 @@
 
 import asyncio
 import json
+from dataclasses import dataclass
 from typing import List, Optional, cast
 
 from openai import AzureOpenAI
@@ -18,68 +19,8 @@ _client = AzureOpenAI(
     api_version=AZURE_AI_API_VERSION, timeout=30.0, max_retries=0,
 )
 
-MAX_NEGOTIATION_ROUNDS = 4   # default — see get_max_negotiation_rounds()
-DEFAULT_FLOOR_DISC_PCT = 5   # default — see get_negotiation_floor_disc()
-DEFAULT_FLOOR_MULTIPLIER = 0.95   # default — see get_floor_multiplier()
-
-
-def upsell_hint(incoming, value_gap: float, units_needed: int, next_min_val, next_disc_pct: int) -> str:
-    """
-    Shared "add Rs.X more to unlock Y% off" hint — was duplicated as a
-    hardcoded f-string in 4 places (negotiator.py first-offer path,
-    negotiator.py qty-change path, product_followup.py auto-offer path,
-    product_followup.py fresh-order path).
-    """
-    try:
-        return get_prompt(
-            incoming, "neg_upsell_hint_prompt",
-            value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
-            next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct,
-        )
-    except RuntimeError:
-        return (
-            f"\n\n💡 Add Rs.{value_gap:,.0f} more to your order value "
-            f"(approx. {units_needed} more unit(s)) to reach Rs.{next_min_val:,} "
-            f"and unlock *{next_disc_pct}% off*!"
-        )
-
-
-def max_discount_hint(incoming, max_disc: int, just_unlocked: bool = False) -> str:
-    """
-    Shared "you've unlocked our maximum store discount" hint — same
-    duplication pattern as upsell_hint() above. `just_unlocked` preserves
-    the two slightly different original wordings ("unlocked" vs "just
-    unlocked") depending on which call site fires.
-    """
-    qualifier = "just " if just_unlocked else ""
-    try:
-        return get_prompt(
-            incoming, "neg_max_discount_unlocked_prompt",
-            max_disc=max_disc, qualifier=qualifier,
-        )
-    except RuntimeError:
-        return f"\n\n🎉 You've {qualifier}unlocked our *maximum store discount of {max_disc}% OFF*!"
-
-
-def get_max_negotiation_rounds(incoming=None) -> int:
-    """
-    Tenant-configurable max negotiation rounds before forcing a final price.
-    Different businesses reasonably want different negotiation depth (a
-    high-touch B2B seller might want 6+ rounds; a low-margin retailer might
-    want 2). Falls back to MAX_NEGOTIATION_ROUNDS when a tenant hasn't set
-    max_negotiation_rounds in their tenant row.
-    """
-    val = getattr(incoming, "max_negotiation_rounds", None) if incoming else None
-    return int(val) if val else MAX_NEGOTIATION_ROUNDS
-
-
-def get_floor_multiplier(incoming=None) -> float:
-    """
-    Tenant-configurable floor multiplier (final concession = baseline ×
-    this value). Falls back to DEFAULT_FLOOR_MULTIPLIER when unset.
-    """
-    val = getattr(incoming, "neg_floor_multiplier", None) if incoming else None
-    return float(val) if val else DEFAULT_FLOOR_MULTIPLIER
+MAX_NEGOTIATION_ROUNDS = 4
+DEFAULT_FLOOR_DISC_PCT = 5
 
 
 # ── Tier helpers (no prompts — pure math) ─────────────────────────────────────
@@ -108,11 +49,10 @@ def parse_global_offer_tiers(incoming, global_offers: str) -> list:
         return []
 
 
-def get_negotiation_floor_disc(tiers: list, incoming=None) -> int:
+def get_negotiation_floor_disc(tiers: list) -> int:
     if len(tiers) >= 2: return tiers[1][1]
     if len(tiers) == 1: return tiers[0][1]
-    val = getattr(incoming, "neg_floor_disc_pct", None) if incoming else None
-    return int(val) if val else DEFAULT_FLOOR_DISC_PCT
+    return DEFAULT_FLOOR_DISC_PCT
 
 def get_applicable_tier(order_value: float, tiers: list) -> tuple:
     applicable = (0, 0)
@@ -193,20 +133,6 @@ def calculate_offer(price_num: float, quantity: int, tiers: Optional[list] = Non
 # ── Detection helpers — all prompts from DB ───────────────────────────────────
 
 async def is_negotiation_request(message: str, incoming, session_history: Optional[list] = None) -> bool:
-    """
-    Pure LLM classification via neg_is_request_prompt — no regex fast-path.
-    This app is multi-tenant and multi-language; a hardcoded pattern list
-    would silently fail for any tenant whose customers phrase things
-    differently, with no fix available short of a code deploy.
-
-    In the normal flow this function is only reached as a FALLBACK — see
-    product_followup.py's is_negotiation_request field (from its unified
-    pf_data_extraction_prompt parse), which classifies this for free in the
-    same call that already parses the message. This function stays as the
-    correct, regex-free classification path for tenants whose DB prompt
-    hasn't been updated to include that field yet, and for any other
-    caller that needs a standalone answer to "is this a negotiation ask?".
-    """
     prompt = get_prompt(incoming, "neg_is_request_prompt")
     try:
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": prompt}]
@@ -254,27 +180,6 @@ async def extract_quantity(message: str, product_name: str, incoming, session_hi
 
 
 async def detect_quantity_change(message: str, current_qty: int, product_name: str, incoming) -> Optional[int]:
-    """
-    Returns the final new quantity (absolute int), or None if no change.
-
-    FIX: previously asked the LLM to return the already-computed final
-    quantity directly (e.g. "add 10 more units" with current_qty=2 → LLM
-    was expected to reply "12"). LLM arithmetic on this is NOT reliable —
-    confirmed in production: the same phrasing pattern ("add N more units")
-    sometimes correctly summed and sometimes returned N as if it were the
-    absolute total (2 → 10 instead of 2 → 12). Now the prompt returns a
-    JSON {"operation": "SET"|"ADD"|"REMOVE"|"NONE", "value": <raw number
-    mentioned, never pre-computed>} and the arithmetic happens here in
-    deterministic Python — removing LLM arithmetic reliability from the
-    equation entirely. Multi-tenant note: this only changes HOW the number
-    is computed, not the classification itself, which remains fully
-    DB-prompt-driven and tenant-configurable.
-
-    Backward compatible: if a tenant's neg_detect_qty_change_prompt hasn't
-    been updated to the new JSON schema yet, the response is a bare
-    integer or "NONE" (old schema) — falls back to treating that as an
-    already-final absolute quantity, exactly as before.
-    """
     prompt = get_prompt(
         incoming, "neg_detect_qty_change_prompt",
         current_qty=current_qty, product_name=product_name,
@@ -285,48 +190,19 @@ async def detect_quantity_change(message: str, current_qty: int, product_name: s
         ]
         r = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=30, temperature=0,
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=10, temperature=0,
                 messages=messages,
             )
         )
         content = r.choices[0].message.content
         if not content:
             return None
-        raw = content.strip()
-
-        # New schema: JSON {"operation": ..., "value": ...}
-        if raw.startswith("{"):
-            try:
-                parsed = json.loads(raw)
-                operation = str(parsed.get("operation", "NONE")).upper()
-                value     = parsed.get("value")
-                if operation == "NONE" or value is None:
-                    return None
-                value = int(value)
-                if operation == "ADD":
-                    result = current_qty + value
-                elif operation == "REMOVE":
-                    result = max(1, current_qty - value)
-                elif operation == "SET":
-                    result = value
-                else:
-                    return None
-                if result != current_qty:
-                    print(f"[NEGOTIATOR] Qty change ({operation}): {current_qty}→{result}")
-                return result
-            except (ValueError, TypeError, json.JSONDecodeError):
-                return None
-
-        # Old schema fallback: bare integer or "NONE" (tenant hasn't
-        # updated neg_detect_qty_change_prompt yet) — treat as already the
-        # final absolute quantity, exactly as this function always did.
-        raw_upper = raw.upper()
-        if raw_upper == "NONE":
-            return None
-        clean = raw_upper.replace(",", "").strip()
+        raw = content.strip().upper()
+        if raw == "NONE": return None
+        clean = raw.replace(",","").strip()
         result = int(clean) if clean.isdigit() else None
         if result and result != current_qty:
-            print(f"[NEGOTIATOR] Qty change (legacy schema): {current_qty}→{result}")
+            print(f"[NEGOTIATOR] Qty change: {current_qty}→{result}")
         return result
     except RuntimeError: raise
     except Exception as e:
@@ -393,7 +269,7 @@ async def detect_more_discount_request(message: str, incoming, session_history: 
 
 
 async def detect_acceptance(message: str, incoming, session_history: Optional[list] = None) -> bool:
-    prompt = get_prompt(incoming, "neg_detect_accept_prompt", message=message)
+    prompt = get_prompt(incoming, "neg_detect_accept_prompt")
     try:
         r = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _client.chat.completions.create(
@@ -409,9 +285,154 @@ async def detect_acceptance(message: str, incoming, session_history: Optional[li
         return False
 
 
+# ── Consolidated negotiation-intent extraction ────────────────────────────────
+# Replaces the 4 separate detect_* calls above (detect_acceptance,
+# detect_quantity_change, detect_counter_offer, detect_more_discount_request)
+# with ONE LLM call to neg_extract_negotiation_intent_prompt (migration 017,
+# enhanced with UNIT/TOTAL price disambiguation by migration 027).
+#
+# The four detectors above are kept in the file (still used by is_negotiation_request
+# and extract_quantity's callers elsewhere) but handle_negotiation()'s Step 3
+# now calls extract_negotiation_intent() instead of calling all four in sequence.
+#
+# RULE: the LLM only classifies. All arithmetic (SET/ADD/REMOVE quantity math,
+# TOTAL-to-per-unit price division) happens in Python — see
+# _apply_quantity_operation() and _resolve_counter_offer_price() below.
+
+@dataclass
+class NegotiationIntent:
+    intent:                    str             # ACCEPTED | QTY_CHANGE | COUNTER_OFFER | MORE_DISCOUNT | NONE
+    matched_phrase:            str
+    accepted:                  bool
+    quantity_value:            Optional[int]   # raw number customer said — NOT computed
+    quantity_operation:        Optional[str]   # SET | ADD | REMOVE
+    counter_offer_value:       Optional[float]  # raw number customer said — NOT divided
+    counter_offer_price_type:  Optional[str]   # UNIT | TOTAL
+    more_discount:             bool
+    confidence:                float
+
+
+def _apply_quantity_operation(current_qty: int, operation: Optional[str], value: Optional[int]) -> Optional[int]:
+    """Pure Python arithmetic for SET/ADD/REMOVE — the LLM never computes this, only classifies."""
+    if value is None or operation is None:
+        return None
+    if operation == "SET":
+        return value
+    if operation == "ADD":
+        return current_qty + value
+    if operation == "REMOVE":
+        return max(0, current_qty - value)
+    return None
+
+
+def _resolve_counter_offer_price(value: Optional[float], price_type: Optional[str], quantity: int) -> Optional[float]:
+    """Converts a TOTAL price ask into a per-unit price. UNIT passes through unchanged.
+    The LLM only classifies UNIT vs TOTAL — this division is the only arithmetic, done here."""
+    if value is None:
+        return None
+    if price_type == "TOTAL" and quantity and quantity > 0:
+        return round(value / quantity, 2)
+    return float(value)
+
+
+async def extract_negotiation_intent(
+    message: str, product_name: str, current_price: float, current_qty: int,
+    incoming, session_history: Optional[list] = None,
+) -> NegotiationIntent:
+    """
+    Single consolidated negotiation-intent extraction. Replaces detect_acceptance
+    + detect_quantity_change + detect_counter_offer + detect_more_discount_request
+    (4 sequential LLM calls, ~6-8s combined) with 1 call (~2-3s).
+
+    Interprets the customer's message ONCE, holistically — not 4 separate
+    times through 4 separate lenses — which also resolves cases like
+    "I'll take 5 units if you can do 1500" where the old sequential detectors
+    could produce inconsistent independent answers.
+
+    On any parse failure, returns intent="NONE" with everything else empty —
+    callers treat this exactly like the old "none of the four detectors
+    matched" case (the stalemate/deferral branch in handle_negotiation()).
+    """
+    current_total = round(current_price * current_qty, 2) if current_price and current_qty else 0
+    prompt = get_prompt(
+        incoming, "neg_extract_negotiation_intent_prompt",
+        product_name=product_name,
+        current_price=f"{current_price:,.0f}" if current_price else "N/A",
+        current_qty=current_qty or "N/A",
+        current_total=f"{current_total:,.0f}",
+    )
+    try:
+        messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": prompt}]
+        if session_history:
+            messages.extend(cast(List[ChatCompletionMessageParam], session_history[-4:]))
+        messages.append({"role": "user", "content": message})
+
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=300, temperature=0, messages=messages,
+            )
+        )
+        content = r.choices[0].message.content
+        if not content:
+            raise ValueError("Empty response content")
+        raw = content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        parsed  = json.loads(raw)
+        intent  = str(parsed.get("intent", "NONE")).upper()
+        acc_obj = parsed.get("accepted") or {}
+        qty_obj = parsed.get("quantity_change") or {}
+        cnt_obj = parsed.get("counter_offer") or {}
+        mdc_obj = parsed.get("more_discount") or {}
+
+        # Report the confidence relevant to the winning intent (each field
+        # carries its own — there is no single top-level confidence).
+        _conf_by_intent = {
+            "ACCEPTED":      acc_obj.get("confidence"),
+            "QTY_CHANGE":    qty_obj.get("confidence"),
+            "COUNTER_OFFER": cnt_obj.get("confidence"),
+            "MORE_DISCOUNT": mdc_obj.get("confidence"),
+        }
+        confidence = float(_conf_by_intent.get(intent) or 0.0)
+
+        result = NegotiationIntent(
+            intent=intent,
+            matched_phrase=str(parsed.get("matched_phrase", message))[:80],
+            accepted=bool(acc_obj.get("value", False)),
+            quantity_value=qty_obj.get("value"),
+            quantity_operation=qty_obj.get("operation"),
+            counter_offer_value=cnt_obj.get("value"),
+            counter_offer_price_type=cnt_obj.get("price_type"),
+            more_discount=bool(mdc_obj.get("value", False)),
+            confidence=confidence,
+        )
+        print(f"[NEGOTIATOR] extract_intent: intent={result.intent} conf={result.confidence:.2f} "
+              f"phrase='{result.matched_phrase}'")
+        return result
+
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"[NEGOTIATOR] extract_negotiation_intent failed: {e} — treating as NONE")
+        return NegotiationIntent(
+            intent="NONE", matched_phrase=message[:80], accepted=False,
+            quantity_value=None, quantity_operation=None,
+            counter_offer_value=None, counter_offer_price_type=None,
+            more_discount=False, confidence=0.0,
+        )
+
+
 # ── Reply generators — all prompts from DB ────────────────────────────────────
 
-async def _reply_no_discount(incoming, product_name, price_num, regular_price, discount_pct, quantity, min_units=5) -> str:
+async def _reply_no_discount(incoming, product_name, price_num, regular_price, discount_pct, quantity, min_units=None) -> str:
+    if min_units is None:
+        min_units = getattr(incoming, "neg_min_units", 5) or 5
     prompt = get_prompt(
         incoming, "neg_no_discount_prompt",
         sender_name=incoming.sender_name, biz_name=incoming.biz_name,
@@ -435,14 +456,7 @@ async def _reply_no_discount(incoming, product_name, price_num, regular_price, d
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_no_discount failed: {e}")
         total = round(price_num * quantity, 2)
-        try:
-            return get_prompt(
-                incoming, "neg_no_discount_fallback",
-                sender_name=incoming.sender_name, price_num=f"{price_num:,.0f}",
-                total=f"{total:,.0f}", min_units=min_units,
-            )
-        except RuntimeError:
-            return f"{incoming.sender_name}, price is *Rs.{price_num:,.0f}*/unit (Total: *Rs.{total:,.0f}*). Buy {min_units}+ units for extra discounts!"
+        return get_prompt(incoming, "neg_no_discount_fallback", sender_name=incoming.sender_name, price_num=f"{price_num:,.0f}", total=f"{total:,.0f}", min_units=min_units)
 
 
 async def build_product_summary(incoming, product_data: Optional[dict]) -> str:
@@ -529,15 +543,7 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
     except RuntimeError: raise
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_first_offer failed: {e}")
-        try:
-            base_reply = get_prompt(
-                incoming, "neg_first_offer_fallback",
-                sender_name=incoming.sender_name, quantity=offer["quantity"],
-                product_name=product_name, offer_price=f"{offer['offer_price']:,.0f}",
-                offer_total=f"{offer['total_price']:,.0f}",
-            )
-        except RuntimeError:
-            base_reply = f"Great news, {incoming.sender_name}! 🎉 For *{offer['quantity']} units* of *{product_name}*: *Rs.{offer['offer_price']:,.0f}*/unit (Total: *Rs.{offer['total_price']:,.0f}*). Shall we proceed?"
+        base_reply = get_prompt(incoming, "neg_first_offer_fallback", sender_name=incoming.sender_name, quantity=offer["quantity"], product_name=product_name, offer_price=f"{offer['offer_price']:,.0f}", offer_total=f"{offer['total_price']:,.0f}")
 
     # ── FIX: Append "order N more to unlock X% off" upsell hint ───────────────
     # This was previously only present on the FIRST-time order entry path in
@@ -551,10 +557,16 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
             next_min_val, next_disc_pct = next_tier
             value_gap    = round(next_min_val - offer.get("order_value", 0), 0)
             units_needed = max(1, int(value_gap / price_num) + 1)
-            base_reply += upsell_hint(incoming, value_gap, units_needed, next_min_val, next_disc_pct)
+            upsell_line = get_prompt(
+                incoming, "neg_upsell_hint_prompt",
+                value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
+                next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct
+            )
+            base_reply += "\n\n" + upsell_line
         elif offer.get("current_tier_disc", 0) > 0:
             max_disc = max(d for _, d in tiers)
-            base_reply += max_discount_hint(incoming, max_disc)
+            max_disc_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc)
+            base_reply += "\n\n" + max_disc_line
 
     return base_reply
 
@@ -586,15 +598,7 @@ async def _reply_counter_offer(incoming, product_name, customer_price, new_offer
     except RuntimeError: raise
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_counter_offer failed: {e}")
-        try:
-            return get_prompt(
-                incoming, "neg_counter_offer_fallback",
-                sender_name=incoming.sender_name, new_offer=f"{new_offer:,.0f}",
-                new_total=f"{total:,.0f}", quantity=quantity,
-                closing_line="This is our best price." if is_final else "Shall we proceed?",
-            )
-        except RuntimeError:
-            return f"{incoming.sender_name}, we can do *Rs.{new_offer:,.0f}*/unit (Total: *Rs.{total:,.0f}* for {quantity} units). {'This is our best price.' if is_final else 'Shall we proceed?'}"
+        return get_prompt(incoming, "neg_counter_offer_fallback", sender_name=incoming.sender_name, new_offer=f"{new_offer:,.0f}", new_total=f"{total:,.0f}", quantity=quantity, closing_line="This is our best price." if is_final else "Shall we proceed?")
 
 
 async def _reply_final_price(incoming, product_name, last_offer, quantity) -> str:
@@ -620,189 +624,12 @@ async def _reply_final_price(incoming, product_name, last_offer, quantity) -> st
     except RuntimeError: raise
     except Exception as e:
         print(f"[NEGOTIATOR] _reply_final_price failed: {e}")
-        try:
-            return get_prompt(
-                incoming, "neg_final_price_fallback",
-                sender_name=incoming.sender_name, last_offer=f"{last_offer:,.0f}",
-                total=f"{total:,.0f}",
-            )
-        except RuntimeError:
-            return f"{incoming.sender_name}, *Rs.{last_offer:,.0f}/unit* is our absolute best price (Total: *Rs.{total:,.0f}*). 🙏 Would you like to proceed?"
+        return get_prompt(incoming, "neg_final_price_fallback", sender_name=incoming.sender_name, last_offer=f"{last_offer:,.0f}", total=f"{total:,.0f}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MAIN HANDLER
 # ══════════════════════════════════════════════════════════════════════════════
-
-
-# Confidence threshold below which we fall back to Phase 1 individual calls.
-# Tune this value based on observed fallback rate in ai_metrics.
-_NEG_CONFIDENCE_THRESHOLD = 0.75
-
-
-async def extract_negotiation_intent(
-    msg: str, incoming, quantity: int, last_offer: float,
-    product_name: str, session_history: Optional[list] = None,
-) -> dict:
-    """
-    Phase 2 optimization: single structured LLM call replacing 4 separate
-    detection calls with one JSON response.
-
-    Returns a rich structured result with intent, confidence, and matched_phrase:
-        {
-            "intent":         str,          # PRIMARY: ACCEPTED | QTY_CHANGE | COUNTER_OFFER | MORE_DISCOUNT | NONE
-            "matched_phrase": str,          # The exact phrase that triggered this classification
-            "accepted":       {"value": bool,  "confidence": float},
-            "quantity_change":{"value": int|None, "confidence": float},
-            "counter_offer":  {"value": float|None, "confidence": float},
-            "more_discount":  {"value": bool, "confidence": float},
-        }
-
-    BUSINESS RULE — PRECEDENCE (enforced by caller, documented here):
-        1. intent=ACCEPTED       → close negotiation, ignore all other fields
-        2. intent=QTY_CHANGE     → update quantity, ignore price fields
-        3. intent=COUNTER_OFFER  → customer proposed a specific price
-        4. intent=MORE_DISCOUNT  → vague discount request
-        5. intent=NONE           → unrelated message, hold current offer
-
-    CONFIDENCE THRESHOLD:
-        If the primary intent confidence < _NEG_CONFIDENCE_THRESHOLD (0.75),
-        fall back to Phase 1 parallel individual calls for safety.
-
-    METRICS:
-        Records extraction latency, confidence, and fallback rate to ai_metrics
-        via incoming._updates so AIOrchestrator can flush them at pipeline end.
-
-    Falls back gracefully on any error — returns {} to trigger Phase 1.
-    """
-    import time as _time
-    _t_start = _time.monotonic()
-
-    prompt = get_prompt(
-        incoming, "neg_extract_negotiation_intent_prompt",
-        product_name   = product_name,
-        current_price  = f"{last_offer:,.0f}",
-        current_qty    = quantity,
-    )
-    try:
-        messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": prompt}]
-        if session_history:
-            messages.extend(cast(List[ChatCompletionMessageParam], session_history[-4:]))
-        messages.append({"role": "user", "content": msg})
-
-        r = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _client.chat.completions.create(
-                model           = AZURE_OPENAI_DEPLOYMENT,
-                max_tokens      = 150,
-                temperature     = 0,
-                messages        = messages,
-                response_format = {"type": "json_object"},
-            )
-        )
-        raw = r.choices[0].message.content
-        if not raw:
-            raise ValueError("Empty response from LLM")
-
-        parsed = json.loads(raw)
-
-        # Extract structured fields with confidence
-        def _conf(field: str) -> float:
-            v = parsed.get(field, {})
-            return float(v.get("confidence", 0.0)) if isinstance(v, dict) else 0.0
-
-        def _val(field: str):
-            v = parsed.get(field, {})
-            return v.get("value") if isinstance(v, dict) else v
-
-        intent          = str(parsed.get("intent", "NONE")).upper()
-        matched_phrase  = str(parsed.get("matched_phrase", ""))
-        primary_conf    = _conf(intent.lower().replace("_", "")) if intent != "NONE" else 0.0
-
-        # Map intent name to confidence field
-        conf_map = {
-            "ACCEPTED":       _conf("accepted"),
-            "QTY_CHANGE":     _conf("quantity_change"),
-            "COUNTER_OFFER":  _conf("counter_offer"),
-            "MORE_DISCOUNT":  _conf("more_discount"),
-        }
-        primary_conf = conf_map.get(intent, 0.0)
-
-        latency_ms = round((_time.monotonic() - _t_start) * 1000)
-        print(f"[NEGOTIATOR] extract_intent: intent={intent} conf={primary_conf:.2f} "
-              f"phrase='{matched_phrase[:40]}' latency={latency_ms}ms")
-
-        # Record metrics for monitoring
-        if hasattr(incoming, '_updates'):
-            incoming._updates["neg_intent_latency_ms"]   = latency_ms
-            incoming._updates["neg_intent_confidence"]   = primary_conf
-            incoming._updates["neg_intent_result"]       = intent
-            incoming._updates["neg_intent_fallback"]     = False
-            incoming._updates["prompt_tokens"]           = (r.usage.prompt_tokens     if r.usage else 0)
-            incoming._updates["completion_tokens"]       = (r.usage.completion_tokens if r.usage else 0)
-
-        # Confidence gate — fall back if model is uncertain
-        if primary_conf < _NEG_CONFIDENCE_THRESHOLD and intent != "NONE":
-            print(f"[NEGOTIATOR] Low confidence ({primary_conf:.2f} < {_NEG_CONFIDENCE_THRESHOLD}) "
-                  f"for intent={intent} — falling back to Phase 1")
-            if hasattr(incoming, '_updates'):
-                incoming._updates["neg_intent_fallback"] = True
-            return {}
-
-        raw_qty = _val("quantity_change")
-        qty_change_val = None
-        if raw_qty is not None and str(raw_qty).strip() != "":
-            try:
-                qty_change_val = int(raw_qty)
-            except (ValueError, TypeError):
-                pass
-
-        # Operation field (SET/ADD/REMOVE) — see neg_extract_negotiation_intent_prompt
-        # migration 017. Defaults to "SET" when absent so tenants on the
-        # older prompt schema (which didn't distinguish SET from ADD) get
-        # EXACTLY their previous behavior: quantity_change.value was always
-        # treated as the final absolute quantity.
-        _qc_field = parsed.get("quantity_change", {})
-        qty_operation = str(_qc_field.get("operation", "SET")).upper() if isinstance(_qc_field, dict) else "SET"
-
-        raw_counter = _val("counter_offer")
-        counter_offer_val = None
-        if raw_counter is not None and str(raw_counter).strip() != "":
-            try:
-                counter_offer_val = float(raw_counter)
-            except (ValueError, TypeError):
-                pass
-
-        return {
-            "intent":          intent,
-            "matched_phrase":  matched_phrase,
-            "accepted":        {"value": bool(_val("accepted") or False),           "confidence": _conf("accepted")},
-            "quantity_change": {"value": qty_change_val, "operation": qty_operation, "confidence": _conf("quantity_change")},
-            "counter_offer":   {"value": counter_offer_val,                         "confidence": _conf("counter_offer")},
-            "more_discount":   {"value": bool(_val("more_discount") or False),       "confidence": _conf("more_discount")},
-        }
-
-    except Exception as e:
-        latency_ms = round((_time.monotonic() - _t_start) * 1000)
-        print(f"[NEGOTIATOR] extract_negotiation_intent failed ({latency_ms}ms): {e} — falling back to Phase 1")
-        if hasattr(incoming, '_updates'):
-            incoming._updates["neg_intent_fallback"] = True
-        return {}
-
-
-def _reply_negotiation_accepted(incoming, quantity, product_name, last_offer) -> str:
-    """
-    Shared acceptance-confirmation reply — same message previously duplicated
-    verbatim in both the Phase 2 (structured extraction) and Phase 1
-    (fallback) acceptance branches of handle_negotiation().
-    """
-    try:
-        return get_prompt(
-            incoming, "neg_accepted_confirmation_prompt",
-            quantity=quantity, product_name=product_name, last_offer=f"{last_offer:,.0f}",
-        )
-    except RuntimeError:
-        return f"Wonderful! 🎉 Confirming *{quantity} units* of *{product_name}* at *Rs.{last_offer:,.0f}/unit*. Reply *Confirm* to place your order!"
-
 
 async def handle_negotiation(
     incoming, product_name: str, price_num: float, regular_price: float,
@@ -827,14 +654,14 @@ async def handle_negotiation(
     # above and ensures the negotiation ceiling actually reflects the best
     # discount tier the store offers — not an arbitrary fixed position.
     max_disc    = max((d for _, d in tiers), default=0) if tiers else 0
-    floor_disc  = max_disc if max_disc > 0 else get_negotiation_floor_disc(tiers, incoming)
+    floor_disc  = max_disc if max_disc > 0 else get_negotiation_floor_disc(tiers)
     floor_price = round(price_num * (1 - floor_disc / 100), 2)
     awaiting_qty = negotiation_state.get("awaiting_quantity", False)
 
     _saved_auto = negotiation_state.get("auto_offer_unit_price")
     negotiation_baseline = float(_saved_auto) if _saved_auto and float(_saved_auto) < price_num else price_num
     if negotiation_baseline < price_num:
-        floor_price = round(negotiation_baseline * get_floor_multiplier(incoming))  # whole rupees — no fractional prices
+        floor_price = round(negotiation_baseline * 0.95)  # whole rupees — no fractional prices
 
     def _state(**kw): return {**negotiation_state, "product_name": product_name, "price_num": price_num,
                                "floor_price": floor_price, "global_offers": global_offers, "_tiers": tiers,
@@ -844,14 +671,8 @@ async def handle_negotiation(
     if awaiting_qty:
         quantity = await extract_quantity(msg, product_name, incoming, session_history)
         if not quantity:
-            try:
-                _ask_qty_reply = get_prompt(
-                    incoming, "neg_ask_quantity_prompt",
-                    sender_name=incoming.sender_name, product_name=product_name,
-                )
-            except RuntimeError:
-                _ask_qty_reply = f"I didn't catch that, {incoming.sender_name}. How many units of *{product_name}* would you like?"
-            return {"reply": _ask_qty_reply,
+            retry_msg = get_prompt(incoming, "neg_ask_quantity_retry_prompt", sender_name=incoming.sender_name, product_name=product_name)
+            return {"reply": retry_msg,
                     "state": _state(awaiting_quantity=True, rounds=rounds),
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
         offer = calculate_offer(price_num, quantity, tiers)
@@ -872,7 +693,8 @@ async def handle_negotiation(
     if not quantity:
         quantity = await extract_quantity(msg, product_name, incoming, session_history)
         if not quantity:
-            return {"reply": f"I'd be happy to work on pricing for *{product_name}*, {incoming.sender_name}! How many units are you looking for?",
+            ask_msg = get_prompt(incoming, "neg_ask_quantity_prompt", sender_name=incoming.sender_name, product_name=product_name)
+            return {"reply": ask_msg,
                     "state": _state(awaiting_quantity=True, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
         offer = calculate_offer(price_num, quantity, tiers)
@@ -892,11 +714,6 @@ async def handle_negotiation(
     # Step 3: Ongoing negotiation
     quantity = int(quantity)
 
-    new_qty = None
-    accepted = False
-    counter = None
-    more_disc = False
-
     # FIX: last_offer must start from the tier price (what the customer is currently
     # paying), NOT price_num (the list price). Using price_num caused the step
     # calculation to use a gap of ~300 instead of ~115, collapsing the full
@@ -912,229 +729,111 @@ async def handle_negotiation(
     else:
         last_offer = price_num
 
-    # ── Phase 2: single structured extraction (fast path) ───────────────────
-    # One LLM call with JSON output replaces 4 separate detection calls.
-    # Falls back to Phase 1 parallel batches if this fails.
-    _intent = await extract_negotiation_intent(
-        msg, incoming, quantity, last_offer, product_name, session_history
-    )
-    if _intent:
-        # Use the rich structured result — apply precedence via intent field.
-        # intent is the single authoritative classification, more reliable than
-        # inferring from individual boolean/numeric fields.
-        _primary = _intent.get("intent", "NONE")
-        _accepted_val  = (_intent.get("accepted",        {}) or {}).get("value", False)
-        _qty_val       = (_intent.get("quantity_change", {}) or {}).get("value")
-        _qty_operation = (_intent.get("quantity_change", {}) or {}).get("operation", "SET")
-        _counter_val   = (_intent.get("counter_offer",   {}) or {}).get("value")
-        _disc_val      = (_intent.get("more_discount",   {}) or {}).get("value", False)
+    parsed = await extract_negotiation_intent(msg, product_name, last_offer, quantity, incoming, session_history)
 
-        # Log matched phrase for debugging without exposing chain-of-thought
-        _phrase = _intent.get("matched_phrase", "")
-        if _phrase:
-            print(f"[NEGOTIATOR] Matched phrase: '{_phrase}'")
-
-        # PRECEDENCE 1: Acceptance — close negotiation immediately
-        if _primary == "ACCEPTED" and _accepted_val:
-            return {"reply": _reply_negotiation_accepted(incoming, quantity, product_name, last_offer),
-                    "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
-                    "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
-
-        # PRECEDENCE 2: Quantity change — update qty, ignore price signals
-        # FIX: the LLM's quantity_change.value is the RAW number the customer
-        # said (e.g. "10" from "add 10 more units") — never a pre-computed
-        # total. The arithmetic happens here, deterministically, based on
-        # operation. Previously new_qty = _qty_val directly, which silently
-        # treated every phrasing as SET — "add 10 more units" at qty=2
-        # became qty=10 instead of qty=12.
-        if _primary == "QTY_CHANGE" and _qty_val:
-            if _qty_operation == "ADD":
-                _computed_qty = quantity + _qty_val
-            elif _qty_operation == "REMOVE":
-                _computed_qty = max(1, quantity - _qty_val)
-            else:  # SET, or unrecognized operation — safest default
-                _computed_qty = _qty_val
-            new_qty = _computed_qty if _computed_qty != quantity else None
-        else:
-            new_qty = None
-
-        # PRECEDENCE 3+4: Price signals — used in negotiation step below
-        accepted  = False
-        counter   = _counter_val if _primary == "COUNTER_OFFER" else None
-        more_disc = _disc_val    if _primary == "MORE_DISCOUNT"  else False
-        goto_qty_block = True
-    else:
-        goto_qty_block = False
-
-    if not goto_qty_block:
-        # ── Phase 1 fallback: parallel batches ───────────────────────────────
-        # Phase 1B parallelization — Step 1: run acceptance + qty change together.
-        # These are independent LLM calls — neither depends on the other's output.
-        #
-        # BUSINESS RULE — EXPLICIT PRECEDENCE (document here, not just in code flow):
-    # If a message triggers BOTH acceptance AND a quantity change simultaneously
-    # (e.g. "Yes, make it 6 units" or "Proceed with 6 units"), the rule is:
-    #
-    #   ACCEPTANCE WINS — the quantity change is IGNORED.
-    #
-    # Rationale: The customer has agreed to the current offer at the current
-    # quantity. Changing quantity mid-acceptance would silently alter pricing,
-    # GST, and the negotiated discount tier — potentially in the customer's
-    # favor without their awareness of the pricing impact.
-    #
-    # If the customer wants a different quantity, they must:
-    #   1. Not confirm yet, OR
-    #   2. Say "add N units" first, then confirm on the updated summary.
-    #
-    # This rule is implemented by checking `if accepted: return` BEFORE
-    # processing new_qty, so new_qty is discarded when accepted=True.
-        # This rule is implemented by checking `if accepted: return` BEFORE
-        # processing new_qty, so new_qty is discarded when accepted=True.
-        #
-        # NOTE: previously had a regex pre-check here to decide whether to
-        # run detect_quantity_change in parallel or skip it for price-offer
-        # messages. Removed — multi-tenant/multi-language platform, no
-        # hardcoded English patterns. Running both checks in parallel
-        # unconditionally costs nothing in wall-clock time (they're
-        # gathered together) and this whole block is itself only reached
-        # as a fallback when extract_negotiation_intent's structured call
-        # already failed, so it's rare in practice.
-        accepted, new_qty = await asyncio.gather(
-            detect_acceptance(msg, incoming, session_history),
-            detect_quantity_change(msg, quantity, product_name, incoming),
+    accepted = parsed.intent == "ACCEPTED"
+    if accepted:
+        confirm_msg = get_prompt(
+            incoming, "neg_accepted_confirmation_prompt",
+            quantity=quantity, product_name=product_name, last_offer=f"{last_offer:,.0f}"
         )
+        return {"reply": confirm_msg,
+                "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
+                "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
-        # Precedence: acceptance always wins — handle it before qty change
-        if accepted:
-            return {"reply": _reply_negotiation_accepted(incoming, quantity, product_name, last_offer),
-                    "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
-                    "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
+    # SET/ADD/REMOVE arithmetic happens here, in Python — extract_negotiation_intent()
+    # only classified the operation and raw value, never computed the new total itself.
+    new_qty = None
+    if parsed.intent == "QTY_CHANGE":
+        new_qty = _apply_quantity_operation(quantity, parsed.quantity_operation, parsed.quantity_value)
     if new_qty and new_qty != quantity:
         quantity = new_qty
         offer    = calculate_offer(price_num, quantity, tiers)
 
-        # ── FIX: Add "order N more to unlock X% off" upsell hint ──────────────
-        # ROOT CAUSE OF MISSING RECOMMENDATION: this quantity-change reply path
-        # (triggered by "add 2 more units") never called get_next_tier() — it
-        # was only wired into the FIRST-time order entry path in
-        # product_followup.py, not this negotiation-continuation path. So
-        # every subsequent "add N more units" message lost the upsell hint
-        # that the customer saw on their very first order message.
         upsell_line = ""
         next_tier = get_next_tier(offer["order_value"], tiers)
         if next_tier:
             next_min_val, next_disc_pct = next_tier
             value_gap    = round(next_min_val - offer["order_value"], 0)
             units_needed = max(1, int(value_gap / price_num) + 1)
-            upsell_line = upsell_hint(incoming, value_gap, units_needed, next_min_val, next_disc_pct)
+            upsell_line = get_prompt(
+                incoming, "neg_upsell_hint_prompt",
+                value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
+                next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct
+            )
         elif tiers and offer.get("current_tier_disc", 0) > 0:
-            # Only show the "maximum tier unlocked" message when the customer
-            # JUST crossed into the top tier this message — not on every
-            # subsequent qty update while already at the top tier.
-            # Check: was the previous tier_disc less than the current one?
             prev_tier_disc = negotiation_state.get("current_tier_disc", 0)
             max_disc       = max(d for _, d in tiers)
             if offer.get("current_tier_disc", 0) >= max_disc and offer.get("current_tier_disc", 0) > prev_tier_disc:
-                upsell_line = max_discount_hint(incoming, max_disc, just_unlocked=True)
-            # else: already at max tier on previous message — no need to repeat
-
-        # ── Bugs 1,3,4,5,6,7 fix: clean single-message quantity-change reply ──
-        # Bug 3+4: Never show "Negotiated price" unless negotiation has started
-        #   (rounds > 0 or customer explicitly asked for discount). The gap/3
-        #   concession off the tier price is NOT negotiation — it's just the
-        #   auto-offer engine finding the best tier price.
-        # Bug 1: Return ONE complete message, not "Updated!" + full summary separately.
-        # Bug 5+6: One clear CTA, not "Shall we proceed?" + "Reply Confirm" both.
-        # Bug 7: Lead with explicit acknowledgement of the quantity change.
+                upsell_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc)
 
         summary_text = await build_product_summary(incoming, product_data)
         summary_block = summary_text.strip() if summary_text else ""
 
-        tier_price        = offer["offer_price"]
-        sub_price         = round(tier_price * quantity, 2)
+        # Same tenant-configurable disclosure gate as product_followup.py's
+        # auto-apply block — a store discount the customer never asked about
+        # shouldn't silently appear in a quantity-update reply, or become the
+        # baseline price they end up negotiating against.
+        _require_disclosure = bool(getattr(incoming, "require_offer_disclosure", False))
+        _offer_disclosed = bool(negotiation_state.get("offer_disclosed"))
+        _disclosure_blocked = _require_disclosure and not _offer_disclosed
+
+        _eff_tier_disc = 0 if _disclosure_blocked else offer.get("current_tier_disc", 0)
+        _eff_price     = price_num if _disclosure_blocked else offer["offer_price"]
+
+        sub_price         = round(_eff_price * quantity, 2)
         gst_amount        = round(sub_price * getattr(incoming, "gst_rate", 0.18), 2)
         total_pay         = round(sub_price + gst_amount, 2)
         gst_pct           = int(getattr(incoming, "gst_rate", 0.18) * 100)
-        current_tier_disc = offer.get("current_tier_disc", 0)
+        current_tier_disc = _eff_tier_disc
 
         prev_qty = negotiation_state.get("quantity", quantity)
         if current_tier_disc > 0:
-            try:
-                body = get_prompt(
-                    incoming, "neg_qty_update_with_discount_prompt",
-                    prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
-                    product_name=product_name, price_num=f"{price_num:,.0f}",
-                    current_tier_disc=current_tier_disc, tier_price=f"{tier_price:,.0f}",
-                    sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}",
-                    total_pay=f"{total_pay:,.2f}",
-                )
-            except RuntimeError:
-                body = (
-                    f"✅ Updated your order from *{prev_qty}* to *{quantity} units*, {incoming.sender_name}!\n\n"
-                    f"• *Product:* {product_name}\n• *Quantity:* {quantity} units\n"
-                    f"• *Regular price:* Rs.{price_num:,.0f}/unit\n"
-                    f"• *Store offer {current_tier_disc}% OFF applied:* Rs.{tier_price:,.0f}/unit\n"
-                    f"• *Subtotal:* Rs.{sub_price:,.2f}\n• *GST ({gst_pct}%):* Rs.{gst_amount:,.2f}\n"
-                    f"• *Total Payable:* Rs.{total_pay:,.2f}"
-                )
+            update_reply = get_prompt(
+                incoming, "neg_qty_update_with_discount_prompt",
+                prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
+                product_name=product_name, price_num=f"{price_num:,.0f}",
+                current_tier_disc=current_tier_disc, tier_price=f"{_eff_price:,.0f}",
+                sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct,
+                gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
+            )
         else:
-            try:
-                body = get_prompt(
-                    incoming, "neg_qty_update_no_discount_prompt",
-                    prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
-                    product_name=product_name, price_num=f"{price_num:,.0f}", tier_price=f"{tier_price:,.0f}",
-                    sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}",
-                    total_pay=f"{total_pay:,.2f}",
-                )
-            except RuntimeError:
-                body = (
-                    f"✅ Updated your order from *{prev_qty}* to *{quantity} units*, {incoming.sender_name}!\n\n"
-                    f"• *Product:* {product_name}\n• *Quantity:* {quantity} units\n"
-                    f"• *Regular price:* Rs.{price_num:,.0f}/unit\n• *Unit price:* Rs.{tier_price:,.0f}\n"
-                    f"• *Subtotal:* Rs.{sub_price:,.2f}\n• *GST ({gst_pct}%):* Rs.{gst_amount:,.2f}\n"
-                    f"• *Total Payable:* Rs.{total_pay:,.2f}"
-                )
+            update_reply = get_prompt(
+                incoming, "neg_qty_update_no_discount_prompt",
+                prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
+                product_name=product_name, price_num=f"{price_num:,.0f}",
+                tier_price=f"{_eff_price:,.0f}", sub_price=f"{sub_price:,.2f}",
+                gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
+            )
 
-        lines = [body]
-        if upsell_line:
-            lines.append(upsell_line.strip())
+        if upsell_line and not _disclosure_blocked:
+            update_reply += "\n\n" + upsell_line.strip()
         if summary_block:
-            lines += ["", summary_block]
-        try:
-            lines += ["", get_prompt(incoming, "neg_qty_update_footer_prompt")]
-        except RuntimeError:
-            lines += ["", "Reply *Confirm* to place your order! 🎉"]
-
-        update_reply = "\n".join(lines)
+            update_reply += "\n\n" + summary_block
+        update_reply += "\n\n" + get_prompt(incoming, "neg_qty_update_footer_prompt")
 
         return {"reply": update_reply,
-                "state": _state(quantity=quantity, rounds=rounds, last_offer_price=offer["offer_price"],
-                                current_tier_disc=offer.get("current_tier_disc", 0),
-                                auto_offer_disc_pct=offer.get("current_tier_disc", 0),
-                                auto_offer_unit_price=offer["offer_price"]),
-                "order_ready": False, "escalate": False, "agreed_price": offer["offer_price"], "quantity": quantity}
+                "state": _state(quantity=quantity, rounds=rounds, last_offer_price=_eff_price,
+                                current_tier_disc=_eff_tier_disc,
+                                auto_offer_disc_pct=_eff_tier_disc,
+                                auto_offer_unit_price=_eff_price),
+                "order_ready": False, "escalate": False, "agreed_price": _eff_price, "quantity": quantity}
 
-    # Phase 1B step 2: counter-offer + more-discount are independent.
-    # Only reached when acceptance=False and no qty change — safe to parallelize.
-    if not goto_qty_block:
-        counter, more_disc = await asyncio.gather(
-            detect_counter_offer(msg, incoming, last_offer, quantity, session_history),
-            detect_more_discount_request(msg, incoming, session_history),
-        )
-
-    # End of Phase 1 fallback block — counter and more_disc are now set
-    # (either from Phase 2 structured extraction or Phase 1 parallel batches)
+    counter = _resolve_counter_offer_price(
+        parsed.counter_offer_value, parsed.counter_offer_price_type, quantity
+    ) if parsed.intent == "COUNTER_OFFER" else None
+    more_disc = parsed.intent == "MORE_DISCOUNT"
 
     if not counter and not more_disc:
-        # BUG FIX: this branch previously repeated the current offer
-        # unconditionally for ANY message that didn't match accept/qty-change/
-        # counter-offer/more-discount — including "I want to speak to a human
-        # agent, this is urgent" and "what is your business address". Neither
-        # is a negotiation continuation; both were incorrectly answered with
-        # "our current offer is Rs.X...". Check with a real classifier before
-        # assuming the customer is still haggling. Only runs in this rare
-        # stalemate branch, not the common negotiation path, so the extra
-        # LLM call only costs latency on genuinely off-topic interruptions.
+        # DEFERRAL: none of accepted / quantity-change / counter-offer /
+        # more-discount matched — this message likely isn't about the
+        # negotiation at all (e.g. a greeting or an escalation request
+        # arriving mid-negotiation). Previously this branch unconditionally
+        # repeated the current offer regardless of what was actually said.
+        # Check with a real classifier before assuming continued haggling.
+        # Only runs in this rare stalemate branch, not the common negotiation
+        # path, so the extra LLM call only costs latency on genuinely
+        # off-topic interruptions.
         try:
             from ai.handlers import classify_intent
             _defer_result = await classify_intent(msg, session_history, incoming)
@@ -1149,20 +848,17 @@ async def handle_negotiation(
                     "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer),
                     "order_ready": False, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
-        try:
-            _stalemate_reply = get_prompt(
-                incoming, "neg_stalemate_reply_prompt",
-                last_offer=f"{last_offer:,.0f}", quantity=quantity,
-                total=f"{round(last_offer*quantity,2):,.0f}",
-            )
-        except RuntimeError:
-            _stalemate_reply = f"Our current offer is *Rs.{last_offer:,.0f}/unit* for *{quantity} units* (Total: *Rs.{round(last_offer*quantity,2):,.0f}*). Would you like to proceed?"
-        return {"reply": _stalemate_reply,
+        total_val = round(last_offer*quantity, 2)
+        stalemate_msg = get_prompt(
+            incoming, "neg_stalemate_reply_prompt",
+            last_offer=f"{last_offer:,.0f}", quantity=quantity, total=f"{total_val:,.0f}"
+        )
+        return {"reply": stalemate_msg,
                 "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer),
                 "order_ready": False, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
     rounds   += 1
-    is_final  = rounds >= get_max_negotiation_rounds(incoming)
+    is_final  = rounds >= MAX_NEGOTIATION_ROUNDS
 
     # ── Stateful bargaining engine ────────────────────────────────────────────
     # Improvements over the fixed-step approach:

@@ -84,6 +84,7 @@ class IncomingMessage:
     neg_floor_disc_pct:     Optional[int] = None
     neg_floor_multiplier:   Optional[float] = None
     intent_min_confidence:  Optional[float] = None
+    require_offer_disclosure: Optional[bool] = None
     max_image_products:     Optional[int] = None
 
     # ── Per-tenant config ─────────────────────────────────────────────────────
@@ -105,12 +106,11 @@ class IncomingMessage:
     # ── Output ────────────────────────────────────────────────────────────────
     captured_replies: List[dict] = field(default_factory=list)
     raw:              dict       = field(default_factory=dict)
-
-    # ── Runtime scratch-pad (set during request processing, not persisted) ────
     _cached_neg_state: Optional[dict] = None
-    _routing:          Optional[object] = None   # RoutingDecision | None
-    _cached_arc:       Optional[object] = None   # AIRequestContext | None
-    _deferred_intent:  Optional[str]   = None
+
+    # ── Runtime-computed attributes (set after construction) ──────────────────
+    _routing:     Optional["RoutingDecision"] = field(default=None, repr=False)
+    _cached_arc:  Optional[object]            = field(default=None, repr=False)
 
 
 @dataclass
