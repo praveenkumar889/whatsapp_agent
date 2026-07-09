@@ -1,7 +1,7 @@
 # ai/handlers.py — All AI handlers using DB prompts only
 #
-# REPLACES: ai/intent_router.py, ai/response_handlers.py, ai/entity_extractor.py
-#           (the prompt-fetching parts — core logic unchanged)
+# REPLACES: ai/intent_router.py, ai/response_handlers.py
+# (entity extraction was removed as dead code — extract_entities/EntityResult had zero callers anywhere in the live pipeline)
 #
 # RULE: No prompt string exists in this file.
 #       Every prompt is fetched via get_prompt(incoming, key).
@@ -9,13 +9,22 @@
 
 import asyncio
 import json
+<<<<<<< HEAD
+from datetime import datetime, timezone
+from typing import List, Optional, Any
+=======
 from datetime import datetime, timezone, timedelta
 from typing import List, Optional, Any, cast
+>>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)
 
 from openai import AzureOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from config import AZURE_AI_ENDPOINT, AZURE_AI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION
+<<<<<<< HEAD
+from models.schemas import IntentResult, IncomingMessage
+=======
 from models.schemas import IntentResult, EntityResult, OrderItem, IncomingMessage
+>>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)
 from db.prompt_store import get_prompt
 
 _client = AzureOpenAI(
@@ -27,7 +36,11 @@ _client = AzureOpenAI(
 )
 
 DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION", "GREETING", "UNKNOWN"}
+<<<<<<< HEAD
+DEFAULT_INTENT_MIN_CONFIDENCE = 0.50  # default — see incoming.intent_min_confidence for tenant override
+=======
 DEFAULT_INTENT_MIN_CONFIDENCE = 0.50
+>>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -36,7 +49,11 @@ DEFAULT_INTENT_MIN_CONFIDENCE = 0.50
 
 async def classify_intent(
     customer_message: str,
+<<<<<<< HEAD
+    session_history:  Optional[List[ChatCompletionMessageParam]] = None,
+=======
     session_history:  Optional[List[Any]] = None,
+>>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)
     incoming: Optional[IncomingMessage] = None,
 ) -> IntentResult:
     """
@@ -44,7 +61,11 @@ async def classify_intent(
     Raises RuntimeError if prompt not set in DB.
     """
     system_prompt  = get_prompt(incoming, "intent_system_prompt")
+<<<<<<< HEAD
+    valid_intents  = set(incoming.valid_intents) if incoming and incoming.valid_intents else DEFAULT_VALID_INTENTS
+=======
     valid_intents  = set(incoming.valid_intents) if (incoming and incoming.valid_intents) else DEFAULT_VALID_INTENTS
+>>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)
     raw = ""
     try:
         messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
@@ -193,6 +214,9 @@ async def handle_unknown(incoming: IncomingMessage) -> str:
     except RuntimeError:
         raise
     except Exception as e:
+<<<<<<< HEAD
+        raise RuntimeError(f"[UNKNOWN] Failed to generate reply: {e}")
+=======
         raise RuntimeError(f"[UNKNOWN] Failed to generate reply: {e}")
 
 
@@ -327,3 +351,4 @@ Example:
         missing_entities=["product_name", "quantity"], raw_text=customer_message,
         tenant_id=incoming.tenant_id,
     )
+>>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)

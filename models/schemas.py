@@ -79,6 +79,12 @@ class IncomingMessage:
     # ── Acceptance keyword config (loaded from tenants, not hardcoded) ────────
     acceptance_keywords:    Optional[str] = None   # comma-separated phrases
     acceptance_exact_words: Optional[str] = None   # comma-separated single words
+    new_order_trigger_phrases: Optional[str] = None  # comma-separated phrases
+    max_negotiation_rounds: Optional[int] = None
+    neg_floor_disc_pct:     Optional[int] = None
+    neg_floor_multiplier:   Optional[float] = None
+    intent_min_confidence:  Optional[float] = None
+    max_image_products:     Optional[int] = None
 
     # ── Per-tenant config ─────────────────────────────────────────────────────
     valid_intents:    Optional[List[str]] = None
