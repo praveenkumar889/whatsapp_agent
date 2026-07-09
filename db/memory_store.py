@@ -56,7 +56,13 @@ def _search(client, query: str, user_id: Optional[str] = None, agent_id: Optiona
     if filters:
         kwargs["filters"] = filters
     try:
-        return client.search(**kwargs) or []
+        res = client.search(**kwargs)
+        if isinstance(res, dict):
+            if "results" in res: return res["results"]
+            if "memories" in res: return res["memories"]
+            if "data" in res: return res["data"]
+            return [res]
+        return res or []
     except Exception as e:
         print(f"[MEM0] search failed: {e}")
         return []
@@ -114,7 +120,12 @@ async def get_relevant_context(
                           limit=limit, memory_type="conversation")
         history = []
         for r in results:
-            memory_text = r.get("memory", "")
+            memory_text = ""
+            if isinstance(r, dict):
+                memory_text = r.get("memory", "")
+            else:
+                memory_text = getattr(r, "memory", str(r)) if hasattr(r, "memory") else ""
+            
             if memory_text:
                 history.append({"role": "user", "content": memory_text})
         print(f"[MEM0] Retrieved {len(history)} memories for context (query: {query[:40]})")

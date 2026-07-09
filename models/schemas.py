@@ -134,6 +134,17 @@ class IntentResult:
 
 
 @dataclass
+class DialogueState:
+    followup: str
+    negotiation_status: str
+    category: str
+    product_name: str
+    product_skus: List[str]
+    intent: str
+
+
+
+@dataclass
 class OrderItem:
     product_name:   Optional[str]
     quantity_value: Optional[int]

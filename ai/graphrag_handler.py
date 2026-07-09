@@ -326,7 +326,7 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
     return None
 
 
-async def call_graphrag_api(incoming, session_history: Optional[list] = None, graphrag_url: Optional[str] = None) -> str:
+async def call_graphrag_api(incoming, session_history: Optional[list] = None, state = None, graphrag_url: Optional[str] = None) -> str:
     """
     Calls the Hybrid RAG Agent API for ALL product-related queries.
 
@@ -410,6 +410,7 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             "direction":           "inbound",
             "invoice_number":      None,
             "payment_reference":   None,
+            "dialogue_state":      state.__dict__ if state else None,
         }
 
         # Resolve effective GraphRAG URL:
@@ -425,7 +426,8 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             mcp_res = await query_mcp_catalog(
                 query=graphrag_text,
                 session_id=incoming.session_id,
-                server_url=mcp_url
+                server_url=mcp_url,
+                state=state.__dict__ if state else None
             )
             if mcp_res and mcp_res.get("status") == "success":
                 products = mcp_res.get("products", [])

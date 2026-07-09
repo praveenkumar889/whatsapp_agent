@@ -369,6 +369,69 @@ async def delete_pending_order(tenant_id: str, session_id: str) -> bool:
         return False
 
 
+async def get_dialogue_state(tenant_id: str, session_id: str) -> Optional[dict]:
+    """Retrieves the dialogue state from workflow_sessions table."""
+    try:
+        result = _get_client().table("workflow_sessions") \
+            .select("product_name") \
+            .eq("tenant_id",  tenant_id) \
+            .eq("session_id", session_id) \
+            .eq("status", "DIALOGUE_STATE") \
+            .order("updated_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            state_json_str = result.data[0].get("product_name")
+            if state_json_str:
+                return json.loads(state_json_str)
+        return None
+    except Exception as e:
+        print(f"[DB] get_dialogue_state failed: {e}")
+        return None
+
+
+async def save_dialogue_state(tenant_id: str, session_id: str, state: dict) -> bool:
+    """Saves the dialogue state in workflow_sessions table."""
+    try:
+        now_utc = datetime.now(timezone.utc)
+        expires_at = (now_utc + timedelta(hours=24)).isoformat()
+        state_json_str = json.dumps(state)
+        row = {
+            "tenant_id":      tenant_id,
+            "session_id":     session_id,
+            "status":         "DIALOGUE_STATE",
+            "product_name":   state_json_str,
+            "quantity_value": 0,
+            "quantity_unit":  "state",
+            "expires_at":     expires_at,
+            "updated_at":     now_utc.isoformat(),
+        }
+        
+        existing = _get_client().table("workflow_sessions") \
+            .select("id") \
+            .eq("tenant_id",  tenant_id) \
+            .eq("session_id", session_id) \
+            .eq("status", "DIALOGUE_STATE") \
+            .limit(1) \
+            .execute()
+
+        if existing.data:
+            existing_row = cast(dict, existing.data[0])
+            _get_client().table("workflow_sessions") \
+                .update(row) \
+                .eq("id", existing_row["id"]) \
+                .execute()
+        else:
+            _get_client().table("workflow_sessions") \
+                .insert(row) \
+                .execute()
+        return True
+    except Exception as e:
+        print(f"[DB] save_dialogue_state failed: {e}")
+        return False
+
+
+
 async def get_last_order(tenant_id: str, session_id: str) -> Optional[dict]:
     """Fetches the most recent WORKFLOW_ACTION message with extracted entities."""
     try:

@@ -16,7 +16,8 @@ async def query_mcp_catalog(
     query: str,
     session_id: Optional[str] = None,
     limit: int = 6,
-    server_url: Optional[str] = None
+    server_url: Optional[str] = None,
+    state: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Calls the `search_catalog` tool on the FastMCP server.
@@ -39,7 +40,8 @@ async def query_mcp_catalog(
                 {
                     "query": query,
                     "limit": limit,
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "dialogue_state": state
                 }
             )
             # res.data contains the tool return value (dict) when calling via FastMCP
@@ -95,3 +97,31 @@ async def get_product_details_mcp(
         print(f"[MCP-CLIENT] Failed to call 'get_product_details' for SKU '{sku}': {e}")
         return None
 
+async def get_taxonomy_hints_mcp(
+    query: str,
+    server_url: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    """
+    Calls the `get_taxonomy_hints` tool on the FastMCP server.
+    """
+    url = server_url or MCP_SERVER_URL
+    print(f"[MCP-CLIENT] Requesting taxonomy hints for '{query[:50]}' via MCP ({url})")
+    try:
+        async with Client(url) as client:
+            res = await client.call_tool("get_taxonomy_context", {"query": query})
+            data = getattr(res, "data", None)
+            if data is not None and isinstance(data, dict):
+                return data.get("hints", {})
+            content = getattr(res, "content", None)
+            if isinstance(content, list) and len(content) > 0:
+                for item in content:
+                    if hasattr(item, "text") and item.text:
+                        try:
+                            parsed = json.loads(item.text)
+                            return parsed.get("hints", {})
+                        except Exception:
+                            pass
+            return {}
+    except Exception as e:
+        print(f"[MCP-CLIENT] Failed to call 'get_taxonomy_hints': {e}")
+        return {}
