@@ -1,7 +1,7 @@
 # models/schemas.py
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional, List, Dict
 
 
 @dataclass
@@ -76,10 +76,6 @@ class IncomingMessage:
     # ── Product summary + recommendation prompt (shown on quantity updates) ───
     product_summary_recommendation_prompt: Optional[str] = None
 
-    # ── Acceptance keyword config (loaded from tenants, not hardcoded) ────────
-    acceptance_keywords:    Optional[str] = None   # comma-separated phrases
-    acceptance_exact_words: Optional[str] = None   # comma-separated single words
-    new_order_trigger_phrases: Optional[str] = None  # comma-separated phrases
     max_negotiation_rounds: Optional[int] = None
     neg_floor_disc_pct:     Optional[int] = None
     neg_floor_multiplier:   Optional[float] = None
@@ -87,11 +83,19 @@ class IncomingMessage:
     require_offer_disclosure: Optional[bool] = None
     max_image_products:     Optional[int] = None
 
+
     # ── Per-tenant config ─────────────────────────────────────────────────────
     valid_intents:    Optional[List[str]] = None
     graphrag_api_url: Optional[str] = None
     products_api_url: Optional[str] = None
     access_token:     Optional[str] = None
+
+    # ── Quick action phrases (tenant config, pre-normalized at load time) ────
+    # Stored as JSONB in tenants.quick_actions. Normalized to frozenset of
+    # casefold()ed strings by _apply_tenant() — zero allocation at message time.
+    # Shape: {"ORDER_CONFIRM": frozenset({"yes","ok",...}), "ORDER_CANCEL": ...}
+    # See utils/conversation_actions.py for the matching helper.
+    quick_actions: Optional[Dict[str, frozenset]] = None
 
     # ── Media ─────────────────────────────────────────────────────────────────
     media_id:        Optional[str]   = None
@@ -109,8 +113,11 @@ class IncomingMessage:
     _cached_neg_state: Optional[dict] = None
 
     # ── Runtime-computed attributes (set after construction) ──────────────────
-    _routing:     Optional["RoutingDecision"] = field(default=None, repr=False)
-    _cached_arc:  Optional[object]            = field(default=None, repr=False)
+    _routing:         Optional["RoutingDecision"] = field(default=None, repr=False)
+    _cached_arc:      Optional[object]            = field(default=None, repr=False)
+    resolved_product: Optional[str]               = field(default=None, repr=False)
+    resolved_query:   Optional[str]               = field(default=None, repr=False)
+
 
 
 @dataclass

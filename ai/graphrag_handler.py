@@ -345,64 +345,7 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
     return None
 
 
-def _build_memory_context_text(results: dict) -> str:
-    """
-    Turns MemoryManager.search()'s {memory_type: [memory_dicts]} result into
-    grouped, labeled sections instead of a flat bullet list — easier for the
-    query-builder prompt (and for debugging) to work with than raw
-    concatenated memory strings.
-
-    Each memory's raw "memory" field carries a TYPE_PREFIX: {json} format
-    (see memory_manager.py's save_* methods) — parsed here to extract the
-    actual field worth surfacing, not just the storage encoding.
-    """
-    import json as _json
-
-    products, categories, preferences, negotiations = [], [], [], []
-
-    for mem_type, items in (results or {}).items():
-        for item in items:
-            raw = (item or {}).get("memory", "")
-            if not raw:
-                continue
-            _, _, json_part = raw.partition(":")
-            try:
-                data = _json.loads(json_part.strip())
-            except Exception:
-                data = {}
-
-            if mem_type == "product_context":
-                name = data.get("name")
-                if name:
-                    products.append(name)
-            elif mem_type == "customer_preference":
-                pref_type = data.get("pref_type", "")
-                value     = data.get("value")
-                if value:
-                    (categories if pref_type == "category" else preferences).append(str(value))
-            elif mem_type == "negotiation_outcome":
-                product  = data.get("product")
-                qty      = data.get("quantity")
-                accepted = data.get("accepted")
-                if product:
-                    detail = f"{product}"
-                    if qty:
-                        detail += f" ({qty} units)"
-                    if accepted is False:
-                        detail += " — offer not accepted"
-                    negotiations.append(detail)
-
-    sections = []
-    if products:
-        sections.append("Previous Products:\n" + "\n".join(f"- {p}" for p in products))
-    if categories:
-        sections.append("Preferred Categories:\n" + "\n".join(f"- {c}" for c in categories))
-    if preferences:
-        sections.append("Preferences:\n" + "\n".join(f"- {p}" for p in preferences))
-    if negotiations:
-        sections.append("Negotiation History:\n" + "\n".join(f"- {n}" for n in negotiations))
-
-    return "\n\n".join(sections)
+from ai.memory_manager import build_memory_context_text as _build_memory_context_text
 
 
 async def _build_enriched_graphrag_query(
@@ -475,7 +418,7 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # GraphRAG uses Neo4j semantic search which understands natural language.
         # We send the customer's original message as-is — no stripping, no cleaning.
         # "i want to order outdoor lights?" → GraphRAG receives exactly this.
-        graphrag_text = incoming.text
+        graphrag_text = getattr(incoming, "resolved_query", None) or incoming.text
 
         # Only handle quote-reply prefix — strip [Quoting:...] to get actual message
         if graphrag_text.startswith("[Quoting:") and "\n" in graphrag_text:
@@ -509,8 +452,10 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # ran and set a value first — whichever signal is available wins.
         _routing = getattr(incoming, "_routing", None)
         _needs_memory = _routing.needs_memory if _routing else None
-        print(f"[MEM0] needs_memory={_needs_memory} for this GraphRAG call")
+        _needs_product_context = bool(_routing.needs_product_context) if _routing else False
+        print(f"[MEM0] needs_memory={_needs_memory} needs_product_context={_needs_product_context} for this GraphRAG call")
         try:
+            memory_context = ""
             if _needs_memory:
                 from ai.memory_policy import MemoryPolicy, MemoryRequest
                 from ai.memory_manager import MemoryManager
@@ -527,28 +472,36 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
                     results = await mm.search(decision.types, query=graphrag_text, max_results=decision.max_results)
                     memory_context = _build_memory_context_text(results)
                     print(f"[MEM0] Retrieved memory_context: {'(empty)' if not memory_context else memory_context[:150]}")
-                    if memory_context:
-                        # Short-term context (this session's own state) alongside
-                        # long-term context (Mem0) — a customer actively looking at
-                        # one product asking for recommendations should get results
-                        # related to what's in front of them right now, not only
-                        # what they bought before.
-                        _current_product = None
-                        _active_neg = getattr(incoming, "_cached_neg_state", None) or await get_negotiation_state(
-                            incoming.tenant_id, incoming.session_id
-                        )
-                        if _active_neg:
-                            _current_product = _active_neg.get("product_name")
-                        if not _current_product:
-                            from db.session_store import get_last_discussed_product
-                            _current_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
 
-                        enriched = await _build_enriched_graphrag_query(
-                            incoming, graphrag_text, memory_context, current_product=_current_product,
-                        )
-                        if enriched:
-                            print(f"[MEM0] Enriched GraphRAG query with retrieved context")
-                            graphrag_text = enriched
+            # Resolved independently of needs_memory — a message can need the
+            # CURRENT product (this session's own state, cheap to resolve)
+            # without needing long-term Mem0 history at all. Previously this
+            # only ran inside the needs_memory branch, so "is there an
+            # installation guide for this" (needs_product_context=True,
+            # needs_memory=False) never got the current product resolved,
+            # and GraphRAG received the raw message with no idea which
+            # product was being discussed.
+            _current_product = getattr(incoming, "resolved_product", None)
+            if not _current_product and (_needs_product_context or memory_context):
+                _active_neg = getattr(incoming, "_cached_neg_state", None) or await get_negotiation_state(
+                    incoming.tenant_id, incoming.session_id
+                )
+                if _active_neg:
+                    _current_product = _active_neg.get("product_name")
+                if not _current_product:
+                    from db.session_store import get_last_discussed_product
+                    _current_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+                print(f"[MEM0] Resolved current_product: {_current_product}")
+
+            # Enrich whenever there's EITHER memory context or a current
+            # product to anchor the query on — not just when both exist.
+            if memory_context or _current_product:
+                enriched = await _build_enriched_graphrag_query(
+                    incoming, graphrag_text, memory_context, current_product=_current_product,
+                )
+                if enriched:
+                    print(f"[MEM0] Enriched GraphRAG query with retrieved context")
+                    graphrag_text = enriched
         except Exception as e:
             print(f"[MEM0] Query enrichment failed (non-critical, using original query): {e}")
 
@@ -831,5 +784,5 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         return _reply_prompt(
             incoming, "graphrag_exception_fallback_prompt",
             fallback=_fallback_lines,
-            sender_name=incoming.sender_name, support=support, website=website,
+            sender_name=incoming.sender_name, support=support, bullet_website=(f"• Browse all products at *{website}*\n" if website else ""),
         )

@@ -49,6 +49,11 @@ class PricingResult:
     gst_amount:                  float = field(default=0.0)
     total_payable:               float = field(default=0.0)
 
+    # ── Dynamic offer progress ────────────────────────────────────────────────
+    current_offer:               dict = field(default_factory=dict)
+    next_offer:                  Optional[dict] = field(default=None)
+    remaining_amount:            Optional[float] = field(default=None)
+
     @classmethod
     def build(
         cls,
@@ -58,11 +63,31 @@ class PricingResult:
         store_disc_pct: int = 0,
         negotiated_unit_price: Optional[float] = None,
         negotiation_rounds: int = 0,
+        tiers: Optional[list] = None,
     ) -> "PricingResult":
         """
         Build a PricingResult from raw inputs. All derived fields are
         computed once here — no other code needs to recalculate them.
         """
+        # Compute dynamic offer tiers if provided
+        order_value = regular_unit_price * quantity
+        current_offer_dict = {"threshold": 0.0, "discount": 0}
+        next_offer_dict = None
+        rem_amount = None
+
+        if tiers:
+            from ai.negotiator import get_applicable_tier, get_next_tier
+            app_val, app_disc = get_applicable_tier(order_value, tiers)
+            current_offer_dict = {"threshold": float(app_val), "discount": int(app_disc)}
+            
+            if store_disc_pct == 0 and app_disc > 0:
+                store_disc_pct = app_disc
+
+            next_t = get_next_tier(order_value, tiers)
+            if next_t:
+                next_offer_dict = {"threshold": float(next_t[0]), "discount": int(next_t[1])}
+                rem_amount = max(0.0, float(next_t[0]) - order_value)
+
         store_unit = round(regular_unit_price * (1 - store_disc_pct / 100), 2)
         neg_unit   = negotiated_unit_price if negotiated_unit_price is not None else store_unit
 
@@ -88,6 +113,9 @@ class PricingResult:
             subtotal                     = subtotal,
             gst_amount                   = gst_amount,
             total_payable                = total_pay,
+            current_offer                = current_offer_dict,
+            next_offer                   = next_offer_dict,
+            remaining_amount             = rem_amount,
         )
 
     @property
@@ -248,4 +276,5 @@ class PricingResult:
             negotiated_unit_price = float(neg_state.get("last_offer_price") or
                                           neg_state.get("auto_offer_unit_price") or 0),
             negotiation_rounds    = int(neg_state.get("rounds") or 0),
+            tiers                 = neg_state.get("_tiers"),
         )

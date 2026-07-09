@@ -10,7 +10,15 @@ from db.session_store import (
 from db.processing_lock import acquire_lock
 from db.memory_store import get_relevant_context
 
-# Every prompt column that must exist in tenants table
+# Every prompt column that must exist in tenants table.
+# NOTE: These are legacy tenant-column prompts only. Most prompts are now
+# served by prompt_templates (DB table). Once all tenants are fully migrated,
+# this list will be empty and the columns dropped.
+#
+# acceptance_keywords, acceptance_exact_words, new_order_trigger_phrases were
+# removed — they were defined here but never read by any handler in the
+# codebase. Acceptance detection is fully LLM-driven via neg_detect_accept_prompt
+# in prompt_templates. Removing them eliminates the false startup warning.
 PROMPT_COLUMNS = [
     "intent_system_prompt",
     "greeting_system_prompt",
@@ -33,9 +41,6 @@ PROMPT_COLUMNS = [
     "neg_final_price_prompt",
     "fast_confirm_prompt",
     "product_summary_recommendation_prompt",
-    "acceptance_keywords",
-    "acceptance_exact_words",
-    "new_order_trigger_phrases",
 ]
 
 
@@ -119,6 +124,20 @@ def _apply_tenant(incoming: IncomingMessage, info: dict) -> None:
     incoming.graphrag_api_url = info.get("graphrag_api_url") or None
     incoming.products_api_url = info.get("products_api_url") or None
     incoming.access_token     = info.get("access_token") or None
+
+    # Normalize quick_actions ONCE here — frozensets are built at tenant load
+    # time, not on every message. is_quick_action() just does a membership test.
+    # Raw shape from DB: {"ORDER_CONFIRM": ["yes","ok",...], "ORDER_CANCEL": [...]}
+    # Stored shape on incoming: {"ORDER_CONFIRM": frozenset({"yes","ok",...}), ...}
+    raw_actions = info.get("quick_actions") or {}
+    if isinstance(raw_actions, dict) and raw_actions:
+        incoming.quick_actions = {
+            action: frozenset(p.casefold().strip() for p in phrases if isinstance(p, str))
+            for action, phrases in raw_actions.items()
+            if isinstance(phrases, list)
+        }
+    else:
+        incoming.quick_actions = None
 
     # Load every prompt column — None if not set in DB
     for col in PROMPT_COLUMNS:

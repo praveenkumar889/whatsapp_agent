@@ -74,6 +74,17 @@ async def dispatch(incoming, result, session_history: list) -> str:
         # Active state exists — fall through to normal WORKFLOW_ACTION routing
         # below, which resolves this correctly via _try_resolve_product_followup().
 
+    # ── Intercept memory-related queries (orders, offers context) ────────────
+    _needs_memory = _routing.needs_memory if _routing else False
+    if _needs_memory and intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION"):
+        try:
+            from ai.memory_handler import handle_memory_query
+            memory_reply = await handle_memory_query(incoming, session_history)
+            if memory_reply:
+                return memory_reply
+        except Exception as e:
+            print(f"[ROUTER] memory_handler query failed: {e}")
+
     if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
         from ai.graphrag_handler import call_graphrag_api
         return await call_graphrag_api(incoming, session_history)
@@ -108,8 +119,19 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
     from db.session_store import get_negotiation_state, save_negotiation_state, get_tenant_offers
     from ai.invoice_handler import _is_invoice_confirmation_request
 
-    pre_neg_state = getattr(incoming, '_cached_neg_state', None) or         await get_negotiation_state(incoming.tenant_id, incoming.session_id)
-    if pre_neg_state is None or result.intent == "HUMAN_ESCALATION":
+    pre_neg_state = getattr(incoming, '_cached_neg_state', None) or \
+                    await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+    if pre_neg_state is None:
+        return None
+
+    # Capability-driven bypass: only intercept intents that require active workflow state
+    # All other intents (FAQ_KNOWLEDGE, GREETING, escalation) bypass negotiation guard and fall through
+    _routing = getattr(result, "routing", None) or getattr(incoming, "_routing", None)
+    if _routing:
+        if not _routing.needs_workflow_state:
+            return None
+    elif result.intent in ("HUMAN_ESCALATION", "FAQ_KNOWLEDGE", "GREETING"):
+        # Safe fallback if no routing decision metadata is attached
         return None
 
     # ── Phase 2: counter_offer_presented — bot has shown its best price ────────
@@ -246,7 +268,7 @@ async def _handle_qty_confirm_split(incoming, neg_state: dict, session_history: 
         return None
 
 
-async def _resume_negotiation(incoming, neg_state: dict, session_history: list) -> str:
+async def _resume_negotiation(incoming, neg_state: dict, session_history: list) -> Optional[str]:
     from ai.negotiator import handle_negotiation
     from ai.graphrag_handler import call_graphrag_api
     from db.session_store import get_tenant_offers, save_negotiation_state
@@ -276,21 +298,13 @@ async def _resume_negotiation(incoming, neg_state: dict, session_history: list) 
         global_offers         = global_offers,
     )
 
-    # DEFERRAL: see product_followup.py's identical handling — the negotiator
-    # determined this message isn't negotiation-related (greeting/escalation
-    # arriving while awaiting invoice confirmation). Route it properly
-    # instead of returning ng_result["reply"], which would be None here.
+    # DEFERRAL: let the main routing dispatch the deferred intent
     if ng_result.get("defer_intent") is not None:
         await save_negotiation_state(incoming.tenant_id, incoming.session_id, ng_result["state"])
         _defer_intent = ng_result["defer_intent"].intent
         incoming._deferred_intent = _defer_intent  # so main.py's debug output reflects the real routing decision
-        print(f"[NEG RESUME] Negotiator deferred (intent={_defer_intent}) — routing directly")
-        if _defer_intent == "GREETING":
-            from ai.handlers import handle_greeting
-            return await handle_greeting(incoming)
-        elif _defer_intent == "HUMAN_ESCALATION":
-            from ai.handlers import handle_escalation
-            return await handle_escalation(incoming)
+        print(f"[NEG RESUME] Negotiator deferred (intent={_defer_intent}) — falling through to main routing")
+        return None
 
     if ng_result["order_ready"] and ng_result["agreed_price"]:
         negotiator_reply = ng_result.get("reply", "")
@@ -368,6 +382,10 @@ async def _invoice_guard(incoming, session_history: list) -> Optional[str]:
 async def _check_fast_confirm(incoming, neg_state) -> bool:
     if not neg_state or not neg_state.get("awaiting_invoice_confirmation", False):
         return False
+    from utils.conversation_actions import is_quick_confirm
+    if is_quick_confirm(incoming):
+        print(f"[FAST CONFIRM] Phrase match (no LLM): '{incoming.text.strip()}'")
+        return True
     try:
         from openai import AzureOpenAI
         from config import (
@@ -398,7 +416,7 @@ async def _check_fast_confirm(incoming, neg_state) -> bool:
 
 
 async def _confirm_negotiated_order(incoming, neg_state: dict) -> str:
-    from db.product_store import create_order
+    from ai.order_service import complete_order
     from db.session_store import clear_negotiation_state
     from ai.invoice_handler import handle_invoice_request
 
@@ -436,7 +454,7 @@ async def _confirm_negotiated_order(incoming, neg_state: dict) -> str:
         "unit_price":     agreed,
         "total_price":    pr.subtotal,
     }]
-    new_order = await create_order(
+    new_order = await complete_order(
         tenant_id   = incoming.tenant_id,
         session_id  = incoming.session_id,
         sender_name = incoming.sender_name,

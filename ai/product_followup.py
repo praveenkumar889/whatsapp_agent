@@ -1047,6 +1047,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         _has_pronoun = False
         if len(compared) <= 1:
             try:
+                _last_prod = await get_last_discussed_product(incoming.tenant_id, incoming.session_id) or "the previous product"
                 pronoun_resp = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: _client.chat.completions.create(
@@ -1054,7 +1055,10 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         max_tokens  = 5,
                         temperature = 0,
                         messages    = [
-                            {"role": "system", "content": get_prompt(incoming, "pf_vague_pronoun_resolver_l2_prompt")},
+                            {"role": "system", "content": get_prompt(
+                                incoming, "pf_vague_pronoun_resolver_l2_prompt",
+                                product_name=_last_prod, customer_message=incoming.text
+                            )},
                             {"role": "user", "content": incoming.text},
                         ],
                     )
@@ -1381,34 +1385,117 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             img_intent = "PRODUCT_IMAGE"
         print(f"[FOLLOW-UP] Image intent: {img_intent}")
 
-        inst_url = (cached_product.get("installation_url") or matched_product.get("installation_url") or "").replace("http://", "https://")
+        # Check for structured installation assets
+        installation = cached_product.get("installation")
+        if isinstance(installation, str):
+            try:
+                installation = json.loads(installation)
+            except Exception:
+                installation = None
+        if not isinstance(installation, dict):
+            # Fallback for backward compatibility
+            inst_url = (cached_product.get("installation_url") or matched_product.get("installation_url") or "").replace("http://", "https://")
+            if inst_url:
+                installation = {
+                    "pdf_url": inst_url,
+                    "has_installation": True
+                }
+            else:
+                installation = {}
+
+        # Sanitize installation URL fields to ensure they are string values (and not boolean True/False or other types)
+        if isinstance(installation, dict):
+            for k in ["pdf_url", "manual_url", "video_url"]:
+                v = installation.get(k)
+                if v is not None:
+                    if isinstance(v, bool):
+                        installation[k] = ""
+                    elif not isinstance(v, str):
+                        installation[k] = str(v)
+
         img_url  = (cached_product.get("image_url") or matched_product.get("image_url") or "").replace("http://", "https://")
 
-        if "INSTALLATION" in img_intent and inst_url:
-            # Send installation image
-            caption = f"Installation guide — {cached_product.get('product_name') or product_name}"
-            inst_wamid = await send_image(incoming, inst_url, caption)
-            if inst_wamid:
-                print(f"[FOLLOW-UP] Installation image sent for '{product_name}' — wamid={inst_wamid}")
-                await save_outbound_message(
-                    tenant_id     = incoming.tenant_id,
-                    session_id    = incoming.session_id,
-                    message_id    = inst_wamid,
-                    text          = caption,
-                    media_url     = inst_url,
-                    original_type = "image",
-                    region        = incoming.region,
+        if "INSTALLATION" in img_intent and (installation.get("pdf_url") or installation.get("manual_url") or installation.get("video_url")):
+            media_url = installation.get("pdf_url") or installation.get("manual_url") or installation.get("video_url") or ""
+            if isinstance(media_url, bool):
+                media_url = ""
+            elif not isinstance(media_url, str):
+                media_url = str(media_url)
+
+            # Send image card if it is an image format, or fallback to sending the links text directly
+            if media_url and (media_url.lower().endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')) or "cdn" in media_url.lower()):
+                caption = f"Installation guide — {cached_product.get('product_name') or product_name}"
+                inst_wamid = await send_image(incoming, media_url, caption)
+                if inst_wamid:
+                    print(f"[FOLLOW-UP] Installation image sent for '{product_name}' — wamid={inst_wamid}")
+                    await save_outbound_message(
+                        tenant_id     = incoming.tenant_id,
+                        session_id    = incoming.session_id,
+                        message_id    = inst_wamid,
+                        text          = caption,
+                        media_url     = media_url,
+                        original_type = "image",
+                        region        = incoming.region,
+                    )
+
+            # Generate dynamic text description of assets
+            try:
+                header = get_prompt(
+                    incoming, "followup_installation_header_prompt",
+                    product_name = cached_product.get('product_name') or product_name
                 )
-            # Also send text with the installation link
-            link_text = (
-                f"Here is the installation guide for *{cached_product.get('product_name') or product_name}*:\n\n"
-                f"🔗 {inst_url}\n\n"
-                f"Need help with anything else?\n"
-                f"• 💰 Pricing & offers\n"
-                f"• 📦 Place an order\n"
-                f"• 🔒 Warranty\n\n"
-                f"Or just tell me how many units you'd like and I'll set it up for you!"
-            )
+            except RuntimeError:
+                header = f"Here is the installation guide for *{cached_product.get('product_name') or product_name}*:\n"
+            text_parts = [header]
+
+            if installation.get("pdf_url"):
+                try:
+                    pdf_line = get_prompt(incoming, "followup_installation_pdf_prompt", pdf_url=installation['pdf_url'])
+                except RuntimeError:
+                    pdf_line = f"📄 PDF Guide: {installation['pdf_url']}"
+                text_parts.append(pdf_line)
+
+            if installation.get("video_url"):
+                try:
+                    video_line = get_prompt(incoming, "followup_installation_video_prompt", video_url=installation['video_url'])
+                except RuntimeError:
+                    video_line = f"▶ Video Tutorial: {installation['video_url']}"
+                text_parts.append(video_line)
+
+            if installation.get("manual_url"):
+                try:
+                    manual_line = get_prompt(incoming, "followup_installation_manual_prompt", manual_url=installation['manual_url'])
+                except RuntimeError:
+                    manual_line = f"🔗 Manual Link: {installation['manual_url']}"
+                text_parts.append(manual_line)
+
+            quick_steps = installation.get("quick_steps")
+            if quick_steps:
+                try:
+                    steps_header = get_prompt(incoming, "followup_installation_steps_header_prompt")
+                except RuntimeError:
+                    steps_header = "\n*Quick Steps:*"
+                text_parts.append(steps_header)
+
+                if isinstance(quick_steps, list):
+                    for idx, step in enumerate(quick_steps, 1):
+                        text_parts.append(f"{idx}. {step}")
+                else:
+                    text_parts.append(str(quick_steps))
+
+            try:
+                footer = get_prompt(incoming, "followup_installation_footer_prompt")
+            except RuntimeError:
+                footer = (
+                    "\nNeed help with anything else?\n"
+                    "• 💰 Pricing & offers\n"
+                    "• 📦 Place an order\n"
+                    "• 🔒 Warranty\n\n"
+                    "Or just tell me how many units you'd like and I'll set it up for you!"
+                )
+            text_parts.append(footer)
+
+            link_text = "\n".join(text_parts)
             link_wamid = await send_reply(incoming, link_text)
             if link_wamid:
                 await save_outbound_message(
@@ -1617,8 +1704,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 _prior_offer_disclosed = bool(_active_neg and _active_neg.get("offer_disclosed"))
                 await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                 _list_price  = cast(float, product_context.get("list_price") or 0.0)
-                _auto_applied = bool(product_context.get("auto_offer_applied") and product_context.get("auto_offer_unit_price"))
-                _actual_price = float(product_context["auto_offer_unit_price"]) if _auto_applied else _list_price
+                _auto_offer_unit_price = product_context.get("auto_offer_unit_price")
+                _auto_applied = bool(product_context.get("auto_offer_applied") and _auto_offer_unit_price is not None)
+                _actual_price = cast(float, _auto_offer_unit_price) if _auto_applied else _list_price
                 _fresh_neg = {
                     "product_name":      product_name,
                     "price_num":         _list_price,
@@ -1638,7 +1726,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     "last_offer_price":  _actual_price,
                 }
                 if _auto_applied:
-                    _fresh_neg["auto_offer_unit_price"] = product_context["auto_offer_unit_price"]
+                    _fresh_neg["auto_offer_unit_price"] = cast(float, _auto_offer_unit_price)
                     _fresh_neg["auto_offer_disc_pct"]   = product_context.get("auto_offer_disc_pct", 0)
                 await save_negotiation_state(incoming.tenant_id, incoming.session_id, _fresh_neg)
                 print(f"[OFFER] Fresh neg_state qty={parsed_qty} auto={_fresh_neg.get('auto_offer_unit_price')}")

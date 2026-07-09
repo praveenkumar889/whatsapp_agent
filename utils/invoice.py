@@ -15,7 +15,10 @@
 
 import io
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Union, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ai.order_service import OrderResult
 
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import cm
@@ -368,7 +371,7 @@ async def upload_invoice_to_storage(
 
 
 async def generate_and_upload_invoice(
-    order:         dict,
+    order:         Union[dict, "OrderResult"],
     biz_name:      str           = "",
     tagline:       Optional[str] = None,
     city:          Optional[str] = None,

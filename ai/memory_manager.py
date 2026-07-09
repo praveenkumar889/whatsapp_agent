@@ -33,6 +33,8 @@ TTL = {
     "negotiation_outcome": 90  * 24 * 60 * 60,# 90 days
     "customer_preference": 365 * 24 * 60 * 60,# 1 year
     "purchase_history":    None,               # forever
+    "order_history":       None,               # forever
+    "offer_history":       90  * 24 * 60 * 60,# 90 days
 }
 
 # ── Importance weights for ranking ────────────────────────────────────────────
@@ -40,6 +42,8 @@ _IMPORTANCE = {
     "workflow_snapshot":   1.0,   # most important — current session
     "product_context":     0.9,   # very important — current product
     "negotiation_outcome": 0.8,   # important for personalisation
+    "order_history":       0.85,  # completed orders
+    "offer_history":       0.75,  # historical offer records
     "customer_preference": 0.7,   # useful for personalisation
     "conversation":        0.5,   # background context
 }
@@ -68,33 +72,83 @@ class MemoryManager:
         return _get_client()
 
     def _search_raw(self, query: str, memory_type: str, limit: int) -> list:
-        """Low-level Mem0 search with correct filter format."""
+        """
+        Low-level Mem0 search. Filters by user_id only — agent_id is NOT
+        persisted by this Mem0 SDK version (confirmed in db/memory_store.py's
+        module comment), so agent_id filtering silently matches nothing.
+        Tenant isolation instead comes from the text-prefix convention
+        already used elsewhere in this codebase (db/memory_store.py) —
+        every save here embeds "T:{tenant}|U:{session}|" in the content,
+        and results are filtered/stripped of that prefix here too.
+
+        IMPORTANT: Do NOT add a metadata filter here. The Mem0 SDK's compound
+        filter {"user_id": ..., "metadata": {"type": ...}} silently returns
+        raw=0 — the same SDK quirk documented in db/memory_store.py. We
+        post-filter by memory type in Python using keyword prefixes instead.
+        """
+        from db.memory_store import _matches_tenant, _strip_tenant_prefix
+
+        # Maps MemoryManager memory_type names → the keyword prefix written
+        # at the start of the content string by each _save_raw() call.
+        # conversation turns have no structured prefix (they're raw user/bot text).
+        _TYPE_TO_PREFIX: dict = {
+            "product_context":     "PRODUCT_CONTEXT:",
+            "workflow_snapshot":   "WORKFLOW_SNAPSHOT:",
+            "negotiation_outcome": "NEG_OUTCOME:",
+            "customer_preference": "CUSTOMER_PREF:",
+            "order_history":       "ORDER_HISTORY:",
+            "offer_history":       "OFFER_HISTORY:",
+            "conversation":        None,   # no structured keyword prefix
+        }
+
         client = self._client()
         if not client:
+            print(f"[MEM] _search_raw({memory_type}): no Mem0 client available")
             return []
         try:
             res = client.search(
                 query  = query,
-                limit  = limit,
-                filters= {"user_id":   self.session_id,
-                          "agent_id":  self.tenant_id,
-                          "metadata":  {"type": memory_type}},
+                limit  = limit * 3,  # over-fetch since tenant filtering happens after
+                filters= {"user_id": self.session_id},
             )
-            return res if isinstance(res, list) else []
+            raw = res if isinstance(res, list) else []
+            required_prefix = _TYPE_TO_PREFIX.get(memory_type)
+            result = []
+            for r in raw:
+                if not isinstance(r, dict):
+                    continue
+                mem_text = r.get("memory", "")
+                if not _matches_tenant(mem_text, self.tenant_id, self.session_id):
+                    continue
+                stripped = _strip_tenant_prefix(mem_text)
+                # Enforce memory-type keyword prefix for structured types;
+                # conversation turns pass through (required_prefix is None).
+                if required_prefix is not None and not stripped.startswith(required_prefix):
+                    continue
+                r = {**r, "memory": stripped}
+                result.append(r)
+            result = result[:limit]
+            print(f"[MEM] _search_raw({memory_type}) tenant={self.tenant_id} session={self.session_id} "
+                  f"query='{query[:40]}' -> raw={len(raw)} tenant_matched={len(result)}")
+            return result
         except Exception as e:
             print(f"[MEM] search failed ({memory_type}): {e}")
             return []
 
     def _save_raw(self, content: str, memory_type: str, extra_meta: dict = {}) -> None:
-        """Low-level Mem0 save."""
+        """Low-level Mem0 save. Embeds the tenant/session text prefix —
+        see _search_raw()'s docstring for why agent_id alone isn't enough."""
+        from db.memory_store import _add_tenant_prefix
+
         client = self._client()
         if not client:
             return
         try:
             meta = {"type": memory_type, "saved_at": int(time.time()),
                     **extra_meta}
+            prefixed_content = _add_tenant_prefix(content, self.tenant_id, self.session_id)
             client.add(
-                messages = [{"role": "system", "content": content}],
+                messages = [{"role": "system", "content": prefixed_content}],
                 user_id  = self.session_id,
                 agent_id = self.tenant_id,
                 metadata = meta,
@@ -183,6 +237,10 @@ class MemoryManager:
             valid = self._deduplicate(valid)
             # 4. Rank by importance × recency × confidence
             ranked = self._rank(valid, mem_type)[:max_results]
+            if raw and not ranked:
+                print(f"[MEM] {mem_type}: {len(raw)} raw -> 0 after filtering "
+                      f"(expired/low-confidence/dedup — check scores: "
+                      f"{[r.get('score') for r in raw]})")
             return mem_type, ranked
 
         results = await asyncio.gather(*[_fetch(t) for t in memory_types],
@@ -268,6 +326,54 @@ class MemoryManager:
         )
         print(f"[MEM] Saved negotiation outcome: {disc}% discount, accepted={accepted}")
 
+    async def save_order_history(
+        self, product: str, quantity: int, price: float, order_id: str,
+        discount_pct: int = 0, negotiated: bool = False
+    ) -> None:
+        """Saves a completed order to structured long-term memory."""
+        import asyncio
+        from datetime import datetime, timezone
+        order_meta = {
+            "type": "order_history",
+            "product": product,
+            "quantity": quantity,
+            "price": price,
+            "order_id": order_id,
+            "discount_pct": discount_pct,
+            "negotiated": negotiated,
+            "date": datetime.now(timezone.utc).isoformat()
+        }
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: self._save_raw(
+                f"ORDER_HISTORY: {json.dumps(order_meta)}", "order_history"
+            )
+        )
+        print(f"[MEM] Saved order history: {order_id} — {product} x {quantity}")
+
+    async def save_offer_history(
+        self, product: str, store_offer_pct: int, negotiated_price: float,
+        offer_threshold: float, accepted: bool
+    ) -> None:
+        """Saves an offer outcome to structured long-term memory."""
+        import asyncio
+        offer_meta = {
+            "type": "offer_history",
+            "product": product,
+            "store_offer_pct": store_offer_pct,
+            "negotiated_price": negotiated_price,
+            "offer_threshold": offer_threshold,
+            "accepted": accepted,
+            "date": str(int(time.time()))
+        }
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: self._save_raw(
+                f"OFFER_HISTORY: {json.dumps(offer_meta)}", "offer_history"
+            )
+        )
+        print(f"[MEM] Saved offer history: {product} discount={store_offer_pct}% accepted={accepted}")
+
     async def save_conversation_turn(self, user_text: str, bot_reply: str) -> None:
         """Saves a conversation turn (30-day TTL)."""
         client = self._client()
@@ -342,3 +448,84 @@ def _extract_material(features: str) -> str:
         if mat in fl:
             return mat.title()
     return "check specs"
+
+
+def build_memory_context_text(results: dict) -> str:
+    """
+    Turns MemoryManager.search()'s {memory_type: [memory_dicts]} result into
+    grouped, labeled sections instead of a flat bullet list — easier for any
+    downstream prompt (GraphRAG query builder, memory-only answer, future
+    handlers) to work with than raw concatenated memory strings. Lives here,
+    not in any one handler, so it's reusable across all of them — Mem0
+    formatting is not GraphRAG-specific or router-specific.
+
+    Each memory's raw "memory" field carries a TYPE_PREFIX: {json} format
+    (see the save_* methods above) — parsed here to extract the actual
+    field worth surfacing, not just the storage encoding.
+    """
+    import json as _json
+
+    products, categories, preferences, negotiations, orders, offers = [], [], [], [], [], []
+
+    for mem_type, items in (results or {}).items():
+        for item in items:
+            raw = (item or {}).get("memory", "")
+            if not raw:
+                continue
+            _, _, json_part = raw.partition(":")
+            try:
+                data = _json.loads(json_part.strip())
+            except Exception:
+                data = {}
+
+            if mem_type == "product_context":
+                name = data.get("name")
+                if name:
+                    products.append(name)
+            elif mem_type == "customer_preference":
+                pref_type = data.get("pref_type", "")
+                value     = data.get("value")
+                if value:
+                    (categories if pref_type == "category" else preferences).append(str(value))
+            elif mem_type == "negotiation_outcome":
+                product  = data.get("product")
+                qty      = data.get("quantity")
+                accepted = data.get("accepted")
+                if product:
+                    detail = f"{product}"
+                    if qty:
+                        detail += f" ({qty} units)"
+                    if accepted is False:
+                        detail += " — offer not accepted"
+                    negotiations.append(detail)
+            elif mem_type == "order_history":
+                product = data.get("product")
+                qty = data.get("quantity")
+                price = data.get("price")
+                oid = data.get("order_id")
+                if product:
+                    orders.append(f"Order {oid or ''}: {product} x{qty or 1} @ Rs.{price or 0:,.0f}")
+            elif mem_type == "offer_history":
+                product = data.get("product")
+                disc = data.get("store_offer_pct")
+                price = data.get("negotiated_price")
+                accepted = data.get("accepted")
+                if product:
+                    status = "Accepted" if accepted else "Rejected"
+                    offers.append(f"Offer for {product}: {disc or 0}% off (Rs.{price or 0:,.0f}/unit) - {status}")
+
+    sections = []
+    if products:
+        sections.append("Previous Products:\n" + "\n".join(f"- {p}" for p in products))
+    if categories:
+        sections.append("Preferred Categories:\n" + "\n".join(f"- {c}" for c in categories))
+    if preferences:
+        sections.append("Preferences:\n" + "\n".join(f"- {p}" for p in preferences))
+    if negotiations:
+        sections.append("Negotiation History:\n" + "\n".join(f"- {n}" for n in negotiations))
+    if orders:
+        sections.append("Completed Orders:\n" + "\n".join(f"- {o}" for o in orders))
+    if offers:
+        sections.append("Past Offers:\n" + "\n".join(f"- {o}" for o in offers))
+
+    return "\n\n".join(sections)

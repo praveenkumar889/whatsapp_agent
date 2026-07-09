@@ -321,6 +321,7 @@ PROMPT_KEYS: dict = {
     "invoice_pdf_failed_prompt":                  "invoice_pdf_failed_prompt",
     "neg_still_bargaining_prompt":                "neg_still_bargaining_prompt",
     "neg_ask_quantity_prompt":                    "neg_ask_quantity_prompt",
+    "neg_ask_quantity_retry_prompt":              "neg_ask_quantity_retry_prompt",
     "graphrag_no_url_configured_prompt":          "graphrag_no_url_configured_prompt",
     "graphrag_403_error_prompt":                  "graphrag_403_error_prompt",
     "graphrag_http_error_prompt":                 "graphrag_http_error_prompt",
@@ -373,4 +374,16 @@ PROMPT_KEYS: dict = {
     "pricing_order_summary_savings_breakdown_prompt":   "pricing_order_summary_savings_breakdown_prompt",
     "pricing_order_summary_savings_prompt":             "pricing_order_summary_savings_prompt",
     "pricing_order_summary_footer_prompt":              "pricing_order_summary_footer_prompt",
+
+    # Custom Dynamic Pipeline Prompts
+    "followup_installation_footer_prompt":              "followup_installation_footer_prompt",
+    "followup_installation_header_prompt":              "followup_installation_header_prompt",
+    "followup_installation_pdf_prompt":                 "followup_installation_pdf_prompt",
+    "followup_installation_video_prompt":               "followup_installation_video_prompt",
+    "followup_installation_manual_prompt":              "followup_installation_manual_prompt",
+    "followup_installation_steps_header_prompt":        "followup_installation_steps_header_prompt",
+    "memory_query_classifier_prompt":                   "memory_query_classifier_prompt",
+    "memory_no_orders_found_prompt":                    "memory_no_orders_found_prompt",
+    "memory_order_formatter_prompt":                    "memory_order_formatter_prompt",
+    "memory_offers_formatter_prompt":                   "memory_offers_formatter_prompt",
 }

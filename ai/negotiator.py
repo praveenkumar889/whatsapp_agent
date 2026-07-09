@@ -29,6 +29,23 @@ def parse_global_offer_tiers(incoming, global_offers: str) -> list:
     if not global_offers or not global_offers.strip():
         return []
     try:
+        # 1. Check database cache first (synchronously via Supabase client)
+        from db.session_store import _get_client
+        db_res = _get_client().table("tenant_offers") \
+            .select("tiers_json") \
+            .eq("tenant_id", incoming.tenant_id) \
+            .limit(1) \
+            .execute()
+        if db_res.data and isinstance(db_res.data, list) and len(db_res.data) > 0:
+            first_row = db_res.data[0]
+            if isinstance(first_row, dict):
+                tiers_raw = first_row.get("tiers_json")
+                if isinstance(tiers_raw, str):
+                    parsed = json.loads(tiers_raw)
+                    if isinstance(parsed, list) and all(len(t) == 2 for t in parsed):
+                        return sorted(parsed, key=lambda x: x[0])
+
+        # 2. If missing/invalid, parse via LLM
         from db.prompt_store import get_prompt
         _tiers_prompt = get_prompt(incoming, "parse_global_offer_tiers_prompt")
         response = _client.chat.completions.create(
@@ -42,7 +59,23 @@ def parse_global_offer_tiers(incoming, global_offers: str) -> list:
         raw    = content.strip() if content else ""
         parsed = json.loads(raw)
         if isinstance(parsed, list) and all(len(t) == 2 for t in parsed):
-            return sorted(parsed, key=lambda x: x[0])
+            sorted_tiers = sorted(parsed, key=lambda x: x[0])
+            # 3. Cache the parsed result back to Postgres
+            try:
+                from datetime import datetime, timezone
+                row = {
+                    "tenant_id":   incoming.tenant_id,
+                    "offers_text": global_offers.strip(),
+                    "tiers_json":  json.dumps(sorted_tiers),
+                    "updated_at":  datetime.now(timezone.utc).isoformat(),
+                }
+                _get_client().table("tenant_offers") \
+                    .upsert(row, on_conflict="tenant_id") \
+                    .execute()
+                print(f"[NEGOTIATOR] Cached tiers_json to DB for {incoming.tenant_id}")
+            except Exception as save_err:
+                print(f"[NEGOTIATOR] Failed to cache tiers_json: {save_err}")
+            return sorted_tiers
         return []
     except Exception as e:
         print(f"[NEGOTIATOR] parse_global_offer_tiers failed: {e}")
@@ -269,7 +302,11 @@ async def detect_more_discount_request(message: str, incoming, session_history: 
 
 
 async def detect_acceptance(message: str, incoming, session_history: Optional[list] = None) -> bool:
-    prompt = get_prompt(incoming, "neg_detect_accept_prompt")
+    from utils.conversation_actions import is_quick_confirm
+    if is_quick_confirm(incoming, message):
+        print(f"[NEGOTIATOR] detect_acceptance: fast-path match (no LLM) for '{message.strip()}'")
+        return True
+    prompt = get_prompt(incoming, "neg_detect_accept_prompt", message=message)
     try:
         r = await asyncio.get_event_loop().run_in_executor(
             None, lambda: _client.chat.completions.create(
@@ -841,7 +878,7 @@ async def handle_negotiation(
             print(f"[NEGOTIATOR] Deferral classify_intent failed (non-critical): {e}")
             _defer_result = None
 
-        if _defer_result and _defer_result.intent in ("GREETING", "HUMAN_ESCALATION"):
+        if _defer_result and _defer_result.intent in ("GREETING", "HUMAN_ESCALATION", "FAQ_KNOWLEDGE"):
             print(f"[NEGOTIATOR] Message not negotiation-related (intent={_defer_result.intent}) "
                   f"— deferring to normal routing, negotiation state preserved")
             return {"reply": None, "defer_intent": _defer_result,
