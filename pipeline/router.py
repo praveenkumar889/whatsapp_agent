@@ -465,11 +465,11 @@ async def _save_neg_outcome_async(
 ) -> None:
     """Fire-and-forget negotiation outcome save to Mem0."""
     try:
-        from db.memory_store import save_negotiation_outcome
-        await save_negotiation_outcome(
-            tenant_id     = tenant_id,
-            session_id    = session_id,
-            product_name  = product,
+        # save_negotiation_outcome lives in MemoryManager (ai/memory_manager.py)
+        from ai.memory_manager import MemoryManager
+        mm = MemoryManager(tenant_id, session_id)
+        await mm.save_negotiation_outcome(
+            product       = product,
             opening_price = opening_price,
             final_price   = final_price,
             rounds        = rounds,

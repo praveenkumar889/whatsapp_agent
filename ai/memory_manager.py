@@ -68,39 +68,93 @@ class MemoryManager:
         return _get_client()
 
     def _search_raw(self, query: str, memory_type: str, limit: int) -> list:
-        """Low-level Mem0 search with correct filter format."""
+        """
+        Low-level Mem0 search.
+
+        VERIFIED (via verify_search_format.py): the installed SDK requires
+        filters={"user_id": ...} — top-level user_id= kwargs are rejected
+        outright. This matches db/memory_store.py's confirmed-working format.
+
+        Does NOT filter by agent_id or nested metadata in the query itself —
+        agent_id is confirmed not persisted (see Debug_mem0.py), and the
+        nested metadata filter format was never verified. Instead, tenant
+        isolation and memory_type filtering both happen client-side here,
+        using the same tenant-prefix convention as db/memory_store.py so
+        writes and reads agree on how a memory is tagged as belonging to
+        this tenant+session.
+        """
+        from db.memory_store import _matches_tenant, _strip_tenant_prefix
         client = self._client()
         if not client:
             return []
         try:
             res = client.search(
-                query  = query,
-                limit  = limit,
-                filters= {"user_id":   self.session_id,
-                          "agent_id":  self.tenant_id,
-                          "metadata":  {"type": memory_type}},
+                query   = query,
+                filters = {"user_id": self.session_id},
+                limit   = limit * 3,
             )
-            return res if isinstance(res, list) else []
+            if isinstance(res, dict):
+                res = res.get("results", [])
+            if not isinstance(res, list):
+                return []
+            filtered = []
+            for r in res:
+                if not isinstance(r, dict):
+                    continue
+                text = r.get("memory", "")
+                if not _matches_tenant(text, self.tenant_id, self.session_id):
+                    continue
+                if (r.get("metadata") or {}).get("type") != memory_type:
+                    continue
+                r["memory"] = _strip_tenant_prefix(text)
+                filtered.append(r)
+            return filtered[:limit]
         except Exception as e:
             print(f"[MEM] search failed ({memory_type}): {e}")
             return []
 
     def _save_raw(self, content: str, memory_type: str, extra_meta: dict = {}) -> None:
-        """Low-level Mem0 save."""
+        """
+        Low-level Mem0 save.
+
+        FIX: previously saved raw content with no tenant marker, relying
+        solely on agent_id= for tenant scoping. Since agent_id is confirmed
+        not persisted, every memory saved here was invisible to
+        db/memory_store.py's get_relevant_context() (which requires the
+        "T:{tenant_id}|U:{session_id}|" prefix) — this was the actual cause
+        of "results=0" on every product_followup.py Mem0 query, not the
+        search filter format. Now embeds the same prefix at save time so
+        both wrappers agree on how tenant isolation is represented.
+        """
+        from db.memory_store import _add_tenant_prefix
         client = self._client()
         if not client:
             return
         try:
             meta = {"type": memory_type, "saved_at": int(time.time()),
                     **extra_meta}
+            prefixed = _add_tenant_prefix(content, self.tenant_id, self.session_id)
             client.add(
-                messages = [{"role": "system", "content": content}],
+                messages = [{"role": "system", "content": prefixed}],
                 user_id  = self.session_id,
                 agent_id = self.tenant_id,
                 metadata = meta,
             )
+            _preview = content[:60].replace("\n", " ")
+            print(f"[MEM0 SAVE] user_id={self.session_id} tenant={self.tenant_id} "
+                  f"memory_type={memory_type} preview={_preview}...")
+            from ai import memory_metrics
+            memory_metrics.record_manager_save(memory_type)
         except Exception as e:
             print(f"[MEM] save failed ({memory_type}): {e}")
+
+    async def _async_save(self, content: str, memory_type: str, extra_meta: dict = {}) -> None:
+        """Helper to run _save_raw asynchronously in an executor."""
+        import asyncio
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            None, lambda: self._save_raw(content, memory_type, extra_meta)
+        )
 
     def _rank(self, memories: list, mem_type: str) -> list:
         """
@@ -168,7 +222,10 @@ class MemoryManager:
         """
         import asyncio
         import concurrent.futures
+        import time as _time_metrics
+        from ai import memory_metrics
 
+        _t0 = _time_metrics.monotonic()
         loop = asyncio.get_event_loop()
 
         async def _fetch(mem_type: str) -> tuple[str, list]:
@@ -192,6 +249,12 @@ class MemoryManager:
             if isinstance(item, tuple):
                 mem_type, ranked = item
                 output[mem_type] = ranked
+
+        _latency_ms  = round((_time_metrics.monotonic() - _t0) * 1000, 1)
+        _total_hits  = sum(len(v) for v in output.values())
+        _types_hit   = [t for t, v in output.items() if v]
+        memory_metrics.record_manager_search(_latency_ms, _total_hits, _types_hit)
+
         return output
 
     # ── Save methods ──────────────────────────────────────────────────────────
@@ -269,21 +332,33 @@ class MemoryManager:
         print(f"[MEM] Saved negotiation outcome: {disc}% discount, accepted={accepted}")
 
     async def save_conversation_turn(self, user_text: str, bot_reply: str) -> None:
-        """Saves a conversation turn (30-day TTL)."""
+        """
+        Saves a conversation turn (30-day TTL).
+
+        FIX: this bypassed _save_raw() and called client.add() directly with
+        unprefixed content — same missing-tenant-prefix bug as _save_raw,
+        just duplicated here. Now applies the same prefix convention so
+        these turns are actually retrievable by db/memory_store.py reads.
+        """
+        from db.memory_store import _add_tenant_prefix
         client = self._client()
         if client:
             import asyncio
             loop = asyncio.get_event_loop()
+            prefixed_user = _add_tenant_prefix(user_text, self.tenant_id, self.session_id)
+            prefixed_bot  = _add_tenant_prefix(bot_reply,  self.tenant_id, self.session_id)
             await loop.run_in_executor(
                 None, lambda: client.add(
-                    messages = [{"role": "user",      "content": user_text},
-                                {"role": "assistant", "content": bot_reply}],
+                    messages = [{"role": "user",      "content": prefixed_user},
+                                {"role": "assistant", "content": prefixed_bot}],
                     user_id  = self.session_id,
                     agent_id = self.tenant_id,
                     metadata = {"type": "conversation",
                                 "saved_at": int(time.time())},
                 )
             )
+            print(f"[MEM0 SAVE] user_id={self.session_id} tenant={self.tenant_id} "
+                  f"memory_type=conversation preview={user_text[:60].replace(chr(10),' ')}...")
 
     # ── Profile builders ──────────────────────────────────────────────────────
 

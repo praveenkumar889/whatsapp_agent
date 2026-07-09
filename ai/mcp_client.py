@@ -12,6 +12,9 @@ from config import MCP_SERVER_URL
 
 logger = logging.getLogger(__name__)
 
+from ai.timing import log_timing
+
+@log_timing("MCPClient.query_mcp_catalog")
 async def query_mcp_catalog(
     query: str,
     session_id: Optional[str] = None,
@@ -103,6 +106,7 @@ async def get_product_details_mcp(
         print(f"[MCP-CLIENT] Failed to call 'get_product_details' for SKU '{sku}': {e}")
         return None
 
+@log_timing("MCPClient.get_taxonomy_context_mcp")
 async def get_taxonomy_context_mcp(
     query: str,
     threshold: float = 0.80,

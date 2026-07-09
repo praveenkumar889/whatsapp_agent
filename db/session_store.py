@@ -1167,6 +1167,9 @@ async def get_last_discussed_product(tenant_id: str, session_id: str) -> Optiona
         return None
 
 
+from ai.timing import log_timing
+
+@log_timing("DB.save_dialog_state")
 async def save_dialog_state(tenant_id: str, session_id: str, state: dict) -> bool:
     """Saves unified Dialog State Tracking (DST) JSON object in workflow_sessions table."""
     try:
@@ -1202,6 +1205,7 @@ async def save_dialog_state(tenant_id: str, session_id: str, state: dict) -> boo
         return False
 
 
+@log_timing("DB.get_dialog_state")
 async def get_dialog_state(tenant_id: str, session_id: str) -> Optional[dict]:
     """Retrieves unified Dialog State Tracking (DST) JSON object from workflow_sessions table."""
     try:

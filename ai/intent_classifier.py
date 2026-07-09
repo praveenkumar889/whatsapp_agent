@@ -52,6 +52,9 @@ Rules:
 - If the user asks for a broad group like "indoor lights", "outdoor lights", or "solar lights", set "intent": "browse_category", set "category_keywords" to the broad term (e.g. ["indoor"]), and leave "filters.category" as null so the customer is shown the collection list.
 """
 
+from ai.timing import log_timing
+
+@log_timing("IntentClassifier.classify_user_intent_client_side")
 async def classify_user_intent_client_side(
     query: str,
     history_context: str = "",

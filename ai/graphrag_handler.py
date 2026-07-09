@@ -351,6 +351,9 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
     return None
 
 
+from ai.timing import log_timing
+
+@log_timing("GraphRAGHandler.call_graphrag_api")
 async def call_graphrag_api(incoming, session_history: Optional[list] = None, graphrag_url: Optional[str] = None) -> str:
     """
     Calls the Hybrid RAG Agent API for ALL product-related queries.
