@@ -338,27 +338,16 @@ PROMPT_KEYS: dict = {
     "neg_qty_update_footer_prompt":               "neg_qty_update_footer_prompt",
     "neg_stalemate_reply_prompt":                 "neg_stalemate_reply_prompt",
 
-<<<<<<< HEAD
-    # Migration 021 — order summary (pipeline/router.py::_build_order_summary)
-    "order_summary_full_discount_prompt":         "order_summary_full_discount_prompt",
-    "order_summary_store_discount_only_prompt":   "order_summary_store_discount_only_prompt",
-    "order_summary_plain_price_prompt":           "order_summary_plain_price_prompt",
-    "order_summary_savings_line_prompt":          "order_summary_savings_line_prompt",
-    "order_summary_footer_prompt":                "order_summary_footer_prompt",
+    # Migration 023 — remaining hardcoded strings
+    "neg_upsell_hint_prompt":                     "neg_upsell_hint_prompt",
+    "neg_max_discount_unlocked_prompt":           "neg_max_discount_unlocked_prompt",
+    "neg_already_confirmed_prompt":               "neg_already_confirmed_prompt",
+    "pf_invalid_number_prompt":                   "pf_invalid_number_prompt",
+    "pf_no_product_name_prompt":                  "pf_no_product_name_prompt",
 
-    # Migration 023 — remaining hardcoded strings
-    "neg_upsell_hint_prompt":                     "neg_upsell_hint_prompt",
-    "neg_max_discount_unlocked_prompt":           "neg_max_discount_unlocked_prompt",
-    "neg_already_confirmed_prompt":               "neg_already_confirmed_prompt",
-    "pf_invalid_number_prompt":                   "pf_invalid_number_prompt",
-    "pf_no_product_name_prompt":                  "pf_no_product_name_prompt",
-=======
-    # Migration 023 — remaining hardcoded strings
-    "neg_upsell_hint_prompt":                     "neg_upsell_hint_prompt",
-    "neg_max_discount_unlocked_prompt":           "neg_max_discount_unlocked_prompt",
-    "neg_already_confirmed_prompt":               "neg_already_confirmed_prompt",
-    "pf_invalid_number_prompt":                   "pf_invalid_number_prompt",
-    "pf_no_product_name_prompt":                  "pf_no_product_name_prompt",
+    # Migration 028 — memory-aware GraphRAG queries
+    "graphrag_query_builder_prompt":               "graphrag_query_builder_prompt",
+    "no_active_workflow_prompt":                   "no_active_workflow_prompt",
 
     # Migration 021 — order summary (pipeline/router.py::_build_order_summary)
     "order_summary_full_discount_prompt":         "order_summary_full_discount_prompt",
@@ -374,5 +363,4 @@ PROMPT_KEYS: dict = {
     "pricing_order_summary_savings_breakdown_prompt":   "pricing_order_summary_savings_breakdown_prompt",
     "pricing_order_summary_savings_prompt":             "pricing_order_summary_savings_prompt",
     "pricing_order_summary_footer_prompt":              "pricing_order_summary_footer_prompt",
->>>>>>> 2ded835 (fix: resolve import error for DEFAULT_INTENT_MIN_CONFIDENCE and update prompt/session/adapter logic)
 }

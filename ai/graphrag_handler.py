@@ -345,6 +345,103 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
     return None
 
 
+def _build_memory_context_text(results: dict) -> str:
+    """
+    Turns MemoryManager.search()'s {memory_type: [memory_dicts]} result into
+    grouped, labeled sections instead of a flat bullet list — easier for the
+    query-builder prompt (and for debugging) to work with than raw
+    concatenated memory strings.
+
+    Each memory's raw "memory" field carries a TYPE_PREFIX: {json} format
+    (see memory_manager.py's save_* methods) — parsed here to extract the
+    actual field worth surfacing, not just the storage encoding.
+    """
+    import json as _json
+
+    products, categories, preferences, negotiations = [], [], [], []
+
+    for mem_type, items in (results or {}).items():
+        for item in items:
+            raw = (item or {}).get("memory", "")
+            if not raw:
+                continue
+            _, _, json_part = raw.partition(":")
+            try:
+                data = _json.loads(json_part.strip())
+            except Exception:
+                data = {}
+
+            if mem_type == "product_context":
+                name = data.get("name")
+                if name:
+                    products.append(name)
+            elif mem_type == "customer_preference":
+                pref_type = data.get("pref_type", "")
+                value     = data.get("value")
+                if value:
+                    (categories if pref_type == "category" else preferences).append(str(value))
+            elif mem_type == "negotiation_outcome":
+                product  = data.get("product")
+                qty      = data.get("quantity")
+                accepted = data.get("accepted")
+                if product:
+                    detail = f"{product}"
+                    if qty:
+                        detail += f" ({qty} units)"
+                    if accepted is False:
+                        detail += " — offer not accepted"
+                    negotiations.append(detail)
+
+    sections = []
+    if products:
+        sections.append("Previous Products:\n" + "\n".join(f"- {p}" for p in products))
+    if categories:
+        sections.append("Preferred Categories:\n" + "\n".join(f"- {c}" for c in categories))
+    if preferences:
+        sections.append("Preferences:\n" + "\n".join(f"- {p}" for p in preferences))
+    if negotiations:
+        sections.append("Negotiation History:\n" + "\n".join(f"- {n}" for n in negotiations))
+
+    return "\n\n".join(sections)
+
+
+async def _build_enriched_graphrag_query(
+    incoming, customer_message: str, memory_context: str, current_product: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Builds an enriched GraphRAG query via graphrag_query_builder_prompt
+    (DB-driven, tenant-configurable) — not Python string concatenation, so
+    the query construction itself stays tenant-configurable like every other
+    customer-facing/LLM-facing text in this codebase.
+
+    Combines short-term context (current_product, from this session's own
+    state) with long-term context (memory_context, from Mem0) — a customer
+    actively discussing one product asking "recommend something for me"
+    should get results related to what they're looking at right now, not
+    only what they bought previously.
+    """
+    try:
+        from db.prompt_store import get_prompt
+        prompt = get_prompt(
+            incoming, "graphrag_query_builder_prompt",
+            customer_message=customer_message, memory_context=memory_context,
+            current_product=current_product or "None",
+        )
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0,
+                messages=[{"role": "system", "content": prompt}],
+            )
+        )
+        content = r.choices[0].message.content
+        return content.strip() if content else None
+    except RuntimeError:
+        raise
+    except Exception as e:
+        print(f"[MEM0] _build_enriched_graphrag_query failed (non-critical): {e}")
+        return None
+
+
 async def call_graphrag_api(incoming, session_history: Optional[list] = None, graphrag_url: Optional[str] = None) -> str:
     """
     Calls the Hybrid RAG Agent API for ALL product-related queries.
@@ -401,6 +498,59 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             else:
                 print(f"[CATEGORY] No match found — clearing state, proceeding with original query")
                 await clear_category_selection(incoming.tenant_id, incoming.session_id)
+
+        # ── Memory-aware query enrichment ───────────────────────────────────
+        # needs_long_term_memory now comes from classify_intent() (migration
+        # 029 extended intent_system_prompt to compute it), reusing the call
+        # that already runs on every single message before dispatch — no
+        # dedicated classifier added. main.py stashes it on incoming right
+        # after classify_intent() runs. Falls back to product_followup.py's
+        # own needs_long_term_memory (via pf_data_extraction_prompt) if that
+        # ran and set a value first — whichever signal is available wins.
+        _routing = getattr(incoming, "_routing", None)
+        _needs_memory = _routing.needs_memory if _routing else None
+        print(f"[MEM0] needs_memory={_needs_memory} for this GraphRAG call")
+        try:
+            if _needs_memory:
+                from ai.memory_policy import MemoryPolicy, MemoryRequest
+                from ai.memory_manager import MemoryManager
+
+                mem_ctx = MemoryRequest(
+                    text=graphrag_text, intent=None, workflow=None,
+                    tenant_id=incoming.tenant_id, session_id=incoming.session_id,
+                    needs_long_term_memory=True,
+                )
+                decision = MemoryPolicy.evaluate(mem_ctx)
+                print(f"[MEM0] MemoryPolicy decision: retrieve={decision.retrieve} types={decision.types}")
+                if decision.retrieve:
+                    mm = MemoryManager(incoming.tenant_id, incoming.session_id)
+                    results = await mm.search(decision.types, query=graphrag_text, max_results=decision.max_results)
+                    memory_context = _build_memory_context_text(results)
+                    print(f"[MEM0] Retrieved memory_context: {'(empty)' if not memory_context else memory_context[:150]}")
+                    if memory_context:
+                        # Short-term context (this session's own state) alongside
+                        # long-term context (Mem0) — a customer actively looking at
+                        # one product asking for recommendations should get results
+                        # related to what's in front of them right now, not only
+                        # what they bought before.
+                        _current_product = None
+                        _active_neg = getattr(incoming, "_cached_neg_state", None) or await get_negotiation_state(
+                            incoming.tenant_id, incoming.session_id
+                        )
+                        if _active_neg:
+                            _current_product = _active_neg.get("product_name")
+                        if not _current_product:
+                            from db.session_store import get_last_discussed_product
+                            _current_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+
+                        enriched = await _build_enriched_graphrag_query(
+                            incoming, graphrag_text, memory_context, current_product=_current_product,
+                        )
+                        if enriched:
+                            print(f"[MEM0] Enriched GraphRAG query with retrieved context")
+                            graphrag_text = enriched
+        except Exception as e:
+            print(f"[MEM0] Query enrichment failed (non-critical, using original query): {e}")
 
         # ── Build payload matching messages table schema ───────────────────
         payload = {

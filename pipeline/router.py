@@ -49,6 +49,31 @@ async def dispatch(incoming, result, session_history: list) -> str:
 
     from ai.handlers import DEFAULT_INTENT_MIN_CONFIDENCE
     _min_conf = getattr(incoming, "intent_min_confidence", None) or DEFAULT_INTENT_MIN_CONFIDENCE
+
+    # Routing gate: a message can only MODIFY an existing workflow if one
+    # exists. GraphRAG is a product-catalog search engine — it has no way
+    # to answer "add 3 more units" correctly (it doesn't know which
+    # product/order), so it shouldn't be asked. This check is semantic
+    # (routing.operation, computed by intent_system_prompt — migration 031),
+    # not a keyword match, so it works the same for "add 3 more units",
+    # "add one more MRI scan", "add two pizzas", or "add spouse" regardless
+    # of tenant/domain.
+    _routing = getattr(incoming, "_routing", None)
+    if _routing and _routing.operation == "MODIFY_WORKFLOW" and not _routing.needs_graphrag:
+        _has_state = incoming._cached_neg_state
+        if not _has_state:
+            from db.session_store import get_last_discussed_product
+            _has_state = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+        if not _has_state:
+            from db.prompt_store import get_prompt
+            try:
+                return get_prompt(incoming, "no_active_workflow_prompt", sender_name=incoming.sender_name)
+            except RuntimeError:
+                return (f"Hi {incoming.sender_name}! You don't have an order in progress right now — "
+                        f"what would you like to order? 😊")
+        # Active state exists — fall through to normal WORKFLOW_ACTION routing
+        # below, which resolves this correctly via _try_resolve_product_followup().
+
     if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
         from ai.graphrag_handler import call_graphrag_api
         return await call_graphrag_api(incoming, session_history)

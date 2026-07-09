@@ -105,7 +105,33 @@ class IncomingMessage:
     # ── Output ────────────────────────────────────────────────────────────────
     captured_replies: List[dict] = field(default_factory=list)
     raw:              dict       = field(default_factory=dict)
+
+    # ── Runtime scratch-pad (set during request processing, not persisted) ────
     _cached_neg_state: Optional[dict] = None
+    _routing:          Optional[object] = None   # RoutingDecision | None
+    _cached_arc:       Optional[object] = None   # AIRequestContext | None
+    _deferred_intent:  Optional[str]   = None
+
+
+@dataclass
+class RoutingDecision:
+    """
+    Tiny, tenant-agnostic routing signal — deliberately NOT the full
+    AIRequestContext. Answers exactly one question: which subsystems does
+    this message actually need? Computed once, as part of the intent
+    classification call that already runs on every message — no extra
+    LLM call added.
+
+    operation is a semantic label, not a domain-specific keyword match —
+    "MODIFY_WORKFLOW" means the same thing whether the workflow is an
+    order, an appointment, a claim, or a shipment; the LLM decides this
+    from meaning, not from tenant-specific vocabulary.
+    """
+    operation:              str   # "NEW_SEARCH" | "MODIFY_WORKFLOW" | "OTHER"
+    needs_graphrag:         bool
+    needs_memory:           bool
+    needs_workflow_state:   bool
+    needs_product_context:  bool
 
 
 @dataclass
@@ -113,6 +139,7 @@ class IntentResult:
     intent:           str
     confidence_score: float
     raw_text:         str
+    routing:           Optional[RoutingDecision] = None
 
 
 @dataclass
