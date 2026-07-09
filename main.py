@@ -38,13 +38,14 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from config import VERIFY_TOKEN, WEBHOOK_SECRET, APP_ENV, AZURE_OPENAI_DEPLOYMENT
 from adapter.whatsapp_adapter import parse_webhook
 from models.schemas import IncomingMessage
-from ai.handlers import classify_intent
+from ai.handlers import update_dialogue_state
 from db.session_store import update_intent, update_reply, save_outbound_message
 from db.processing_lock import release_lock, cleanup_stale_locks
 from db.memory_store import add_conversation_turn
 from pipeline.setup import setup_pipeline
 from pipeline.router import dispatch
 from messaging import send_reply
+from ai.mcp_client import get_taxonomy_hints_mcp
 
 # ── Concurrency guard — max 50 simultaneous pipeline runs ─────────────────────
 _pipeline_semaphore = asyncio.Semaphore(50)
@@ -209,51 +210,42 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
     """
     _t0 = time.monotonic()
 
-    # ── Steps 1-5: Setup (tenant, dedup, lock, history, save) ───────────────
-    ok, session_history = await setup_pipeline(incoming)
+    # ── Steps 1-2: Setup (tenant, dedup, lock) ──────────────────────────────
+    ok, _ = await setup_pipeline(incoming)
     if not ok:
         return _empty_result()
 
     try:
-        # ── Step 2.5: Load negotiation state ONCE, cache on incoming ────────
-        # FIX: Previously loaded 3-4x per request across _neg_guard,
-        # _invoice_guard, _resume_negotiation, and product_followup.
-        # Now loaded once here — all downstream reads use incoming._cached_neg_state.
-        from db.session_store import get_negotiation_state as _gns
-        incoming._cached_neg_state = await _gns(incoming.tenant_id, incoming.session_id)
-        _neg = incoming._cached_neg_state
-
-        # ── Step 3: Classify intent — with NEG BYPASS ───────────────────────
-        # FIX: During active negotiation the intent classifier oscillates between
-        # FAQ_KNOWLEDGE and WORKFLOW_ACTION wasting 2.5-3s per message.
-        # Bypass saves that time and keeps intent consistent.
-        _t_intent = time.monotonic()
-        _in_active_neg = (
-            _neg is not None
-            and int(_neg.get("rounds", 0)) > 0
-            and not _neg.get("awaiting_invoice_confirmation", False)
+        # ── Step 2.5: Parallelize History, Message Save, State Load & MCP Taxonomy ────
+        from pipeline.setup import get_history as _gh, save_message as _sm
+        from db.session_store import get_dialogue_state as _gds
+        _t_prep = time.monotonic()
+        session_history, _, incoming._cached_state, taxonomy_hints = await asyncio.gather(
+            _gh(incoming),
+            _sm(incoming),
+            _gds(incoming.tenant_id, incoming.session_id),
+            get_taxonomy_hints_mcp(incoming.text),
         )
-        if _in_active_neg:
-            class _BypassResult:
-                intent           = "WORKFLOW_ACTION"
-                confidence_score = 0.97
-                raw_text         = incoming.text
-            result = _BypassResult()
-            print(f"[INTENT ROUTER] '{incoming.text[:55]}' => WORKFLOW_ACTION (0.97) [NEG BYPASS]")
-        else:
-            result = await classify_intent(
-                customer_message = incoming.text,
-                session_history  = session_history,
-                incoming         = incoming,
-            )
-        print(f"[TIMING] classify_intent: {time.monotonic() - _t_intent:.2f}s")
-        print(f"[INTENT]   {result.intent}  confidence={result.confidence_score}")
+        print(f"[TIMING] Parallel setup (history/save/state/taxonomy): {time.monotonic() - _t_prep:.2f}s")
 
-        # ── Step 4: Update intent in DB ──────────────────────────────────────
-        await update_intent(incoming.message_id, result.intent, result.confidence_score, incoming.tenant_id)
+        # ── Step 3: Update Dialogue State ───────────────────────
+        _t_intent = time.monotonic()
+        state = await update_dialogue_state(
+            customer_message = incoming.text,
+            previous_state   = incoming._cached_state,
+            session_history  = session_history,
+            taxonomy_hints   = taxonomy_hints,
+            incoming         = incoming,
+        )
+        print(f"[TIMING] update_dialogue_state: {time.monotonic() - _t_intent:.2f}s")
+        print(f"[STATE]   {state.intent} | {state.product_name}")
+
+        from db.session_store import save_dialogue_state as _sds
+        asyncio.create_task(_sds(incoming.tenant_id, incoming.session_id, state.__dict__))
+        asyncio.create_task(update_intent(incoming.message_id, state.intent, 1.0, incoming.tenant_id))
 
         # ── Step 5: Dispatch to handler ──────────────────────────────────────
-        reply = await dispatch(incoming, result, session_history)
+        reply = await dispatch(incoming, state, session_history)
 
         # ── Step 6: Send reply ───────────────────────────────────────────────
         sent_wamid = await _send_reply_chunked(incoming, reply)
@@ -295,10 +287,10 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         return {
             "replies": incoming.captured_replies,
             "debug": {
-                "intent":     result.intent,
-                "confidence": result.confidence_score,
+                "intent":     state.intent,
+                "confidence": 1.0,
                 "latency":    latency,
-                "route":      _get_route(result),
+                "route":      _get_route(state),
                 "tenant_id":  incoming.tenant_id,
             },
         }
@@ -367,15 +359,13 @@ async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional
     return last_wamid
 
 
-def _get_route(result) -> str:
+def _get_route(state) -> str:
     """Returns a human-readable route label for debug output."""
-    if result.intent == "GREETING":
+    if state.intent == "GREETING":
         return "Greeting Handler"
-    if result.intent == "HUMAN_ESCALATION":
+    if state.intent == "HUMAN_ESCALATION":
         return "Human Handoff Escalation"
-    if result.intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or result.confidence_score < 0.50:
-        return "GraphRAG / Catalog"
-    return "Unknown Intent Handler"
+    return f"GraphRAG / Catalog ({state.intent})"
 
 
 def _empty_result() -> dict:

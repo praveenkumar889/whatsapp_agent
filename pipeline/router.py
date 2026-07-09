@@ -12,7 +12,7 @@ import asyncio
 from typing import Optional
 
 
-async def dispatch(incoming, result, session_history: list) -> str:
+async def dispatch(incoming, state, session_history: list) -> str:
     """
     Main routing function — returns reply string.
     All imports are local to avoid circular import chain.
@@ -26,7 +26,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
         incoming._cached_neg_state = await _gns(incoming.tenant_id, incoming.session_id)
 
     # Guard 1: Negotiation awaiting confirmation
-    reply = await _neg_guard(incoming, result, session_history)
+    reply = await _neg_guard(incoming, state, session_history)
     if reply:
         return reply
 
@@ -36,8 +36,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
         return reply
 
     # Main intent routing
-    intent     = result.intent
-    confidence = result.confidence_score
+    intent     = state.intent
 
     if intent == "GREETING":
         from ai.handlers import handle_greeting
@@ -47,12 +46,9 @@ async def dispatch(incoming, result, session_history: list) -> str:
         from ai.handlers import handle_escalation
         return await handle_escalation(incoming)
 
-    if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < 0.50:
-        from ai.graphrag_handler import call_graphrag_api
-        return await call_graphrag_api(incoming, session_history)
-
-    from ai.handlers import handle_unknown
-    return await handle_unknown(incoming)
+    # All other intents dynamically defined in the tenant's prompt route to GraphRAG / Catalog
+    from ai.graphrag_handler import call_graphrag_api
+    return await call_graphrag_api(incoming, session_history, state)
 
 
 def _load_fast_confirm_prompt(incoming) -> str:
@@ -61,7 +57,7 @@ def _load_fast_confirm_prompt(incoming) -> str:
     return get_prompt(incoming, "fast_order_confirm_check_prompt")
 
 
-async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
+async def _neg_guard(incoming, state, session_history: list) -> Optional[str]:
     """
     Guards the negotiation state machine.
 
@@ -81,8 +77,8 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
     from db.session_store import get_negotiation_state, save_negotiation_state, get_tenant_offers
     from ai.invoice_handler import _is_invoice_confirmation_request
 
-    pre_neg_state = getattr(incoming, '_cached_neg_state', None) or         await get_negotiation_state(incoming.tenant_id, incoming.session_id)
-    if pre_neg_state is None or result.intent == "HUMAN_ESCALATION":
+    pre_neg_state = getattr(incoming, '_cached_neg_state', None) or await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+    if pre_neg_state is None or state.intent == "HUMAN_ESCALATION":
         return None
 
     # ── Phase 2: counter_offer_presented — bot has shown its best price ────────

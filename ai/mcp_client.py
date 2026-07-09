@@ -21,7 +21,8 @@ async def query_mcp_catalog(
     tenant_id: Optional[str] = None,
     limit: int = 15,
     server_url: Optional[str] = None,
-    intent_data: Optional[Dict[str, Any]] = None
+    intent_data: Optional[Dict[str, Any]] = None,
+    state: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
     Calls the `search_catalog` tool on the FastMCP server.
@@ -48,6 +49,8 @@ async def query_mcp_catalog(
                 tool_args["tenant_id"] = tenant_id
             if intent_data:
                 tool_args["intent_data"] = intent_data
+            if state:
+                tool_args["dialogue_state"] = state
             res = await client.call_tool("search_catalog", tool_args)
             # res.data contains the tool return value (dict) when calling via FastMCP
             data = getattr(res, "data", None)
@@ -121,16 +124,19 @@ async def get_taxonomy_context_mcp(
             res = await client.call_tool("get_taxonomy_context", {"query": query, "threshold": threshold})
             data = getattr(res, "data", None)
             if data is not None and isinstance(data, dict):
-                return data.get("taxonomy", {})
+                return data.get("taxonomy", data.get("hints", {}))
             content = getattr(res, "content", None)
             if isinstance(content, list) and len(content) > 0:
                 for item in content:
                     if hasattr(item, "text") and item.text:
                         try:
-                            return json.loads(item.text).get("taxonomy", {})
+                            parsed = json.loads(item.text)
+                            return parsed.get("taxonomy", parsed.get("hints", {}))
                         except Exception:
                             pass
-            return None
+            return {}
     except Exception as e:
         print(f"[MCP-CLIENT] Failed to call 'get_taxonomy_context': {e}")
-        return None
+        return {}
+
+get_taxonomy_hints_mcp = get_taxonomy_context_mcp

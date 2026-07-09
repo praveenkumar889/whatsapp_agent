@@ -83,9 +83,11 @@ async def setup_pipeline(incoming: IncomingMessage) -> tuple:
         print(f"[PIPELINE] Already processing {incoming.session_id} — skipping")
         return False, None
 
-    session_history = await _get_history(incoming)
-    await save_message(incoming)
-    return True, session_history
+    return True, None
+
+
+async def get_history(incoming: IncomingMessage) -> list:
+    return await _get_history(incoming)
 
 
 def _apply_tenant(incoming: IncomingMessage, info: dict) -> None:

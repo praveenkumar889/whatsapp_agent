@@ -58,10 +58,11 @@ from ai.timing import log_timing
 async def classify_user_intent_client_side(
     query: str,
     history_context: str = "",
-    taxonomy_hints: Optional[Dict[str, Any]] = None
+    taxonomy_hints: Optional[Dict[str, Any]] = None,
+    incoming: Optional[Any] = None
 ) -> Dict[str, Any]:
     """
-    Classify user query on the WhatsApp agent side to skip server-side classification.
+    Classify user query on the WhatsApp agent side using tenant-specific prompt from Supabase to skip server-side classification.
     """
     def _call_llm():
         prompt = f"User Query: {query}"
@@ -71,8 +72,18 @@ async def classify_user_intent_client_side(
         if taxonomy_hints:
             tax_str = f"\n\nCandidate Database Taxonomy Tags:\n{json.dumps(taxonomy_hints)}"
         
+        system_prompt = SYSTEM_PROMPT
+        if incoming:
+            try:
+                from db.prompt_store import get_prompt
+                tenant_prompt = get_prompt(incoming, "intent_system_prompt", biz_name=getattr(incoming, "biz_name", "Inventaa LED Lights"))
+                if tenant_prompt:
+                    system_prompt = f"{SYSTEM_PROMPT}\n\n=== TENANT SPECIFIC INTENT CLASSIFICATION RULES ===\n{tenant_prompt}"
+            except Exception as e:
+                logger.warning(f"[INTENT-CLIENT] Could not load tenant intent prompt from Supabase: {e}")
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT + tax_str},
+            {"role": "system", "content": system_prompt + tax_str},
             {"role": "user", "content": prompt}
         ]
         res = _client.chat.completions.create(

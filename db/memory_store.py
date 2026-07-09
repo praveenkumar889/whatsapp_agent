@@ -54,13 +54,17 @@ def _search_and_filter(
     Fetches limit*3 to ensure enough results after tenant filtering.
     """
     try:
-        result = client.search(
+        res = client.search(
             query   = query,
             filters = {"user_id": session_id},
             limit   = limit * 3,
         )
-        if isinstance(result, dict):
-            result = result.get("results", [])
+        if isinstance(res, dict):
+            result = res.get("results") or res.get("memories") or res.get("data") or []
+        elif isinstance(res, list):
+            result = res
+        else:
+            result = [res] if res else []
         if not isinstance(result, list):
             return []
         _raw_count = len(result)
@@ -69,12 +73,6 @@ def _search_and_filter(
             r for r in result
             if _matches_tenant(r.get("memory", ""), tenant_id, session_id)
         ]
-        # DIAGNOSTIC: raw vs tenant-filtered count + per-type breakdown, in one
-        # line, so a still-0 retrieval can be pinned to a specific cause:
-        #   raw=0                      → nothing indexed yet / wrong user_id / genuine miss
-        #   raw>0, tenant_filtered=0   → write path missing the tenant prefix somewhere
-        #   raw>0, tenant_filtered>0   → working; check "types:" breakdown for what came back
-        # Remove once Mem0 retrieval is confirmed stable end-to-end.
         _type_counts: dict = {}
         for r in filtered:
             _t = (r.get("metadata") or {}).get("type", "unknown")
@@ -82,7 +80,6 @@ def _search_and_filter(
         _types_str = " ".join(f"{k}={v}" for k, v in _type_counts.items()) or "none"
         print(f"[MEM0 SEARCH] query=\"{query[:40]}\" raw={_raw_count} "
               f"tenant_filtered={len(filtered)} types: {_types_str}")
-        # Strip prefix from memory text so callers get clean content
         for r in filtered:
             if isinstance(r, dict) and "memory" in r:
                 r["memory"] = _strip_tenant_prefix(r["memory"])
@@ -148,6 +145,12 @@ async def add_conversation_turn(
         print(f"[MEM0] add_conversation_turn failed: {e}")
 
 
+def _extract_memory_text(r) -> str:
+    if isinstance(r, dict):
+        return r.get("memory", "")
+    return getattr(r, "memory", str(r)) if hasattr(r, "memory") else str(r)
+
+
 async def get_relevant_context(
     tenant_id: str,
     session_id: str,
@@ -165,11 +168,6 @@ async def get_relevant_context(
         # Use _search_and_filter for multi-tenant isolation via tenant prefix
         results = _search_and_filter(client, query, tenant_id, session_id, limit)
 
-        # FIX: Mem0 SDK returns different shapes depending on version:
-        #   - dict with "results" key: {"results": [...], "relations": [...]}
-        #   - list of dicts: [{"memory": "...", "id": "..."}]
-        #   - list of strings: ["memory text 1", "memory text 2"]
-        # The original bug: results.get("results") called on a list → AttributeError
         if not isinstance(results, list):
             results = []
 

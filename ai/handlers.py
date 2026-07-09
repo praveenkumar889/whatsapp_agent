@@ -15,7 +15,7 @@ from typing import List, Optional, Any
 from openai import AzureOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 from config import AZURE_AI_ENDPOINT, AZURE_AI_API_KEY, AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION
-from models.schemas import IntentResult, EntityResult, OrderItem, IncomingMessage
+from models.schemas import IntentResult, DialogueState, EntityResult, OrderItem, IncomingMessage
 from db.prompt_store import get_prompt
 
 _client = AzureOpenAI(
@@ -33,28 +33,48 @@ DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION",
 # INTENT ROUTER
 # ══════════════════════════════════════════════════════════════════════════════
 
-async def classify_intent(
+BASE_INTENT_CLASSIFIER_PROMPT = """You are an expert conversational Intent Classifier and Dialogue State Tracker for WhatsApp AI agents.
+Your task is to analyze the customer's message and classify their intent accurately based on the tenant's specific rules and business domain attached below.
+Always reply ONLY with a valid JSON object matching the required schema. Do not include explanation or markdown formatting."""
+
+async def update_dialogue_state(
     customer_message: str,
-    session_history:  Optional[List[ChatCompletionMessageParam]] = None,
+    previous_state: Optional[dict] = None,
+    session_history: Optional[List[dict]] = None,
+    taxonomy_hints: Optional[dict] = None,
     incoming: Optional[IncomingMessage] = None,
-) -> IntentResult:
+) -> DialogueState:
     """
-    Classifies intent using tenant's intent_system_prompt from DB.
+    Updates dialogue state by attaching the tenant's intent_system_prompt from DB dynamically to the base classifier prompt.
     Raises RuntimeError if prompt not set in DB.
     """
-    system_prompt  = get_prompt(incoming, "intent_system_prompt")
-    valid_intents  = set(incoming.valid_intents) if incoming and incoming.valid_intents else DEFAULT_VALID_INTENTS
+    tenant_prompt = get_prompt(incoming, "intent_system_prompt")
+    system_prompt = f"{BASE_INTENT_CLASSIFIER_PROMPT}\n\n=== TENANT SPECIFIC INTENT & ROUTING RULES ===\n{tenant_prompt}"
     raw = ""
     try:
-        messages: List[ChatCompletionMessageParam] = [{"role": "system", "content": system_prompt}]
+        if taxonomy_hints:
+            taxonomy_section = "\n\nCANDIDATE TAXONOMY HINTS (Select any category/collection below that matches the user's explicit request. Do NOT blindly copy unrelated candidate categories):"
+            if taxonomy_hints.get("category"):
+                taxonomy_section += f"\n  Matched Categories: {taxonomy_hints['category']}"
+            if taxonomy_hints.get("use_case"):
+                taxonomy_section += f"\n  Matched Use Cases: {taxonomy_hints['use_case']}"
+            if taxonomy_hints.get("feature"):
+                taxonomy_section += f"\n  Matched Features: {taxonomy_hints['feature']}"
+            system_prompt += taxonomy_section
+
+        messages = [{"role": "system", "content": system_prompt}]
+        if previous_state:
+            messages.append({"role": "system", "content": f"Previous State: {json.dumps(previous_state)}"})
         if session_history:
             messages.extend(session_history)
         messages.append({"role": "user", "content": customer_message})
 
+        print(f"[STATE TRACKER DEBUG] LLM Input Messages: {json.dumps(messages, indent=2)}")
+
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=60, temperature=0,
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=250, temperature=0,
                 messages=messages,
             )
         )
@@ -62,26 +82,40 @@ async def classify_intent(
         if not content:
             raise ValueError("Empty or None response content")
         raw    = content.strip()
-        parsed = json.loads(raw)
+        if raw.startswith("```json"): raw = raw[7:]
+        if raw.endswith("```"): raw = raw[:-3]
+        parsed = json.loads(raw.strip())
 
-        intent = str(parsed.get("intent", "UNKNOWN")).upper()
-        conf   = float(parsed.get("confidence_score", 0.0))
-        conf   = max(0.0, min(1.0, conf))
+        state = DialogueState(
+            followup=str(parsed.get("followup", "no")).lower(),
+            negotiation_status=str(parsed.get("negotation", parsed.get("negotiation", parsed.get("negotiation_status", "none")))).lower(),
+            category=str(parsed.get("category", parsed.get("cateorgy", ""))),
+            product_name=str(parsed.get("product_name", parsed.get("product name", ""))),
+            product_skus=parsed.get("product_skus", parsed.get("product skus", [])),
+            intent=str(parsed.get("intent", "UNKNOWN")).upper(),
+        )
+        if isinstance(state.product_skus, str):
+            state.product_skus = [state.product_skus]
 
-        if intent not in valid_intents or conf < 0.50:
-            intent, conf = "UNKNOWN", 0.0
-
-        print(f"[INTENT ROUTER] '{customer_message[:60]}' => {intent} ({conf:.2f})")
-        return IntentResult(intent=intent, confidence_score=conf, raw_text=customer_message)
+        print(f"[STATE TRACKER] Raw LLM Output: {raw}")
+        print(f"[STATE TRACKER] Updated state: {state}")
+        return state
 
     except json.JSONDecodeError as e:
-        print(f"[INTENT ROUTER] JSON parse error: {e} | raw='{raw}'")
+        print(f"[STATE TRACKER] JSON parse error: {e} | raw='{raw}'")
     except RuntimeError:
         raise  # prompt missing — re-raise so it's visible
     except Exception as e:
-        print(f"[INTENT ROUTER ERROR] {e}")
+        print(f"[STATE TRACKER ERROR] {e}")
 
-    return IntentResult(intent="UNKNOWN", confidence_score=0.0, raw_text=customer_message)
+    return DialogueState(
+        followup="no",
+        negotiation_status="none",
+        category="",
+        product_name="",
+        product_skus=[],
+        intent="UNKNOWN",
+    )
 
 
 # ══════════════════════════════════════════════════════════════════════════════

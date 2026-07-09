@@ -354,7 +354,7 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
 from ai.timing import log_timing
 
 @log_timing("GraphRAGHandler.call_graphrag_api")
-async def call_graphrag_api(incoming, session_history: Optional[list] = None, graphrag_url: Optional[str] = None) -> str:
+async def call_graphrag_api(incoming, session_history: Optional[list] = None, state = None, graphrag_url: Optional[str] = None) -> str:
     """
     Calls the Hybrid RAG Agent API for ALL product-related queries.
 
@@ -445,6 +445,7 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             "direction":           "inbound",
             "invoice_number":      None,
             "payment_reference":   None,
+            "dialogue_state":      state.__dict__ if state else None,
         }
 
         # Resolve effective GraphRAG URL:
@@ -458,45 +459,37 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
             print(f"[GRAPHRAG-MCP] Routing via MCP Server at {mcp_url}")
             from ai.mcp_client import query_mcp_catalog, get_taxonomy_context_mcp
             
-            if _client_intent_data is None:
-                existing_state = await get_dialog_state(incoming.tenant_id, incoming.session_id) or {}
-                print(f"\n[DEBUG-DST] === DIALOG STATE TRACKER START ===")
-                print(f"[DEBUG-DST] Session ID    : {incoming.session_id}")
-                print(f"[DEBUG-DST] Tenant ID     : {incoming.tenant_id}")
-                print(f"[DEBUG-DST] Previous State: {json.dumps(existing_state, indent=2)}")
-                
-                history_text = "\n".join([f"{m.get('sender', 'user')}: {m.get('text', '')}" for m in (session_history or [])[-4:] if isinstance(m, dict)])
-                if existing_state:
-                    history_text = f"Current Dialog State: {json.dumps(existing_state)}\n" + history_text
-                taxonomy_hints = await get_taxonomy_context_mcp(graphrag_text, server_url=mcp_url)
-                print(f"[DEBUG-DST] Taxonomy Hints: {json.dumps(taxonomy_hints)}")
-                
+            if _client_intent_data is None and state and getattr(state, "intent", None):
+                intent_val = str(state.intent).lower()
+                cat_kws = [state.category] if getattr(state, "category", "") else []
+                if not cat_kws and len(graphrag_text.split()) <= 6:
+                    cat_kws = [graphrag_text.strip()]
+                intent_to_use = "browse_category" if cat_kws and not getattr(state, "product_name", "") else (intent_val if intent_val in ("browse_category", "find_product", "get_product_info", "check_policy", "get_advice") else "find_product")
+                _client_intent_data = {
+                    "intent": intent_to_use,
+                    "category_keywords": cat_kws,
+                    "feature_keywords": [],
+                    "product_name": state.product_name if getattr(state, "product_name", "") else None,
+                    "filters": {"category": None if intent_to_use == "browse_category" else (cat_kws[0] if cat_kws else None)},
+                    "preferences": {}
+                }
+                print(f"[GRAPHRAG-CLIENT] Using dynamic intent data from tenant state: {json.dumps(_client_intent_data)}")
+            elif _client_intent_data is None:
                 from ai.intent_classifier import classify_user_intent_client_side
                 _client_intent_data = await classify_user_intent_client_side(
                     query=graphrag_text,
-                    history_context=history_text,
-                    taxonomy_hints=taxonomy_hints
+                    taxonomy_hints=getattr(state, "taxonomy_hints", None) if state else None,
+                    incoming=incoming
                 )
-                print(f"[DEBUG-DST] Extracted Client Intent -> {json.dumps(_client_intent_data, indent=2)}")
-                
-                # Update Dialog State in workflow_sessions table
-                updated_state = {
-                    "follow_up": _client_intent_data.get("intent") in ["get_product_info", "check_policy"],
-                    "negotiation": existing_state.get("negotiation", False),
-                    "product": _client_intent_data.get("product_name") or existing_state.get("product"),
-                    "category": (_client_intent_data.get("category_keywords") or [existing_state.get("category", None)])[0],
-                    "tenant_id": incoming.tenant_id
-                }
-                await save_dialog_state(incoming.tenant_id, incoming.session_id, updated_state)
-                print(f"[DEBUG-DST] Transitioned State -> {json.dumps(updated_state, indent=2)}")
-                print(f"[DEBUG-DST] === DIALOG STATE TRACKER END ===\n")
+                print(f"[GRAPHRAG-CLIENT] Pre-classified intent data via Supabase prompt: {json.dumps(_client_intent_data)}")
 
             mcp_res = await query_mcp_catalog(
                 query=graphrag_text,
                 session_id=incoming.session_id,
                 tenant_id=incoming.tenant_id,
                 server_url=mcp_url,
-                intent_data=_client_intent_data
+                intent_data=_client_intent_data,
+                state=state.__dict__ if state and hasattr(state, "__dict__") else (state if isinstance(state, dict) else None)
             )
             if mcp_res and mcp_res.get("status") == "success":
                 products = mcp_res.get("products", [])

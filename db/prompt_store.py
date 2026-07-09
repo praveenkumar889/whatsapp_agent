@@ -110,6 +110,23 @@ class _PromptLoader:
     def _from_db(tenant_id: str, name: str, lang: str) -> Optional[tuple]:
         """Returns (prompt_text, version) or None."""
         try:
+            # 1. First check TENANT_SUPABASE_URL tenants table for tenant-specific prompt override
+            try:
+                from db.session_store import _get_tenant_client
+                res_tenant = (
+                    _get_tenant_client()
+                    .table("tenants")
+                    .select(name)
+                    .eq("tenant_id", tenant_id)
+                    .limit(1)
+                    .execute()
+                )
+                if res_tenant.data and res_tenant.data[0].get(name):
+                    return res_tenant.data[0][name], 1
+            except Exception as te:
+                print(f"[PROMPT] Tenant DB read failed for '{name}': {te}")
+
+            # 2. Fallback check in prompt_templates table
             from db.session_store import _get_client
             result = (
                 _get_client()
@@ -127,6 +144,7 @@ class _PromptLoader:
                 from typing import cast
                 row = cast(dict, result.data[0])
                 return row["prompt_text"], int(row.get("version", 1))
+
             return None
         except Exception as e:
             print(f"[PROMPT] DB read failed for '{name}': {e}")
@@ -252,6 +270,7 @@ _load_from_db = _PromptLoader._from_db
 
 PROMPT_KEYS: dict = {
     # Old prompts — tenants table columns exist
+    "graphrag_intent_prompt":      "graphrag_intent_prompt",
     "intent_system_prompt":        "intent_system_prompt",
     "greeting_system_prompt":      "greeting_system_prompt",
     "entity_system_prompt":        "entity_system_prompt",

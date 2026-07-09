@@ -338,6 +338,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         str  → LLM answer using product data from cache
         None → not a product follow-up, let call_graphrag_api() handle it
     """
+    # Fast skip: If state tracker already identified BROWSE_CATEGORY or NEW_SEARCH (and not a list selection number), skip follow-up parser LLM calls
+    _ds = getattr(incoming, "dialogue_state", None)
+    _txt_clean = incoming.text.strip()
+    _is_bare_num = bool(re.match(r'^[1-9]\d*$', _txt_clean))
+    if _ds and not _is_bare_num:
+        if getattr(_ds, "intent", "") == "BROWSE_CATEGORY" or getattr(_ds, "operation", "") == "NEW_SEARCH":
+            print(f"[FOLLOW-UP] Fast skip — BROWSE_CATEGORY / NEW_SEARCH detected ({getattr(_ds, 'intent', '')} | {getattr(_ds, 'operation', '')})")
+            return None
+
     neg_state = None
     selection = await get_graphrag_product_selection(incoming.tenant_id, incoming.session_id)
     if not selection:
@@ -841,6 +850,19 @@ async def _try_resolve_product_followup(incoming, session_history: list):
 
         return None
 
+    # Guard against new searches where the customer asks for a product name not in the current selection
+    # e.g., "show athena lights" when selection only has Oxana Revolve, Juno, etc.
+    _req_prod = (parsed.get("product_name") or parsed.get("selected_product_name") or "").strip()
+    if _req_prod and selection:
+        _in_selection = any(
+            _req_prod.lower() in (p.get("product_name") or p.get("name") or "").lower() or
+            (p.get("product_name") or p.get("name") or "").lower() in _req_prod.lower()
+            for p in selection
+        )
+        if not _in_selection:
+            print(f"[FOLLOW-UP] Requested product '{_req_prod}' not found in current selection list — routing to GraphRAG")
+            return None
+
     # NOTE: numeric list-index selection (picking "57" to mean item #57)
     # has been REMOVED entirely. It was unreliable on long product lists
     # (90+ items) and collided with quantity parsing ("57" meaning 57 units).
@@ -1202,16 +1224,27 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 print(f"[FOLLOW-UP] Name match via LLM parser: '{tgt_name}' -> {pname}")
                 break
 
+    # Guard: If no product was explicitly matched yet and the message is an explicit search query, route to GraphRAG
+    if not matched_product:
+        _txt_clean = incoming.text.strip().lower()
+        _is_explicit_search = any(_txt_clean.startswith(prefix) for prefix in ("show ", "find ", "search ", "looking for ", "do you have "))
+        _ds = getattr(incoming, "dialogue_state", None)
+        _is_ds_new_search = _ds and getattr(_ds, "operation", "") == "NEW_SEARCH"
+        if _is_explicit_search or _is_ds_new_search:
+            print(f"[FOLLOW-UP] Explicit new search query detected ('{incoming.text}') — routing to GraphRAG")
+            return None
+
     # Fallback to word-score name matching
     if not matched_product:
         msg_lower = incoming.text.lower().strip()
         msg_words = set(re.findall(r'\b[a-z]+\b', msg_lower))
+        _domain_stopwords = {"lights", "light", "lamp", "lamps", "led", "fixture", "fixtures", "surface", "outdoor", "indoor", "series", "model", "with", "from", "watt", "watts", "show", "find", "have", "some", "more", "about", "details", "price"}
+        msg_words_clean = msg_words - _domain_stopwords
         best_score = 0
         for p in selection:
             pname  = (p.get("product_name") or p.get("name") or "").lower()
-            pwords = set(re.findall(r'\b[a-z]+\b', pname))
-            # Only count words >3 chars — skip "led", "12w", "the", "and"
-            score = sum(1 for w in pwords if len(w) > 3 and w in msg_words)
+            pwords = set(re.findall(r'\b[a-z]+\b', pname)) - _domain_stopwords
+            score = sum(1 for w in pwords if len(w) > 3 and w in msg_words_clean)
             if score > best_score:
                 best_score      = score
                 matched_product = p
@@ -1340,6 +1373,16 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                         break
         except Exception as _wse:
             print(f"[FOLLOW-UP] Workflow state lookup failed: {_wse}")
+
+    # Guard: If no product was explicitly matched yet and the message is an explicit search query, route to GraphRAG
+    if not matched_product:
+        _txt_clean = incoming.text.strip().lower()
+        _is_explicit_search = any(_txt_clean.startswith(prefix) for prefix in ("show ", "find ", "search ", "looking for ", "do you have "))
+        _ds = getattr(incoming, "dialogue_state", None)
+        _is_ds_new_search = _ds and getattr(_ds, "operation", "") == "NEW_SEARCH"
+        if _is_explicit_search or _is_ds_new_search:
+            print(f"[FOLLOW-UP] Explicit new search query detected ('{incoming.text}') — routing to GraphRAG")
+            return None
 
     # ── Case 3: Pure follow-up — scan bot history (with strict matching) ────
     # Bug fix: require at least 2 words to match, not just "lexa" which
