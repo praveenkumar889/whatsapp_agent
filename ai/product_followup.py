@@ -530,19 +530,26 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     # Negotiation state above is already saved UNCHANGED, so
                     # the customer can resume negotiating afterward.
                     if result.get("defer_intent") is not None:
-                        _defer_intent = result["defer_intent"].intent
+                        defer_res = result["defer_intent"]
+                        _defer_intent = defer_res.intent
                         incoming._deferred_intent = _defer_intent  # so main.py's debug output reflects the real routing decision
+                        
+                        # Update incoming._routing with the real classifier routing
+                        if hasattr(defer_res, "routing") and defer_res.routing:
+                            incoming._routing = defer_res.routing
+                            
                         print(f"[FOLLOW-UP] Negotiator deferred (intent={_defer_intent}) — routing directly")
+                        routing = getattr(defer_res, "routing", None)
+                        req_field = getattr(routing, "requested_knowledge_field", "none") or "none"
+                        if routing and routing.needs_customer_history and req_field.lower() == "none":
+                            from ai.customer_history_handler import handle_customer_history_query
+                            return await handle_customer_history_query(incoming, session_history)
                         if _defer_intent == "GREETING":
                             from ai.handlers import handle_greeting
                             return await handle_greeting(incoming)
                         elif _defer_intent == "HUMAN_ESCALATION":
                             from ai.handlers import handle_escalation
                             return await handle_escalation(incoming)
-                        # Fall through to normal product_followup handling below
-                        # for any other deferred intent (shouldn't normally
-                        # reach here — negotiator.py only defers on GREETING/
-                        # HUMAN_ESCALATION today — but fail safe rather than crash).
 
                     if result["order_ready"] and result["agreed_price"]:
                         # FIX BUGS 1,2,3,4: order_ready=True means negotiation is concluded

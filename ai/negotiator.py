@@ -467,33 +467,47 @@ async def extract_negotiation_intent(
 
 # ── Reply generators — all prompts from DB ────────────────────────────────────
 
-async def _reply_no_discount(incoming, product_name, price_num, regular_price, discount_pct, quantity, min_units=None) -> str:
+async def _reply_no_discount(incoming, product_name, price_num, regular_price, discount_pct, quantity, min_units=None, tiers: Optional[list] = None) -> str:
     if min_units is None:
         min_units = getattr(incoming, "neg_min_units", 5) or 5
-    prompt = get_prompt(
-        incoming, "neg_no_discount_prompt",
-        sender_name=incoming.sender_name, biz_name=incoming.biz_name,
-        product_name=product_name, quantity=quantity,
-        price_num=f"{price_num:,.0f}", regular_price=f"{regular_price:,.0f}",
-        discount_pct=discount_pct, min_units=min_units,
+
+    from ai.pricing import PricingResult
+    pr = PricingResult.build(
+        regular_unit_price=regular_price,
+        quantity=quantity,
+        gst_rate=getattr(incoming, "gst_rate", 0.18),
+        store_disc_pct=0,
+        negotiated_unit_price=price_num,
+        negotiation_rounds=0,
+        tiers=tiers or [],
     )
-    try:
-        r = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0.4,
-                messages=[{"role": "system", "content": prompt},
-                           {"role": "user", "content": "Give the no-discount response."}],
+    base_reply = pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
+
+    # Append "order N more to unlock X% off" upsell hint
+    if tiers:
+        order_value = price_num * quantity
+        next_tier = get_next_tier(order_value, tiers)
+        if next_tier:
+            next_min_val, next_disc_pct = next_tier
+            value_gap    = round(next_min_val - order_value, 0)
+            units_needed = max(1, int(value_gap / price_num) + 1)
+            upsell_line = get_prompt(
+                incoming, "neg_upsell_hint_prompt",
+                value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
+                next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct
             )
-        )
-        content = r.choices[0].message.content
-        if not content:
-            raise ValueError("Empty response from AI")
-        return content.strip()
-    except RuntimeError: raise
-    except Exception as e:
-        print(f"[NEGOTIATOR] _reply_no_discount failed: {e}")
-        total = round(price_num * quantity, 2)
-        return get_prompt(incoming, "neg_no_discount_fallback", sender_name=incoming.sender_name, price_num=f"{price_num:,.0f}", total=f"{total:,.0f}", min_units=min_units)
+            # Insert upsell hint before the footer
+            try:
+                footer_text = get_prompt(incoming, "pricing_order_summary_footer_prompt")
+            except Exception:
+                footer_text = "Reply *Confirm* to place your order and receive your invoice! 🎉"
+
+            if upsell_line and footer_text in base_reply:
+                base_reply = base_reply.replace(footer_text, upsell_line + "\n\n" + footer_text)
+            elif upsell_line:
+                base_reply += "\n\n" + upsell_line
+
+    return base_reply
 
 
 async def build_product_summary(incoming, product_data: Optional[dict]) -> str:
@@ -556,38 +570,21 @@ async def build_product_summary(incoming, product_data: Optional[dict]) -> str:
 
 
 async def _reply_first_offer(incoming, product_name, price_num, regular_price, graphrag_discount_pct, offer, tiers: Optional[list] = None) -> str:
-    prompt = get_prompt(
-        incoming, "neg_first_offer_prompt",
-        sender_name=incoming.sender_name, biz_name=incoming.biz_name,
-        product_name=product_name, regular_price=f"{regular_price:,.0f}",
-        price_num=f"{price_num:,.0f}", graphrag_discount_pct=graphrag_discount_pct,
-        quantity=offer["quantity"], offer_price=f"{offer['offer_price']:,.0f}",
-        offer_total=f"{offer['total_price']:,.0f}",
-    )
-    base_reply = None
-    try:
-        r = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=200, temperature=0.4,
-                messages=[{"role": "system", "content": prompt},
-                           {"role": "user", "content": "Present the offer."}],
-            )
-        )
-        content = r.choices[0].message.content
-        base_reply = content.strip() if content else ""
-        if not base_reply:
-            raise ValueError("Empty response from AI")
-    except RuntimeError: raise
-    except Exception as e:
-        print(f"[NEGOTIATOR] _reply_first_offer failed: {e}")
-        base_reply = get_prompt(incoming, "neg_first_offer_fallback", sender_name=incoming.sender_name, quantity=offer["quantity"], product_name=product_name, offer_price=f"{offer['offer_price']:,.0f}", offer_total=f"{offer['total_price']:,.0f}")
+    from ai.pricing import PricingResult
 
-    # ── FIX: Append "order N more to unlock X% off" upsell hint ───────────────
-    # This was previously only present on the FIRST-time order entry path in
-    # product_followup.py (auto_offer_upsell). Negotiation-driven replies
-    # (this function, and the qty-change path below) never showed it, so the
-    # recommendation disappeared as soon as the customer entered the
-    # negotiation flow instead of the plain-order flow.
+    pr = PricingResult.build(
+        regular_unit_price=regular_price,
+        quantity=offer["quantity"],
+        gst_rate=getattr(incoming, "gst_rate", 0.18),
+        store_disc_pct=offer.get("current_tier_disc", 0),
+        negotiated_unit_price=offer["offer_price"],
+        negotiation_rounds=0, # Initial offer presentation
+        tiers=tiers or [],
+    )
+    base_reply = pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
+
+    # Append "order N more to unlock X% off" upsell hint or max discount unlocked
+    upsell_line = None
     if tiers:
         next_tier = get_next_tier(offer.get("order_value", 0), tiers)
         if next_tier:
@@ -599,11 +596,20 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
                 value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
                 next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct
             )
-            base_reply += "\n\n" + upsell_line
         elif offer.get("current_tier_disc", 0) > 0:
             max_disc = max(d for _, d in tiers)
-            max_disc_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc, qualifier="")
-            base_reply += "\n\n" + max_disc_line
+            upsell_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc, qualifier="")
+
+    if upsell_line:
+        try:
+            footer_text = get_prompt(incoming, "pricing_order_summary_footer_prompt")
+        except Exception:
+            footer_text = "Reply *Confirm* to place your order and receive your invoice! 🎉"
+
+        if footer_text in base_reply:
+            base_reply = base_reply.replace(footer_text, upsell_line + "\n\n" + footer_text)
+        else:
+            base_reply += "\n\n" + upsell_line
 
     return base_reply
 
@@ -714,7 +720,7 @@ async def handle_negotiation(
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
         offer = calculate_offer(price_num, quantity, tiers)
         if not offer["has_discount"]:
-            reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity)
+            reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity, tiers=tiers)
             return {"reply": reply, "state": _state(awaiting_quantity=False, quantity=quantity, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": price_num, "quantity": quantity}
         reply = await _reply_first_offer(incoming, product_name, price_num, regular_price, graphrag_discount_pct, offer, tiers)
@@ -736,7 +742,7 @@ async def handle_negotiation(
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
         offer = calculate_offer(price_num, quantity, tiers)
         if not offer["has_discount"]:
-            reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity)
+            reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity, tiers=tiers)
             return {"reply": reply, "state": _state(quantity=quantity, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": price_num, "quantity": quantity}
         reply = await _reply_first_offer(incoming, product_name, price_num, regular_price, graphrag_discount_pct, offer, tiers)
@@ -893,12 +899,26 @@ async def handle_negotiation(
             print(f"[NEGOTIATOR] Deferral classify_intent failed (non-critical): {e}")
             _defer_result = None
 
-        if _defer_result and _defer_result.intent in ("GREETING", "HUMAN_ESCALATION", "FAQ_KNOWLEDGE"):
-            print(f"[NEGOTIATOR] Message not negotiation-related (intent={_defer_result.intent}) "
-                  f"— deferring to normal routing, negotiation state preserved")
-            return {"reply": None, "defer_intent": _defer_result,
-                    "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer),
-                    "order_ready": False, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
+        if _defer_result:
+            is_off_topic = False
+            if _defer_result.intent in ("GREETING", "HUMAN_ESCALATION", "FAQ_KNOWLEDGE"):
+                is_off_topic = True
+
+            routing = _defer_result.routing
+            if routing:
+                if (routing.needs_customer_history or 
+                    routing.needs_customer_context or 
+                    (routing.requested_knowledge_field and routing.requested_knowledge_field.lower() != "none") or
+                    routing.needs_graphrag or
+                    routing.operation == "NEW_SEARCH"):
+                    is_off_topic = True
+
+            if is_off_topic:
+                print(f"[NEGOTIATOR] Message not negotiation-related (intent={_defer_result.intent}) "
+                      f"— deferring to normal routing, negotiation state preserved")
+                return {"reply": None, "defer_intent": _defer_result,
+                        "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer),
+                        "order_ready": False, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
         total_val = round(last_offer*quantity, 2)
         stalemate_msg = get_prompt(

@@ -447,7 +447,35 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # rather than querying customer databases itself.
         try:
             arc = getattr(incoming, "_cached_arc", None)
-            _current_product = arc.resolved_product if arc else None
+            _current_product = None
+            if arc and arc.llm_context:
+                msg_lower = incoming.text.lower()
+                has_past_ref = any(k in msg_lower for k in ("previous order", "last order", "previously ordered", "previous purchase", "last purchase", "what i bought", "bought last", "past order", "previous product", "last product", "what i ordered"))
+                
+                if has_past_ref:
+                    try:
+                        from db.customer_data_service import CustomerDataService
+                        cds = CustomerDataService(incoming.tenant_id, incoming.session_id)
+                        _current_product = await cds.get_latest_ordered_product()
+                        if _current_product:
+                            print(f"[CONTEXT] Resolved previous order product: {_current_product}")
+                    except Exception as e:
+                        print(f"[CONTEXT] Failed to resolve previous order product: {e}")
+                
+                if not _current_product:
+                    routing = getattr(incoming, "_routing", None)
+                    needs_prod = getattr(routing, "needs_product_context", False) if routing else False
+                    req_field = getattr(routing, "requested_knowledge_field", "none") or "none"
+                    is_details_query = needs_prod or (req_field.lower() != "none")
+                    
+                    if is_details_query:
+                        from db.session_store import get_last_discussed_product
+                        _current_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+                        if not _current_product:
+                            _current_product = arc.resolved_product
+                    else:
+                        if getattr(arc.llm_context, "active_product_session", False):
+                            _current_product = arc.resolved_product
             history_context = arc.customer_context if arc else ""
 
             if history_context or _current_product:

@@ -255,7 +255,8 @@ async def dispatch(incoming, result, session_history: list) -> str:
 
     # ── Intercept history-related queries (orders, offers context) ────────────
     _needs_customer_history = getattr(_routing, "needs_customer_history", False) if _routing else False
-    if _needs_customer_history:
+    _req_field = getattr(_routing, "requested_knowledge_field", "none") or "none"
+    if _needs_customer_history and _req_field.lower() == "none":
         try:
             from ai.customer_history_handler import handle_customer_history_query
             customer_history_reply = await handle_customer_history_query(incoming, session_history)
