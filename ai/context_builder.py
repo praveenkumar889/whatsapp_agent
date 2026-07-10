@@ -128,7 +128,7 @@ class ContextBuilder:
             from db.session_store import get_last_discussed_product, get_graphrag_product_selection
             last_prod = await get_last_discussed_product(self.tenant_id, self.session_id)
             selection = await get_graphrag_product_selection(self.tenant_id, self.session_id) or []
-            selection_names = [prod.get("product_name").lower().strip() if isinstance(prod, dict) else str(prod).lower().strip() for prod in selection]
+            selection_names = [(prod.get("product_name") or prod.get("name") or "").lower().strip() if isinstance(prod, dict) else str(prod).lower().strip() for prod in selection]
             neg_product = self.arc.neg_state.get("product_name") if self.arc.neg_state else None
             
             pname_lower = pname.lower().strip()

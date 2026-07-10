@@ -106,7 +106,12 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
                 qty = o.get("quantity_value") or 1
                 price = float(o.get("total_price") or 0)
                 oid = o.get("order_id") or "N/A"
-                details_list.append(f"• Order {oid}: {prod} x{qty} @ Rs.{price:,.0f}")
+                inv_url = o.get("invoice_url")
+                
+                detail = f"• Order {oid}: {prod} x{qty} @ Rs.{price:,.0f}"
+                if inv_url:
+                    detail += f"\n  🔗 *Invoice URL:* {inv_url}"
+                details_list.append(detail)
 
             order_details = "\n".join(details_list)
             formatter_fallback = f"Hi {incoming.sender_name or 'there'}! Here are your previous orders:\n\n{order_details}"

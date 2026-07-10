@@ -356,6 +356,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # any stale negotiation state and route to GraphRAG instead.
     neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
+    # Bypasses negotiation if the user is asking for a specific non-none knowledge field (e.g. images, installation)
+    _routing = getattr(incoming, "_routing", None)
+    _req_field = _routing.requested_knowledge_field if _routing else None
+    _bypass_negotiation = False
+    if _req_field and _req_field.lower() not in ("none", ""):
+        print(f"[FOLLOW-UP] requested field '{_req_field}' — bypassing negotiation check")
+        _bypass_negotiation = True
+        neg_state = None
+
     # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
     # Runs BEFORE parse and is_negotiation_request.
     # "Currently is there any offers?" / "is there any offers?" →
@@ -435,7 +444,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     neg_state = None
 
     _t_neg_check_start = time.monotonic()
-    _is_neg_req = False if _is_offer_inq else await is_negotiation_request(incoming.text, incoming, session_history)
+    _is_neg_req = False if (_is_offer_inq or _bypass_negotiation) else await is_negotiation_request(incoming.text, incoming, session_history)
     print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
@@ -1309,22 +1318,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         except Exception as e:
             print(f"[FOLLOW-UP] LLM guard failed ({e}) — defaulting to FOLLOW_UP")
 
-    # ── Case 3: Pure follow-up — scan bot history ───────────────────────────
-    if not matched_product and session_history:
-        recent_bot_msgs = [
-            m["content"] for m in session_history[-6:]
-            if m.get("role") == "assistant"
-        ]
-        combined_bot_text = " ".join(recent_bot_msgs).lower()
-        for p in selection:
-            pname      = (p.get("product_name") or p.get("name") or "").lower()
-            first_word = pname.split()[0] if pname else ""
-            if first_word and len(first_word) > 3 and first_word in combined_bot_text:
-                matched_product = p
-                print(f"[FOLLOW-UP] Bot history match: '{first_word}' -> {pname}")
-                break
-
-    # ── Case 4: last_discussed_product DB fallback ───────────────────────────
+    # ── Case 3: last_discussed_product DB fallback (Prioritized State) ────────
     if not matched_product:
         try:
             _ld = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
@@ -1339,9 +1333,24 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     if _ldc:
                         matched_product = {"product_name": _ld, "name": _ld}
                 if matched_product:
-                    print(f"[FOLLOW-UP] Case 4 DB fallback: last_discussed='{_ld}'")
+                    print(f"[FOLLOW-UP] Case 3 DB fallback (prioritized): last_discussed='{_ld}'")
         except Exception as _lde:
-            print(f"[FOLLOW-UP] Case 4 fallback failed: {_lde}")
+            print(f"[FOLLOW-UP] Case 3 fallback failed: {_lde}")
+
+    # ── Case 4: Pure follow-up — scan bot history (Heuristic Fallback) ────────
+    if not matched_product and session_history:
+        recent_bot_msgs = [
+            m["content"] for m in session_history[-6:]
+            if m.get("role") == "assistant"
+        ]
+        combined_bot_text = " ".join(recent_bot_msgs).lower()
+        for p in selection:
+            pname      = (p.get("product_name") or p.get("name") or "").lower()
+            first_word = pname.split()[0] if pname else ""
+            if first_word and len(first_word) > 3 and first_word in combined_bot_text:
+                matched_product = p
+                print(f"[FOLLOW-UP] Case 4 Bot history match: '{first_word}' -> {pname}")
+                break
 
     if not matched_product:
         return None

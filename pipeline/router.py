@@ -492,6 +492,13 @@ async def _resume_negotiation(incoming, neg_state: dict, session_history: list) 
         # If negotiator has a counter-offer reply, deliver it and enter Phase 2.
         # Do NOT set awaiting_invoice_confirmation=True — customer hasn't accepted.
         if negotiator_reply and negotiator_reply.strip():
+            if ng_result["state"].get("awaiting_invoice_confirmation"):
+                await save_negotiation_state(
+                    incoming.tenant_id, incoming.session_id,
+                    {**ng_result["state"], "last_offer_price": a, "quantity": q}
+                )
+                return negotiator_reply
+
             await save_negotiation_state(
                 incoming.tenant_id, incoming.session_id,
                 {**ng_result["state"], "counter_offer_presented": True,

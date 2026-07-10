@@ -602,7 +602,7 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
             base_reply += "\n\n" + upsell_line
         elif offer.get("current_tier_disc", 0) > 0:
             max_disc = max(d for _, d in tiers)
-            max_disc_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc)
+            max_disc_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc, qualifier="")
             base_reply += "\n\n" + max_disc_line
 
     return base_reply
@@ -730,7 +730,7 @@ async def handle_negotiation(
     if not quantity:
         quantity = await extract_quantity(msg, product_name, incoming, session_history)
         if not quantity:
-            ask_msg = get_prompt(incoming, "neg_ask_quantity_prompt", sender_name=incoming.sender_name, product_name=product_name)
+            ask_msg = get_prompt(incoming, "neg_ask_quantity_prompt", sender_name=incoming.sender_name, product_name=product_name, regular_price=f"{regular_price:,.0f}")
             return {"reply": ask_msg,
                     "state": _state(awaiting_quantity=True, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
@@ -770,10 +770,17 @@ async def handle_negotiation(
 
     accepted = parsed.intent == "ACCEPTED"
     if accepted:
-        confirm_msg = get_prompt(
-            incoming, "neg_accepted_confirmation_prompt",
-            quantity=quantity, product_name=product_name, last_offer=f"{last_offer:,.0f}"
+        from ai.pricing import PricingResult
+        pr = PricingResult.build(
+            regular_unit_price=regular_price,
+            quantity=quantity,
+            gst_rate=getattr(incoming, "gst_rate", 0.18),
+            store_disc_pct=int(negotiation_state.get("auto_offer_disc_pct") or 0),
+            negotiated_unit_price=last_offer,
+            negotiation_rounds=rounds,
+            tiers=tiers,
         )
+        confirm_msg = pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
         return {"reply": confirm_msg,
                 "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
                 "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
@@ -802,7 +809,7 @@ async def handle_negotiation(
             prev_tier_disc = negotiation_state.get("current_tier_disc", 0)
             max_disc       = max(d for _, d in tiers)
             if offer.get("current_tier_disc", 0) >= max_disc and offer.get("current_tier_disc", 0) > prev_tier_disc:
-                upsell_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc)
+                upsell_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc, qualifier="")
 
         summary_text = await build_product_summary(incoming, product_data)
         summary_block = summary_text.strip() if summary_text else ""
@@ -834,6 +841,14 @@ async def handle_negotiation(
                 sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct,
                 gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
             )
+            # Add total savings display if store discount applies
+            total_disc = round((price_num - _eff_price) * quantity, 2)
+            if total_disc > 0:
+                try:
+                    savings_line = get_prompt(incoming, "pricing_order_summary_savings_prompt", total_discount_amount=f"{total_disc:,.0f}")
+                except Exception:
+                    savings_line = f"🎁 *You save Rs.{total_disc:,.0f} on this order!*"
+                update_reply += "\n\n" + savings_line
         else:
             update_reply = get_prompt(
                 incoming, "neg_qty_update_no_discount_prompt",
