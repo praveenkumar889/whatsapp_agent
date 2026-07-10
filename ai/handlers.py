@@ -55,7 +55,7 @@ async def classify_intent(
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=60, temperature=0,
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0,
                 messages=messages,
             )
         )
@@ -74,10 +74,14 @@ async def classify_intent(
             routing = RoutingDecision(
                 operation=str(parsed.get("operation", "OTHER")).upper(),
                 needs_graphrag=bool(parsed.get("needs_graphrag", False)),
-                needs_memory=bool(parsed.get("needs_memory", False)),
+                needs_customer_context=bool(parsed.get("needs_customer_context", False) or parsed.get("needs_memory", False)),
                 needs_workflow_state=bool(parsed.get("needs_workflow_state", False)),
                 needs_product_context=bool(parsed.get("needs_product_context", False)),
+                needs_customer_history=bool(parsed.get("needs_customer_history", False)),
+                knowledge_domain=parsed.get("knowledge_domain", "product"),
+                requested_knowledge_field=parsed.get("requested_knowledge_field"),
             )
+
 
         _min_conf = getattr(incoming, "intent_min_confidence", None) or DEFAULT_INTENT_MIN_CONFIDENCE
         if intent not in valid_intents or conf < _min_conf:

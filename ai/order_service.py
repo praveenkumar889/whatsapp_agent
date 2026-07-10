@@ -76,43 +76,31 @@ async def complete_order(
     saved_to_memory = False
     if items:
         try:
-            from ai.memory_manager import MemoryManager
-            from db.session_store import get_cached_product_by_name
+
 
             _product_name = items[0].get("product_name")
 
             async def _save_order_context_async():
-                mm = MemoryManager(tenant_id, session_id)
+                from db.customer_data_service import CustomerDataService
+                cds = CustomerDataService(tenant_id, session_id)
                 
-                # 1. Save product context for follow-up QA
-                _cached = await get_cached_product_by_name(tenant_id, _product_name)
-                if _cached:
-                    await mm.save_product_context(_cached)
+                # 1. Save product view for follow-up QA
+                await cds.save_product_view(_product_name)
 
-                # 2. Save structured completed order history
+                # 2. Save offer history to database (if a discount or negotiation happened)
                 qty_val = int(new_order.get("quantity_value") or items[0].get("quantity_value") or 1)
                 unit_pr = float(new_order.get("unit_price") or items[0].get("unit_price") or 0.0)
                 disc_pct = int(new_order.get("store_discount_pct") or 0)
                 neg_disc = float(new_order.get("negotiation_discount_amount") or 0.0)
                 was_neg = neg_disc > 0.0
 
-                await mm.save_order_history(
-                    product      = _product_name,
-                    quantity     = qty_val,
-                    price        = unit_pr,
-                    order_id     = new_order.get("order_id", ""),
-                    discount_pct = disc_pct,
-                    negotiated   = was_neg,
-                )
-
-                # 3. Save offer history to Mem0 (if a discount or negotiation happened)
                 if disc_pct > 0 or was_neg:
                     orig_amount = float(new_order.get("original_amount") or (unit_pr * qty_val))
-                    await mm.save_offer_history(
+                    await cds.save_offer_history(
                         product          = _product_name,
-                        store_offer_pct  = disc_pct,
-                        negotiated_price = unit_pr,
-                        offer_threshold  = orig_amount,
+                        offer_tier       = "negotiated" if was_neg else "store_offer",
+                        discount_applied = disc_pct,
+                        threshold        = orig_amount,
                         accepted         = True,
                     )
 

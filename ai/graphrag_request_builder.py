@@ -8,7 +8,7 @@ import re
 import json
 from typing import Optional, Any, List, Dict
 from db.session_store import get_graphrag_product_selection, get_last_discussed_product, get_category_selection
-from ai.memory_manager import MemoryManager
+from db.customer_data_service import CustomerDataService
 
 class GraphRAGRequestBuilder:
     """
@@ -36,28 +36,25 @@ class GraphRAGRequestBuilder:
 
         # 2. Fetch context from DB/Mem0
         selection = await get_graphrag_product_selection(self.tenant_id, self.session_id) or []
-        last_product = await get_last_discussed_product(self.tenant_id, self.session_id)
+        from ai.product_context_resolver import ProductContextResolver
+        last_product = await ProductContextResolver.resolve(self.tenant_id, self.session_id, self.incoming._cached_neg_state)
         category_options = await get_category_selection(self.tenant_id, self.session_id) or []
 
-        # 3. Fetch Mem0 profile for recommendation/personalization checks
-        mm = MemoryManager(self.tenant_id, self.session_id)
-        profile = await mm.get_customer_profile()
-        preferences = list(profile.get("preferences", {}).values())
 
-        # Retrieve previous products from purchase summaries
+        # 3. Fetch customer profile for recommendation/personalization checks
+        cds = CustomerDataService(self.tenant_id, self.session_id)
+        profile = await cds.get_customer_summary()
+        prefs = profile.get("preferences") or {}
+        preferences = list(prefs.values())
+
+        # Retrieve previous products from order history
         previous_products = []
         try:
-            memories = await mm.search(["purchase_summary"], query="purchases", max_results=5)
-            for m in memories.get("purchase_summary", []):
-                text = m.get("memory", "")
-                if "PURCHASE_SUMMARY:" in text:
-                    try:
-                        p_info = json.loads(text.split("PURCHASE_SUMMARY:", 1)[1].strip())
-                        p_name = p_info.get("product")
-                        if p_name and p_name not in previous_products:
-                            previous_products.append(p_name)
-                    except Exception:
-                        pass
+            orders = await cds.get_order_history(limit=5)
+            for o in orders:
+                p_name = o.get("product_name")
+                if p_name and p_name not in previous_products:
+                    previous_products.append(p_name)
         except Exception:
             pass
 

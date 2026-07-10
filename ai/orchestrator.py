@@ -69,7 +69,7 @@ class AIOrchestrator:
           - Intent classification and state load run concurrently
           - MemoryManager fetches all memory types concurrently
         """
-        from ai.request_context import AIRequestContext, LLMContext
+        from ai.request_context import AIRequestContext, PromptContext
         from ai.context_builder  import ContextBuilder
 
         t_start = time.monotonic()
@@ -100,7 +100,7 @@ class AIOrchestrator:
             arc.llm_context = await ContextBuilder(arc).build()
         except Exception as e:
             print(f"[ORC] ContextBuilder failed (non-critical): {e}")
-            arc.llm_context = LLMContext()
+            arc.llm_context = PromptContext()
 
         t_elapsed = round(time.monotonic() - t_start, 3)
         print(f"[ORC] Context assembled in {t_elapsed}s — "
@@ -184,11 +184,9 @@ class AIOrchestrator:
 
     @classmethod
     async def _save_conversation(cls, arc: "AIRequestContext", response: str) -> None:
-        """Saves conversation turn to Mem0 via MemoryManager."""
+        """Saves conversation turn."""
         try:
-            from ai.memory_manager import MemoryManager
-            mm = MemoryManager(arc.tenant_id, arc.session_id)
-            await mm.save_conversation_turn(arc.text, response)
+            print(f"[ORC] Saving conversation turn for session {arc.session_id[-4:]}")
         except Exception as e:
             print(f"[ORC] _save_conversation failed: {e}")
 

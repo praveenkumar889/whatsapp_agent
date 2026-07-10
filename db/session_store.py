@@ -211,6 +211,26 @@ async def update_reply(
         return False
 
 
+async def get_latest_graphrag_response(tenant_id: str, session_id: str) -> Optional[str]:
+    """Fetches the most recent raw GraphRAG response from messages table for this session."""
+    try:
+        result = _get_client().table("messages") \
+            .select("graphrag_response") \
+            .eq("tenant_id", tenant_id) \
+            .eq("session_id", session_id) \
+            .not_.is_("graphrag_response", "null") \
+            .order("created_at", desc=True) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            row = cast(dict, result.data[0])
+            return cast(Optional[str], row.get("graphrag_response"))
+        return None
+    except Exception as e:
+        print(f"[DB] get_latest_graphrag_response failed: {e}")
+        return None
+
+
 async def save_outbound_message(
     tenant_id: str,
     session_id: str,
@@ -653,6 +673,7 @@ async def get_cached_product_by_name(
                 data = [data]
             if data:
                 first_item = cast(dict, data[0])
+                first_item["_cached_at"] = row.get("cached_at")
                 print(f"[DB] Product found in cache by name (indexed) — '{product_name}' -> SKU={first_item.get('sku')}")
                 return first_item
     except Exception as e:
@@ -679,6 +700,7 @@ async def get_cached_product_by_name(
                 item_dict = cast(dict, item)
                 cached_name = (item_dict.get("product_name") or "").lower().strip()
                 if cached_name == name_lower:
+                    item_dict["_cached_at"] = row_dict.get("cached_at")
                     print(f"[DB] Product found in cache by name (fallback scan) — '{product_name}' -> SKU={item_dict.get('sku')}")
                     return item_dict
 
@@ -686,6 +708,7 @@ async def get_cached_product_by_name(
     except Exception as e:
         print(f"[DB] get_cached_product_by_name failed: {e}")
         return None
+
 
 
 async def save_graphrag_product_selection(
@@ -1063,14 +1086,7 @@ async def clear_post_order_context(tenant_id: str, session_id: str) -> bool:
 
         print(f"[DB] Supabase post-order context cleared for {session_id}")
 
-        # 2. Update Mem0 workflow snapshot
-        try:
-            from db.memory_store import save_workflow_snapshot
-            await save_workflow_snapshot(tenant_id, session_id, "INVOICED")
-            print(f"[DB] Mem0 workflow snapshot updated to INVOICED for {session_id}")
-        except Exception as mem_err:
-            print(f"[DB] Mem0 snapshot update failed during context clear: {mem_err}")
-
+        # 2. Update Mem0 workflow snapshot (no-op since Mem0 is removed)
         return True
     except Exception as e:
         print(f"[DB] clear_post_order_context failed: {e}")
@@ -1243,3 +1259,23 @@ async def get_tenant_offers(tenant_id: str) -> Optional[dict]:
     except Exception as e:
         print(f"[DB] get_tenant_offers failed: {e}")
         return None
+
+
+async def get_tenant_config(tenant_id: str, key: str) -> Optional[dict]:
+    """
+    Fetches JSONB configuration value from tenant_configurations table.
+    """
+    try:
+        result = _get_client().table("tenant_configurations") \
+            .select("config_value") \
+            .eq("tenant_id", tenant_id) \
+            .eq("config_key", key) \
+            .limit(1) \
+            .execute()
+        if result.data:
+            row = cast(dict, result.data[0])
+            return cast(Optional[dict], row.get("config_value"))
+        return None
+    except Exception as e:
+        print(f"[DB] Failed to load tenant configuration '{key}': {e}")
+        return None

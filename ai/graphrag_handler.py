@@ -345,7 +345,6 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
     return None
 
 
-from ai.memory_manager import build_memory_context_text as _build_memory_context_text
 
 
 async def _build_enriched_graphrag_query(
@@ -443,67 +442,24 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
                 await clear_category_selection(incoming.tenant_id, incoming.session_id)
 
         # ── Memory-aware query enrichment ───────────────────────────────────
-        # needs_long_term_memory now comes from classify_intent() (migration
-        # 029 extended intent_system_prompt to compute it), reusing the call
-        # that already runs on every single message before dispatch — no
-        # dedicated classifier added. main.py stashes it on incoming right
-        # after classify_intent() runs. Falls back to product_followup.py's
-        # own needs_long_term_memory (via pf_data_extraction_prompt) if that
-        # ran and set a value first — whichever signal is available wins.
-        _routing = getattr(incoming, "_routing", None)
-        _needs_memory = _routing.needs_memory if _routing else None
-        _needs_product_context = bool(_routing.needs_product_context) if _routing else False
-        print(f"[MEM0] needs_memory={_needs_memory} needs_product_context={_needs_product_context} for this GraphRAG call")
+        # ── RequestContext Context Consumption ──────────────────────────────
+        # GraphRAG consumes structured context assembled upstream by ContextBuilder
+        # rather than querying customer databases itself.
         try:
-            memory_context = ""
-            if _needs_memory:
-                from ai.memory_policy import MemoryPolicy, MemoryRequest
-                from ai.memory_manager import MemoryManager
+            arc = getattr(incoming, "_cached_arc", None)
+            _current_product = arc.resolved_product if arc else None
+            history_context = arc.customer_context if arc else ""
 
-                mem_ctx = MemoryRequest(
-                    text=graphrag_text, intent=None, workflow=None,
-                    tenant_id=incoming.tenant_id, session_id=incoming.session_id,
-                    needs_long_term_memory=True,
-                )
-                decision = MemoryPolicy.evaluate(mem_ctx)
-                print(f"[MEM0] MemoryPolicy decision: retrieve={decision.retrieve} types={decision.types}")
-                if decision.retrieve:
-                    mm = MemoryManager(incoming.tenant_id, incoming.session_id)
-                    results = await mm.search(decision.types, query=graphrag_text, max_results=decision.max_results)
-                    memory_context = _build_memory_context_text(results)
-                    print(f"[MEM0] Retrieved memory_context: {'(empty)' if not memory_context else memory_context[:150]}")
-
-            # Resolved independently of needs_memory — a message can need the
-            # CURRENT product (this session's own state, cheap to resolve)
-            # without needing long-term Mem0 history at all. Previously this
-            # only ran inside the needs_memory branch, so "is there an
-            # installation guide for this" (needs_product_context=True,
-            # needs_memory=False) never got the current product resolved,
-            # and GraphRAG received the raw message with no idea which
-            # product was being discussed.
-            _current_product = getattr(incoming, "resolved_product", None)
-            if not _current_product and (_needs_product_context or memory_context):
-                _active_neg = getattr(incoming, "_cached_neg_state", None) or await get_negotiation_state(
-                    incoming.tenant_id, incoming.session_id
-                )
-                if _active_neg:
-                    _current_product = _active_neg.get("product_name")
-                if not _current_product:
-                    from db.session_store import get_last_discussed_product
-                    _current_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
-                print(f"[MEM0] Resolved current_product: {_current_product}")
-
-            # Enrich whenever there's EITHER memory context or a current
-            # product to anchor the query on — not just when both exist.
-            if memory_context or _current_product:
+            if history_context or _current_product:
+                print(f"[CONTEXT] Consuming resolved_product={_current_product} for this GraphRAG query")
                 enriched = await _build_enriched_graphrag_query(
-                    incoming, graphrag_text, memory_context, current_product=_current_product,
+                    incoming, graphrag_text, history_context, current_product=_current_product,
                 )
                 if enriched:
-                    print(f"[MEM0] Enriched GraphRAG query with retrieved context")
+                    print(f"[CONTEXT] Enriched GraphRAG query with retrieved context")
                     graphrag_text = enriched
         except Exception as e:
-            print(f"[MEM0] Query enrichment failed (non-critical, using original query): {e}")
+            print(f"[CONTEXT] Query enrichment failed (non-critical, using original query): {e}")
 
         # ── Build payload matching messages table schema ───────────────────
         payload = {

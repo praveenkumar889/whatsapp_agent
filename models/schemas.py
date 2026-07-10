@@ -134,11 +134,15 @@ class RoutingDecision:
     order, an appointment, a claim, or a shipment; the LLM decides this
     from meaning, not from tenant-specific vocabulary.
     """
-    operation:              str   # "NEW_SEARCH" | "MODIFY_WORKFLOW" | "OTHER"
-    needs_graphrag:         bool
-    needs_memory:           bool
-    needs_workflow_state:   bool
-    needs_product_context:  bool
+    operation:                 str   # "NEW_SEARCH" | "MODIFY_WORKFLOW" | "OTHER"
+    needs_graphrag:            bool
+    needs_customer_context:    bool  # Renamed from needs_memory
+    needs_workflow_state:      bool
+    needs_product_context:     bool
+    needs_customer_history:    bool = False
+    knowledge_domain:          Optional[str] = "product"
+    requested_knowledge_field: Optional[str] = None
+
 
 
 @dataclass

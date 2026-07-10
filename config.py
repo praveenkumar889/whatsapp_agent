@@ -26,11 +26,6 @@ SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "whatsapp-media")
 PRODUCTS_API_URL  = os.getenv("PRODUCTS_API_URL", "")
 GRAPHRAG_API_URL  = os.getenv("GRAPHRAG_API_URL", "")
 
-# ── Mem0 ──────────────────────────────────────────────────────────────────────
-# Get your API key from https://app.mem0.ai
-# This replaces: get_session_history() DB reads and workflow_sessions table
-MEM0_API_KEY = os.getenv("MEM0_API_KEY", "")
-
 # ── Application ───────────────────────────────────────────────────────────────
 APP_NAME      = os.getenv("APP_NAME", "WhatsApp AI Agent")
 BUSINESS_NAME = os.getenv("BUSINESS_NAME", "WhatsApp AI Agent")

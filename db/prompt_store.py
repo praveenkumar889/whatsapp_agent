@@ -197,7 +197,7 @@ def get_prompt(incoming: Any, key: str, **template_vars: Any) -> str:
 async def get_prompt_with_context(
     incoming: Any, key: str, inject_mem0: bool = True, **template_vars: Any,
 ) -> str:
-    """Async variant that also injects Mem0 semantic context variables."""
+    """Async variant that also injects Postgres semantic context variables."""
     base  = get_prompt(incoming, key, **template_vars)
     if not inject_mem0:
         return base
@@ -208,17 +208,27 @@ async def get_prompt_with_context(
     if not needs:
         return base
     try:
-        from db.memory_store import get_relevant_context
-        ctx = await get_relevant_context(
-            tenant_id  = getattr(incoming, "tenant_id", ""),
-            session_id = getattr(incoming, "session_id", ""),
-            query      = str(template_vars.get("product_name","") or getattr(incoming,"text","")),
-        )
-        ctx_str = " | ".join(m.get("content","") for m in ctx if m.get("content"))
+        from ai.context_builder import ContextBuilder
+        from ai.request_context import AIRequestContext
+        from models.schemas import IntentResult
+
+        arc = getattr(incoming, "_cached_arc", None)
+        if not arc:
+            arc = AIRequestContext(
+                incoming = incoming,
+                result = IntentResult(intent="UNKNOWN", confidence_score=0.0, raw_text=getattr(incoming, "text", "")),
+                session_history = []
+            )
+            incoming._cached_arc = arc
+
+        cb = ContextBuilder(arc)
+        ctx = await cb.build()
+        ctx_dict = ctx.to_dict()
         for var in needs:
-            base = base.replace("{" + var + "}", ctx_str or "")
+            val = ctx_dict.get(var) or ""
+            base = base.replace("{" + var + "}", str(val))
     except Exception as e:
-        print(f"[PROMPT] Mem0 injection failed (non-critical): {e}")
+        print(f"[PROMPT] Context injection failed (non-critical): {e}")
     return base
 
 
@@ -244,7 +254,7 @@ def update_prompt_template(
             "version":nv,"status":"active","prompt_text":new_text,"description":description,
         }).execute()
         _cache_invalidate(tenant_id, prompt_name, language)
-        print(f"[PROMPT] Updated '{prompt_name}' → v{nv}")
+        print(f"[PROMPT] Updated '{prompt_name}' -> v{nv}")
         return True
     except Exception as e:
         print(f"[PROMPT] update failed: {e}")

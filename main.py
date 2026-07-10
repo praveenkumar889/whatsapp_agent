@@ -39,7 +39,6 @@ from models.schemas import IncomingMessage
 from ai.handlers import classify_intent
 from db.session_store import update_intent, update_reply, save_outbound_message
 from db.processing_lock import release_lock, cleanup_stale_locks
-from db.memory_store import add_conversation_turn
 from pipeline.setup import setup_pipeline
 from pipeline.router import dispatch
 from messaging import send_reply
@@ -292,14 +291,7 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
                 text       = reply,
                 region     = incoming.region,
             )
-            # FIX: Fire-and-forget — Mem0 save runs after response is sent.
-            # Previously awaited here, adding 1-3s to every message latency.
-            asyncio.create_task(_save_mem0_turn(
-                tenant_id  = incoming.tenant_id,
-                session_id = incoming.session_id,
-                user_text  = incoming.text,
-                bot_reply  = reply,
-            ))
+            # No Mem0 task. Postgres updates are done directly.
 
         # ── Step 8: Return debug info ────────────────────────────────────────
         latency = round(time.monotonic() - _t0, 2)
@@ -323,27 +315,6 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
 
     finally:
         await release_lock(incoming.session_id, incoming.tenant_id)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-
-async def _save_mem0_turn(tenant_id: str, session_id: str,
-                           user_text: str, bot_reply: str) -> None:
-    """
-    Fire-and-forget Mem0 save. Called via asyncio.create_task() so it runs
-    after the HTTP response is already sent — never blocks the pipeline.
-    """
-    try:
-        await add_conversation_turn(
-            tenant_id  = tenant_id,
-            session_id = session_id,
-            user_text  = user_text,
-            bot_reply  = bot_reply,
-        )
-    except Exception as e:
-        print(f"[MEM0] Background save failed (non-critical): {e}")
 
 
 async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional[str]:

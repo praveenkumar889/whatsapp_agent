@@ -18,12 +18,191 @@ async def dispatch(incoming, result, session_history: list) -> str:
     All imports are local to avoid circular import chain.
     """
     # Performance: load negotiation state ONCE and cache on incoming object.
-    # Previously loaded 3-4× per request across _neg_guard, _invoice_guard,
-    # _resume_negotiation, and _try_resolve_product_followup.
-    # All downstream reads now use incoming._cached_neg_state — zero extra DB calls.
     if not hasattr(incoming, '_cached_neg_state'):
         from db.session_store import get_negotiation_state as _gns
         incoming._cached_neg_state = await _gns(incoming.tenant_id, incoming.session_id)
+
+    # Centralized RequestContext ContextBuilder assembly
+    arc = getattr(incoming, "_cached_arc", None)
+    if arc:
+        from ai.context_builder import ContextBuilder
+        await ContextBuilder(arc).build()
+
+    # Dynamic Knowledge Resolution Intercept Guard
+    _routing = getattr(incoming, "_routing", None)
+    requested_field = _routing.requested_knowledge_field if _routing else None
+    domain = (_routing.knowledge_domain or "product") if _routing else "product"
+
+    if arc and requested_field and requested_field.upper() != "NONE":
+        # Check messages table for the last graphrag_response in this session
+        from db.session_store import get_latest_graphrag_response
+        import json
+        raw_graph_resp = await get_latest_graphrag_response(incoming.tenant_id, incoming.session_id)
+        
+        products = []
+        if raw_graph_resp:
+            try:
+                data = json.loads(raw_graph_resp)
+                if isinstance(data, dict):
+                    response_text = data.get("response_text", [])
+                    if isinstance(response_text, list):
+                        products = response_text
+                elif isinstance(data, list):
+                    products = data
+            except Exception as e:
+                print(f"[ROUTER] Failed to parse graphrag_response JSON: {e}")
+
+        # Resolve matched product
+        matched_product = None
+        if arc.resolved_product and products:
+            pname_lower = arc.resolved_product.lower().strip()
+            for p in products:
+                if not isinstance(p, dict):
+                    continue
+                p_pname = (p.get("name") or p.get("product_name") or "").lower().strip()
+                if p_pname == pname_lower or pname_lower in p_pname or p_pname in pname_lower:
+                    matched_product = p
+                    break
+
+        # Fallback to DB product_cache lookup if not found in latest graphrag_response
+        if not matched_product and arc.resolved_product:
+            from db.session_store import get_cached_product_by_name
+            cached_product = await get_cached_product_by_name(incoming.tenant_id, arc.resolved_product)
+            if cached_product:
+                matched_product = cached_product
+
+        val = None
+        if matched_product:
+            if requested_field.lower() == "installation":
+                val = matched_product.get("installation_url") or matched_product.get("installation") or matched_product.get("pdf_url")
+                if isinstance(val, dict):
+                    val = val.get("pdf_url") or val.get("manual_url") or val.get("video_url")
+                if not val:
+                    # check nested installation column string in product_cache
+                    installation = matched_product.get("installation")
+                    if isinstance(installation, str):
+                        try:
+                            installation = json.loads(installation)
+                        except Exception:
+                            installation = None
+                    if isinstance(installation, dict):
+                        val = installation.get("pdf_url") or installation.get("manual_url") or installation.get("video_url")
+            else:
+                val = matched_product.get(requested_field) or matched_product.get(f"{requested_field}_url")
+
+        if val:
+            from db.prompt_store import get_prompt
+            if requested_field.lower() == "installation":
+                try:
+                    header = get_prompt(incoming, "followup_installation_header_prompt", product_name=arc.resolved_product)
+                    return f"{header}\n🔗 {val}"
+                except Exception:
+                    return f"Here is the installation guide for *{arc.resolved_product}*:\n\n🔗 {val}"
+            elif isinstance(val, str) and (val.startswith("http://") or val.startswith("https://")):
+                prompt_key = f"asset_success_{requested_field}_prompt"
+                try:
+                    return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=val)
+                except Exception:
+                    label = requested_field.capitalize().replace("_", " ")
+                    return f"Here is the {label} for *{arc.resolved_product}*:\n\n🔗 {val}"
+            else:
+                prompt_key = f"asset_success_{requested_field}_prompt"
+                try:
+                    return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=str(val))
+                except Exception:
+                    label = requested_field.capitalize().replace("_", " ")
+                    return f"Here is the {label} for *{arc.resolved_product}*:\n{val}"
+
+        # Check cache/refresh state
+        kstate = getattr(arc.llm_context, "knowledge_state", {})
+        is_available = kstate.get("available", False)
+        needs_refresh = kstate.get("needs_refresh", False)
+        
+        if not is_available or needs_refresh:
+            print(f"[ROUTER] Cache miss or expired for '{arc.resolved_product}' (domain: {domain}, field: {requested_field}) — calling GraphRAG")
+            from ai.graphrag_handler import call_graphrag_api
+            # Temporarily rewrite query to request the details
+            original_text = incoming.text
+            incoming.text = f"Product: {arc.resolved_product}. Query: {original_text}"
+            
+            # This calls GraphRAG, fetches from Neo4j, formats/sends, and updates product_cache
+            res = await call_graphrag_api(incoming, session_history)
+            
+            # Restore original text
+            incoming.text = original_text
+            
+            if res is not None:
+                return res
+            
+            # Rebuild context to reload refreshed details
+            from ai.context_builder import ContextBuilder
+            await ContextBuilder(arc).build()
+            
+        # Access structured knowledge
+        kstate = getattr(arc.llm_context, "knowledge_state", {})
+        if kstate.get("available"):
+            from ai.knowledge_accessor import KnowledgeAccessor
+            asset = await KnowledgeAccessor.get(incoming, arc.llm_context.knowledge_context, domain, requested_field)
+            if asset:
+                asset_type = asset.get("type")
+                asset_val = asset.get("value")
+                
+                # Deliver typed assets: Image
+                if asset_type == "image":
+                    from messaging import send_image
+                    img_url = asset_val[0] if isinstance(asset_val, list) and asset_val else asset_val
+                    if img_url:
+                        caption = f"Here is the image for {arc.resolved_product or 'the product'}"
+                        wamid = await send_image(incoming, img_url, caption)
+                        if wamid:
+                            from db.session_store import save_outbound_message
+                            await save_outbound_message(
+                                tenant_id=incoming.tenant_id,
+                                session_id=incoming.session_id,
+                                message_id=wamid,
+                                text=caption,
+                                media_url=img_url,
+                                original_type="image",
+                                region=incoming.region,
+                            )
+                            return ""
+                
+                # Deliver typed assets: Document / PDF URL
+                elif asset_type == "document":
+                    doc_url = asset_val
+                    if doc_url:
+                        from db.prompt_store import get_prompt
+                        prompt_key = f"asset_success_{requested_field}_prompt"
+                        try:
+                            return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=doc_url)
+                        except RuntimeError:
+                            if requested_field.lower() == "installation":
+                                try:
+                                    header = get_prompt(incoming, "followup_installation_header_prompt", product_name=arc.resolved_product)
+                                    return f"{header}\n🔗 {doc_url}"
+                                except Exception:
+                                    return f"Here is the installation guide for *{arc.resolved_product}*:\n\n🔗 {doc_url}"
+                            label = requested_field.capitalize().replace("_", " ")
+                            return f"You can view the {label} for *{arc.resolved_product}* here:\n{doc_url}"
+
+                # Deliver typed assets: Text / Specifications / etc
+                from db.prompt_store import get_prompt
+                prompt_key = f"asset_success_{requested_field}_prompt"
+                try:
+                    return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=asset_val)
+                except RuntimeError:
+                    label = requested_field.capitalize().replace("_", " ")
+                    return f"Here is the {label} for *{arc.resolved_product}*:\n{asset_val}"
+            else:
+                # Deliver missing-asset fallback
+                from db.prompt_store import get_prompt
+                prompt_key = f"asset_missing_{requested_field}_prompt"
+                try:
+                    return get_prompt(incoming, prompt_key, product_name=arc.resolved_product)
+                except RuntimeError:
+                    label = requested_field.capitalize().replace("_", " ")
+                    return f"This product currently doesn't have {label} details available."
+
 
     # Guard 1: Negotiation awaiting confirmation
     reply = await _neg_guard(incoming, result, session_history)
@@ -59,7 +238,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
     # "add one more MRI scan", "add two pizzas", or "add spouse" regardless
     # of tenant/domain.
     _routing = getattr(incoming, "_routing", None)
-    if _routing and _routing.operation == "MODIFY_WORKFLOW" and not _routing.needs_graphrag:
+    if _routing and _routing.operation == "MODIFY_WORKFLOW" and not _routing.needs_graphrag and not getattr(_routing, "needs_customer_history", False):
         _has_state = incoming._cached_neg_state
         if not _has_state:
             from db.session_store import get_last_discussed_product
@@ -74,16 +253,16 @@ async def dispatch(incoming, result, session_history: list) -> str:
         # Active state exists — fall through to normal WORKFLOW_ACTION routing
         # below, which resolves this correctly via _try_resolve_product_followup().
 
-    # ── Intercept memory-related queries (orders, offers context) ────────────
-    _needs_memory = _routing.needs_memory if _routing else False
-    if _needs_memory and intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION"):
+    # ── Intercept history-related queries (orders, offers context) ────────────
+    _needs_customer_history = getattr(_routing, "needs_customer_history", False) if _routing else False
+    if _needs_customer_history:
         try:
-            from ai.memory_handler import handle_memory_query
-            memory_reply = await handle_memory_query(incoming, session_history)
-            if memory_reply:
-                return memory_reply
+            from ai.customer_history_handler import handle_customer_history_query
+            customer_history_reply = await handle_customer_history_query(incoming, session_history)
+            if customer_history_reply:
+                return customer_history_reply
         except Exception as e:
-            print(f"[ROUTER] memory_handler query failed: {e}")
+            print(f"[ROUTER] customer_history_handler query failed: {e}")
 
     if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
         from ai.graphrag_handler import call_graphrag_api
@@ -588,12 +767,11 @@ async def _save_neg_outcome_async(
     opening_price: float, final_price: float,
     rounds: int, accepted: bool, quantity: int,
 ) -> None:
-    """Fire-and-forget negotiation outcome save to Mem0."""
+    """Fire-and-forget negotiation outcome save to Postgres database."""
     try:
-        # save_negotiation_outcome lives in MemoryManager (ai/memory_manager.py)
-        from ai.memory_manager import MemoryManager
-        mm = MemoryManager(tenant_id, session_id)
-        await mm.save_negotiation_outcome(
+        from db.customer_data_service import CustomerDataService
+        cds = CustomerDataService(tenant_id, session_id)
+        await cds.save_negotiation_outcome(
             product       = product,
             opening_price = opening_price,
             final_price   = final_price,
@@ -602,4 +780,4 @@ async def _save_neg_outcome_async(
             quantity      = quantity,
         )
     except Exception as e:
-        print(f"[MEM0] save_negotiation_outcome failed (non-critical): {e}")
+        print(f"[Database] save_negotiation_outcome failed (non-critical): {e}")

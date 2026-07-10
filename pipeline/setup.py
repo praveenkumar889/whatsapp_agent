@@ -8,7 +8,6 @@ from db.session_store import (
     resolve_tenant_id, is_duplicate, get_session_history, save_message,
 )
 from db.processing_lock import acquire_lock
-from db.memory_store import get_relevant_context
 
 # Every prompt column that must exist in tenants table.
 # NOTE: These are legacy tenant-column prompts only. Most prompts are now
@@ -203,12 +202,6 @@ async def _resolve_quoted_caption(incoming: IncomingMessage) -> None:
 
 
 async def _get_history(incoming: IncomingMessage) -> list:
-    mem0 = await get_relevant_context(
-        incoming.tenant_id, incoming.session_id, incoming.text, limit=6,
-    )
-    if mem0:
-        print(f"[DB] Context from Mem0 — {len(mem0)} memories")
-        return mem0
     pg = await get_session_history(incoming.tenant_id, incoming.session_id, limit=10)
     print(f"[DB] History from Postgres — {len(pg)} turns")
     return pg

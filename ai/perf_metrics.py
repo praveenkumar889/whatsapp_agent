@@ -6,7 +6,7 @@
 #   that require manually eyeballing a wall of [TIMING] logs.
 #
 # WHY IN-PROCESS, NOT SUPABASE:
-#   Same reasoning as ai/memory_metrics.py — the ai_metrics table +
+#   The ai_metrics table +
 #   AIOrchestrator.finalize() already exist for this, but AIOrchestrator
 #   isn't wired into the live pipeline (main.py's run_pipeline() bypasses
 #   it entirely). This gives real numbers today via get_snapshot() without

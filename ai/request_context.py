@@ -26,7 +26,7 @@ from typing import Optional, Any
 
 
 @dataclass
-class LLMContext:
+class PromptContext:
     """
     Assembled semantic context for LLM prompt injection.
     All fields are plain strings, safe to inject into {variable} slots.
@@ -36,6 +36,11 @@ class LLMContext:
     negotiation_profile:  str = ""
     workflow_context:     str = ""
     conversation_summary: str = ""
+    customer_context:     str = ""  # Added for unified customer context
+    active_product_session: bool = False
+    resolved_product:     Optional[str] = None
+    knowledge_state:      dict = field(default_factory=dict)
+    knowledge_context:    dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -44,10 +49,26 @@ class LLMContext:
             "negotiation_profile":  self.negotiation_profile,
             "workflow_context":     self.workflow_context,
             "conversation_summary": self.conversation_summary,
+            "customer_context":     self.customer_context,
+            "active_product_session": self.active_product_session,
+            "resolved_product":     self.resolved_product,
+            "knowledge_state":      self.knowledge_state,
+            "knowledge_context":    self.knowledge_context,
         }
 
     def has_content(self) -> bool:
-        return any(self.to_dict().values())
+        # Check standard context strings or if knowledge has been loaded
+        return any(
+            isinstance(v, str) and bool(v) for v in [
+                self.product_context,
+                self.customer_preferences,
+                self.negotiation_profile,
+                self.workflow_context,
+                self.conversation_summary,
+                self.customer_context
+            ]
+        ) or bool(self.knowledge_state.get("available"))
+
 
 
 @dataclass
@@ -59,15 +80,12 @@ class AIRequestContext:
       - incoming:      original WhatsApp message (immutable — don't add state here)
       - result:        intent classification result
       - session_history: recent message turns from Postgres
-      - llm_context:   assembled Mem0 + workflow context (set by ContextBuilder)
+      - llm_context:   assembled context for prompts (set by ContextBuilder)
       - neg_state:     negotiation state dict loaded once from DB
       - pricing:       PricingResult if active order (set by pricing engine)
       - _updates:      deferred writes flushed at end of pipeline
-
-    Design rules:
-      - incoming stays clean (WhatsApp payload only)
-      - State accumulated during the request lives here, not on incoming
-      - All DB/Mem0 writes are deferred to _updates and flushed once at the end
+      - resolved_product: active resolved product (cascade/waterfall resolved)
+      - customer_context: unified customer history data formatting block
     """
 
     # ── Core request data ──────────────────────────────────────────────────
@@ -76,7 +94,7 @@ class AIRequestContext:
     session_history: list = field(default_factory=list)
 
     # ── Context assembled by ContextBuilder ───────────────────────────────
-    llm_context:     LLMContext = field(default_factory=LLMContext)
+    llm_context:     PromptContext = field(default_factory=PromptContext)
 
     # ── State loaded once from DB ─────────────────────────────────────────
     neg_state:       Optional[dict] = None    # negotiation_state from DB
@@ -84,6 +102,10 @@ class AIRequestContext:
 
     # ── Pricing ───────────────────────────────────────────────────────────
     pricing:         Optional[Any] = None     # PricingResult if active
+
+    # ── Centralized Context envelope ──────────────────────────────────────
+    resolved_product: Optional[str] = None
+    customer_context: str = ""
 
     # ── Deferred writes (flushed at pipeline end) ─────────────────────────
     _updates:        dict = field(default_factory=dict)

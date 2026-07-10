@@ -8,5 +8,4 @@ supabase
 tzdata
 reportlab
 streamlit
-mem0ai
 
