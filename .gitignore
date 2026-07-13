@@ -124,3 +124,12 @@ ENV/
 
 # Local Streamlit testing interface
 interface/
+
+# Development helper scripts and configs
+.antigravityignore
+check_intent_prompt.py
+dynamic_prompts.txt
+intent_prompt_version5.txt
+pyrightconfig.json
+regression_test.py
+
