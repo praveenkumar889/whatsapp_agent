@@ -132,4 +132,6 @@ dynamic_prompts.txt
 intent_prompt_version5.txt
 pyrightconfig.json
 regression_test.py
+migrations/
+
 
