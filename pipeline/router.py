@@ -279,6 +279,30 @@ def _load_fast_confirm_prompt(incoming) -> str:
     return get_prompt(incoming, "fast_order_confirm_check_prompt")
 
 
+def _has_invoice_keyword(incoming) -> bool:
+    """
+    DB-driven keyword pre-filter before the invoice-inquiry LLM call.
+
+    Reads the INVOICE_INQUIRY list from the tenant's quick_actions JSON column.
+    If the tenant has no INVOICE_INQUIRY list configured, returns True (safe
+    fallback — always run the LLM rather than silently skip it).
+
+    Run migrations/004_invoice_keyword_shortcuts.sql to seed this list for
+    existing tenants. For new tenants it goes in the INSERT quick_actions JSON.
+
+    By returning False early we avoid a full LLM call (~2.5s) on every
+    non-invoice message (product search, negotiation, quantity updates, etc.).
+    """
+    qa = getattr(incoming, "quick_actions", None)
+    if not qa:
+        return True  # not configured — let LLM decide
+    kws = qa.get("INVOICE_INQUIRY")
+    if not kws:
+        return True  # key missing — let LLM decide
+    text_lower = incoming.text.casefold()
+    return any(kw.casefold() in text_lower for kw in kws)
+
+
 async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
     """
     Guards the negotiation state machine.
@@ -548,8 +572,14 @@ async def _invoice_guard(incoming, session_history: list) -> Optional[str]:
     # ACTUALLY waiting on a Confirm/Proceed reply right now.
     awaiting_conf = bool(pre_neg_state and pre_neg_state.get("awaiting_invoice_confirmation", False))
 
-    # Explicit invoice inquiry ("send invoice", "where is my invoice") is always valid
-    invoice_inquiry = await _is_invoice_inquiry(incoming)
+    # Explicit invoice inquiry ("send invoice", "where is my invoice").
+    # Fast path: skip the LLM entirely if the message has no invoice-related
+    # keywords (checked against tenant's quick_actions INVOICE_INQUIRY list
+    # from DB). Saves ~2.5s on every non-invoice message (product search,
+    # negotiation, quantity updates, etc.).
+    invoice_inquiry = False
+    if _has_invoice_keyword(incoming):
+        invoice_inquiry = await _is_invoice_inquiry(incoming)
 
     is_fast_confirm      = False
     invoice_confirm_req  = False

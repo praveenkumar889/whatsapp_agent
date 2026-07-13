@@ -217,19 +217,16 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
     """
     _t0 = time.monotonic()
 
-    # ── Steps 1-5: Setup (tenant, dedup, lock, history, save) ───────────────
-    ok, session_history = await setup_pipeline(incoming)
+    # ── Steps 1-5: Setup (tenant, dedup, lock, history, save, neg_state) ───
+    # setup_pipeline now returns neg_state too — fetched in parallel with
+    # save_message so we don't pay an extra DB round-trip here.
+    ok, session_history, _neg = await setup_pipeline(incoming)
     if not ok:
         return _empty_result()
 
     try:
-        # ── Step 2.5: Load negotiation state ONCE, cache on incoming ────────
-        # FIX: Previously loaded 3-4x per request across _neg_guard,
-        # _invoice_guard, _resume_negotiation, and product_followup.
-        # Now loaded once here — all downstream reads use incoming._cached_neg_state.
-        from db.session_store import get_negotiation_state as _gns
-        incoming._cached_neg_state = await _gns(incoming.tenant_id, incoming.session_id)
-        _neg = incoming._cached_neg_state
+        # neg_state already loaded + cached on incoming by setup_pipeline
+        # (parallel with save_message — no extra DB call needed here)
 
         # ── Step 3: Classify intent — with NEG BYPASS ───────────────────────
         # FIX: During active negotiation the intent classifier oscillates between
@@ -277,21 +274,22 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         # ── Step 6: Send reply ───────────────────────────────────────────────
         sent_wamid = await _send_reply_chunked(incoming, reply)
 
-        # ── Step 7: Store reply (Mem0 + DB) ─────────────────────────────────
+        # ── Step 7: Store reply (DB) — parallel writes ──────────────────────
         if sent_wamid:
             replied_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-            await update_reply(
-                incoming.message_id, reply, replied_at,
-                getattr(incoming, "_graphrag_raw", None),
+            await asyncio.gather(
+                update_reply(
+                    incoming.message_id, reply, replied_at,
+                    getattr(incoming, "_graphrag_raw", None),
+                ),
+                save_outbound_message(
+                    tenant_id  = incoming.tenant_id,
+                    session_id = incoming.session_id,
+                    message_id = sent_wamid,
+                    text       = reply,
+                    region     = incoming.region,
+                ),
             )
-            await save_outbound_message(
-                tenant_id  = incoming.tenant_id,
-                session_id = incoming.session_id,
-                message_id = sent_wamid,
-                text       = reply,
-                region     = incoming.region,
-            )
-            # No Mem0 task. Postgres updates are done directly.
 
         # ── Step 8: Return debug info ────────────────────────────────────────
         latency = round(time.monotonic() - _t0, 2)

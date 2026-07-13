@@ -63,122 +63,127 @@ _client = AzureOpenAI(
 )
 
 
+async def _send_product_card(incoming, position: int, p: dict) -> None:
+    """
+    Sends one product image card (or text fallback) to the customer.
+    Called in parallel via asyncio.gather — each card is independent.
+    The save_outbound_message is fire-and-forget (audit log, non-blocking).
+    """
+    img_url   = p.get("image_url")
+    name      = p.get("name", "Product")
+    price     = p.get("price_num", 0)
+    reg_price = p.get("regular_price", price)
+    discount  = p.get("discount_percentage", 0)
+    rating    = p.get("rating", 0)
+    reviews   = p.get("review_count", 0)
+
+    caption = f"{position}. {name}\nRs.{float(price):,.0f}"
+    if discount:
+        caption += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
+    if rating:
+        caption += f"\n⭐ {rating} ({reviews} reviews)"
+
+    if img_url:
+        img_wamid = await send_image(incoming, img_url, caption)
+        if img_wamid:
+            print(f"[GRAPHRAG] Image sent for product {position}: {name} — wamid={img_wamid}")
+            asyncio.create_task(save_outbound_message(
+                tenant_id     = incoming.tenant_id,
+                session_id    = incoming.session_id,
+                message_id    = img_wamid,
+                text          = caption,
+                media_url     = img_url,
+                original_type = "image",
+                region        = incoming.region,
+            ))
+    else:
+        reply_wamid = await send_reply(incoming, caption)
+        if reply_wamid:
+            print(f"[GRAPHRAG] No image for product {position}: {name} — sent text card wamid={reply_wamid}")
+            asyncio.create_task(save_outbound_message(
+                tenant_id  = incoming.tenant_id,
+                session_id = incoming.session_id,
+                message_id = reply_wamid,
+                text       = caption,
+                region     = incoming.region,
+            ))
+
+
 async def _send_structured_product_list(incoming, products: list) -> str:
     """
     Builds and sends the full product-list response: caches products,
     saves the selection for follow-up picking, sends image cards for the
-    first 3 products, and returns the numbered text summary.
+    first N products in parallel, and returns the numbered text summary.
 
     Extracted so it can be reused both for the initial GraphRAG response
     AND for a successful retry response — fixes a bug where a successful
     retry with real products silently fell through to returning the
     ORIGINAL error text instead of ever rendering the retried products.
+
+    LATENCY OPTIMIZATIONS:
+      - All DB cache saves are fire-and-forget (asyncio.create_task) — they're
+        for future requests only and don't affect the current response.
+      - Product image cards are sent in parallel (asyncio.gather) instead of
+        sequentially — saves 1-2s when max_image_products >= 2.
     """
     print(f"[GRAPHRAG] Got {len(products)} products from structured response")
 
     if len(products) == 1:
-        try:
-            from db.session_store import save_last_discussed_product
-            pname = products[0].get("name") or products[0].get("product_name")
-            if pname:
-                await save_last_discussed_product(incoming.tenant_id, incoming.session_id, pname)
-        except Exception as e:
-            print(f"[GRAPHRAG] Failed to save single product context: {e}")
+        pname = products[0].get("name") or products[0].get("product_name")
+        if pname:
+            asyncio.create_task(save_last_discussed_product(incoming.tenant_id, incoming.session_id, pname))
 
-    try:
-        _t_cache_save_start = time.monotonic()
-        batch_items = []
-        for p in products:
-            sku = p.get("sku")
-            if sku:
-                cached_item = [{
-                    "product_name":               p.get("name"),
-                    "list_price":                 float(p.get("price_num", 0)),
-                    "sku":                        sku,
-                    "image_url":                  p.get("image_url"),
-                    "installation_url":           p.get("installation_url"),
-                    "product_url":                p.get("url"),
-                    "discount_pct":               p.get("discount_percentage", 0),
-                    "regular_price":              p.get("regular_price", p.get("price_num", 0)),
-                    "features":                   [],
-                    "specs":                      [],
-                    "review_count":               p.get("review_count", 0),
-                    "rating":                     p.get("rating", 0),
-                    "policies":                   [],
-                    "faqs":                       [],
-                    "warranties":                 [],
-                    "warranty":                   p.get("warranty", ""),
-                    "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
-                    "feature_descriptions":       p.get("feature_descriptions", ""),
-                }]
-                batch_items.append({"sku": sku, "api_response": cached_item})
+    # Build batch cache items (sync — just dict construction, no I/O)
+    batch_items = []
+    for p in products:
+        sku = p.get("sku")
+        if sku:
+            cached_item = [{
+                "product_name":               p.get("name"),
+                "list_price":                 float(p.get("price_num", 0)),
+                "sku":                        sku,
+                "image_url":                  p.get("image_url"),
+                "installation_url":           p.get("installation_url"),
+                "product_url":                p.get("url"),
+                "discount_pct":               p.get("discount_percentage", 0),
+                "regular_price":              p.get("regular_price", p.get("price_num", 0)),
+                "features":                   [],
+                "specs":                      [],
+                "review_count":               p.get("review_count", 0),
+                "rating":                     p.get("rating", 0),
+                "policies":                   [],
+                "faqs":                       [],
+                "warranties":                 [],
+                "warranty":                   p.get("warranty", ""),
+                "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
+                "feature_descriptions":       p.get("feature_descriptions", ""),
+            }]
+            batch_items.append({"sku": sku, "api_response": cached_item})
 
-        from db.session_store import save_product_api_responses_batch
-        await save_product_api_responses_batch(incoming.tenant_id, batch_items)
-        print(f"[TIMING] Product cache batch save ({len(batch_items)} products): {time.monotonic() - _t_cache_save_start:.2f}s")
-    except Exception as e:
-        print(f"[GRAPHRAG] Cache save failed (non-critical): {e}")
+    # Fire-and-forget: all three cache saves are for future requests only.
+    # Moving these off the critical path saves ~400-600ms per product-list response.
+    if batch_items:
+        asyncio.create_task(save_product_api_responses_batch(incoming.tenant_id, batch_items))
+    asyncio.create_task(save_graphrag_product_selection(
+        tenant_id  = incoming.tenant_id,
+        session_id = incoming.session_id,
+        products   = products,
+    ))
+    _go = next((p.get("global_offers") for p in products if p.get("global_offers")), None)
+    if _go:
+        asyncio.create_task(save_tenant_offers(tenant_id=incoming.tenant_id, offers_text=_go))
 
-    try:
-        await save_graphrag_product_selection(
-            tenant_id  = incoming.tenant_id,
-            session_id = incoming.session_id,
-            products   = products,
-        )
-        print(f"[GRAPHRAG] Product selection saved to workflow_sessions")
-    except Exception as e:
-        print(f"[GRAPHRAG] Selection save failed (non-critical): {e}")
-
-    try:
-        _go = next((p.get("global_offers") for p in products if p.get("global_offers")), None)
-        if _go:
-            await save_tenant_offers(tenant_id=incoming.tenant_id, offers_text=_go)
-    except Exception as e:
-        print(f"[GRAPHRAG] tenant_offers save failed (non-critical): {e}")
-
+    # Send image cards in parallel — all cards are independent of each other.
+    # Previously sequential (each awaited before starting next), costing
+    # N × ~1s. Now all fire simultaneously and we wait for the slowest one.
     MAX_IMAGE_PRODUCTS = getattr(incoming, "max_image_products", None) or 3
-    for i, p in enumerate(products, 1):
-        if i > MAX_IMAGE_PRODUCTS:
-            break
-
-        img_url   = p.get("image_url")
-        name      = p.get("name", "Product")
-        price     = p.get("price_num", 0)
-        reg_price = p.get("regular_price", price)
-        discount  = p.get("discount_percentage", 0)
-        rating    = p.get("rating", 0)
-        reviews   = p.get("review_count", 0)
-
-        caption = f"{i}. {name}\nRs.{float(price):,.0f}"
-        if discount:
-            caption += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
-        if rating:
-            caption += f"\n⭐ {rating} ({reviews} reviews)"
-
-        if img_url:
-            img_wamid = await send_image(incoming, img_url, caption)
-            if img_wamid:
-                print(f"[GRAPHRAG] Image sent for product {i}: {name} — wamid={img_wamid}")
-                await save_outbound_message(
-                    tenant_id     = incoming.tenant_id,
-                    session_id    = incoming.session_id,
-                    message_id    = img_wamid,
-                    text          = caption,
-                    media_url     = img_url,
-                    original_type = "image",
-                    region        = incoming.region,
-                )
-        else:
-            reply_wamid = await send_reply(incoming, caption)
-            if reply_wamid:
-                print(f"[GRAPHRAG] No image for product {i}: {name} — sent text card wamid={reply_wamid}")
-                await save_outbound_message(
-                    tenant_id  = incoming.tenant_id,
-                    session_id = incoming.session_id,
-                    message_id = reply_wamid,
-                    text       = caption,
-                    region        = incoming.region,
-                )
+    card_tasks = [
+        _send_product_card(incoming, i, p)
+        for i, p in enumerate(products, 1)
+        if i <= MAX_IMAGE_PRODUCTS
+    ]
+    if card_tasks:
+        await asyncio.gather(*card_tasks, return_exceptions=True)
 
     lines = [_reply_prompt(
         incoming, "graphrag_product_list_header_prompt",

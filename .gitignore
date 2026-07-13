@@ -121,3 +121,6 @@ ENV/
 # Local env files
 .env
 .env.*
+
+# Local Streamlit testing interface
+interface/

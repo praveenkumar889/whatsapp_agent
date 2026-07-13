@@ -3,9 +3,12 @@
 # Loads ALL prompt columns from tenants table into incoming object.
 # No defaults, no fallbacks — every prompt must be set in DB.
 
+import asyncio
+
 from models.schemas import IncomingMessage
 from db.session_store import (
     resolve_tenant_id, is_duplicate, get_session_history, save_message,
+    get_negotiation_state,
 )
 from db.processing_lock import acquire_lock
 
@@ -45,7 +48,7 @@ PROMPT_COLUMNS = [
 
 async def setup_pipeline(incoming: IncomingMessage) -> tuple:
     """
-    Returns (True, session_history) to continue, or (False, None) to abort.
+    Returns (True, session_history, neg_state) to continue, or (False, None, None) to abort.
 
     LOCK OWNERSHIP INVARIANT (important for callers):
         If this returns (True, ...), the caller now owns the processing lock
@@ -59,33 +62,68 @@ async def setup_pipeline(incoming: IncomingMessage) -> tuple:
         exception from this function — doing so can delete a DIFFERENT,
         currently-active request's lock, since processing_locks is keyed
         only by session_id.
+
+    LATENCY OPTIMIZATIONS:
+        Phase A — parallel: dedup check + history fetch + quoted caption resolve
+                  (all independent once tenant_id is known; saves ~150ms vs sequential)
+        Phase B — after lock: parallel: neg_state fetch + save_message
+                  (independent writes; saves ~100ms and makes neg_state available
+                  to main.py without a second DB round-trip)
     """
+    # Step 1: resolve tenant — required first, provides tenant_id for all queries below
     tenant_info = await resolve_tenant_id(incoming.phone_number_id)
     if tenant_info is None:
         print(f"[PIPELINE] Unknown phone_number_id={incoming.phone_number_id} — skipping")
-        return False, None
+        return False, None, None
 
     _apply_tenant(incoming, tenant_info)
     _resolve_media_unsupported_marker(incoming)
     _log_incoming(incoming)
 
-    await _resolve_quoted_caption(incoming)
+    # Step 2: parallel — dedup + history + quoted-caption (all independent)
+    dedup_result, history_result, _ = await asyncio.gather(
+        is_duplicate(incoming.message_id, incoming.tenant_id),
+        get_session_history(incoming.tenant_id, incoming.session_id, limit=10),
+        _resolve_quoted_caption(incoming),
+        return_exceptions=True,
+    )
 
-    if await is_duplicate(incoming.message_id, incoming.tenant_id):
+    if isinstance(dedup_result, BaseException):
+        print(f"[PIPELINE] Dedup check error: {dedup_result}")
+        return False, None, None
+    if dedup_result:
         print(f"[PIPELINE] Duplicate — skipping {incoming.message_id}")
-        return False, None
+        return False, None, None
 
+    session_history: list = []
+    if isinstance(history_result, BaseException):
+        print(f"[PIPELINE] History fetch error (non-critical): {history_result}")
+    else:
+        session_history = history_result or []
+    print(f"[DB] History from Postgres — {len(session_history)} turns")
+
+    # Step 3: acquire lock — must be after dedup passes
     if not await acquire_lock(incoming.session_id, incoming.tenant_id):
         print(f"[PIPELINE] Already processing {incoming.session_id} — skipping")
-        return False, None
+        return False, None, None
 
-    # From this point on, THIS request holds the lock. Anything that fails
-    # below must release it before returning/raising — otherwise it leaks
-    # until cleanup_stale_locks() catches it (up to ~2 minutes later).
+    # Step 4: parallel — save message + fetch negotiation state
+    # From this point on THIS request holds the lock — release on any error.
     try:
-        session_history = await _get_history(incoming)
-        await save_message(incoming)
-        return True, session_history
+        neg_result, save_result = await asyncio.gather(
+            get_negotiation_state(incoming.tenant_id, incoming.session_id),
+            save_message(incoming),
+            return_exceptions=True,
+        )
+        if isinstance(save_result, BaseException):
+            print(f"[PIPELINE] Save message error (non-critical): {save_result}")
+        neg_state = None
+        if isinstance(neg_result, BaseException):
+            print(f"[PIPELINE] Neg state fetch error (non-critical): {neg_result}")
+        else:
+            neg_state = neg_result
+        incoming._cached_neg_state = neg_state
+        return True, session_history, neg_state
     except Exception:
         from db.processing_lock import release_lock as _release_lock
         try:
@@ -201,7 +239,3 @@ async def _resolve_quoted_caption(incoming: IncomingMessage) -> None:
         print(f"[ADAPTER] Quoted message lookup failed: {e}")
 
 
-async def _get_history(incoming: IncomingMessage) -> list:
-    pg = await get_session_history(incoming.tenant_id, incoming.session_id, limit=10)
-    print(f"[DB] History from Postgres — {len(pg)} turns")
-    return pg
