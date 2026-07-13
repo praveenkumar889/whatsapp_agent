@@ -123,7 +123,7 @@ ENV/
 .env.*
 
 # Local Streamlit testing interface
-interface/
+# interface/
 
 # Development helper scripts and configs
 .antigravityignore
