@@ -220,54 +220,25 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         from pipeline.setup import get_history as _gh, save_message as _sm
         from db.session_store import get_dialogue_state as _gds
 
-        _txt_lower = incoming.text.strip().lower()
-        _skip_taxonomy = (
-            not _txt_lower.isdigit()
-            and _txt_lower in {
-                "hi", "hello", "hey", "hii", "hiii", "thanks",
-                "thank you", "thankyou", "bye", "good morning",
-                "good afternoon", "good evening", "👋", "🙏", "👍",
-            }
-        )
-        incoming._skip_taxonomy = _skip_taxonomy
-
         _t_prep = time.monotonic()
-        if _skip_taxonomy:
-            print(f"[TAXONOMY] Skipping MCP taxonomy for trivial message: '{_txt_lower}'")
-            session_history, _, incoming._cached_state = await asyncio.gather(
-                _gh(incoming),
-                _sm(incoming),
-                _gds(incoming.tenant_id, incoming.session_id),
-            )
-            taxonomy_hints = {}
-        else:
-            session_history, _, incoming._cached_state, taxonomy_hints = await asyncio.gather(
-                _gh(incoming),
-                _sm(incoming),
-                _gds(incoming.tenant_id, incoming.session_id),
-                get_taxonomy_hints_mcp(incoming.text),
-            )
+        session_history, _, incoming._cached_state, taxonomy_hints = await asyncio.gather(
+            _gh(incoming),
+            _sm(incoming),
+            _gds(incoming.tenant_id, incoming.session_id),
+            get_taxonomy_hints_mcp(incoming.text),
+        )
         print(f"[TIMING] Parallel setup (history/save/state/taxonomy): {time.monotonic() - _t_prep:.2f}s")
 
         # ── Step 3: Update Dialogue State ───────────────────────
-        # Fast-path: skip LLM intent classification for obvious greetings
-        if _skip_taxonomy:
-            from models.schemas import DialogueState
-            state = DialogueState(
-                followup='no', negotiation_status='none',
-                category='', product_name='', product_skus=[], intent='GREETING',
-            )
-            print(f"[TIMING] update_dialogue_state: 0.00s (fast-path GREETING)")
-        else:
-            _t_intent = time.monotonic()
-            state = await update_dialogue_state(
-                customer_message = incoming.text,
-                previous_state   = incoming._cached_state,
-                session_history  = session_history,
-                taxonomy_hints   = taxonomy_hints,
-                incoming         = incoming,
-            )
-            print(f"[TIMING] update_dialogue_state: {time.monotonic() - _t_intent:.2f}s")
+        _t_intent = time.monotonic()
+        state = await update_dialogue_state(
+            customer_message = incoming.text,
+            previous_state   = incoming._cached_state,
+            session_history  = session_history,
+            taxonomy_hints   = taxonomy_hints,
+            incoming         = incoming,
+        )
+        print(f"[TIMING] update_dialogue_state: {time.monotonic() - _t_intent:.2f}s")
         print(f"[STATE]   {state.intent} | {state.product_name}")
 
         from db.session_store import save_dialogue_state as _sds
