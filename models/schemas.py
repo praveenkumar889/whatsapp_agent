@@ -141,6 +141,8 @@ class DialogueState:
     product_name: str
     product_skus: List[str]
     intent: str
+    reply: Optional[str] = None
+    operation: Optional[str] = None
 
 
 

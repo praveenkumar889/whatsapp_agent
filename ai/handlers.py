@@ -35,7 +35,20 @@ DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION",
 
 BASE_INTENT_CLASSIFIER_PROMPT = """You are an expert conversational Intent Classifier and Dialogue State Tracker for WhatsApp AI agents.
 Your task is to analyze the customer's message and classify their intent accurately based on the tenant's specific rules and business domain attached below.
-Always reply ONLY with a valid JSON object matching the required schema. Do not include explanation or markdown formatting."""
+Always reply ONLY with a valid JSON object matching the required schema. Do not include explanation or markdown formatting.
+
+CRITICAL SINGLE-PASS OPTIMIZATION RULE:
+If the classified intent is GREETING, UNKNOWN, or operation is "OTHER" (and does not require product search, category browsing, or workflow action), also output a "reply" field in the JSON containing a polite, welcoming, direct conversational response in the tenant's brand voice (e.g. welcoming them to the store and briefly offering options: Browse LED catalogue, Place/track an order, Connect with team).
+Schema format:
+{
+  "intent": "GREETING" | "BROWSE_CATEGORY" | "FIND_PRODUCT" | "GET_PRODUCT_INFO" | "CHECK_POLICY" | "WORKFLOW_ACTION" | "HUMAN_ESCALATION" | "UNKNOWN",
+  "confidence_score": 0.95,
+  "operation": "OTHER" | "NEW_SEARCH" | "MODIFY_WORKFLOW",
+  "category": "",
+  "product_name": "",
+  "followup": "no",
+  "reply": "Optional reply text when intent is GREETING/UNKNOWN/OTHER"
+}"""
 
 async def update_dialogue_state(
     customer_message: str,
@@ -93,6 +106,8 @@ async def update_dialogue_state(
             product_name=str(parsed.get("product_name", parsed.get("product name", ""))),
             product_skus=parsed.get("product_skus", parsed.get("product skus", [])),
             intent=str(parsed.get("intent", "UNKNOWN")).upper(),
+            reply=parsed.get("reply"),
+            operation=str(parsed.get("operation", "OTHER")).upper() if parsed.get("operation") else None,
         )
         if isinstance(state.product_skus, str):
             state.product_skus = [state.product_skus]
@@ -115,6 +130,8 @@ async def update_dialogue_state(
         product_name="",
         product_skus=[],
         intent="UNKNOWN",
+        reply=None,
+        operation=None,
     )
 
 

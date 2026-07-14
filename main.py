@@ -220,13 +220,29 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         from pipeline.setup import get_history as _gh, save_message as _sm
         from db.session_store import get_dialogue_state as _gds
 
+        _txt_strip = incoming.text.strip()
+        _words = _txt_strip.split()
+        # Structural check: short conversational turns (<=3 words without digits/SKUs/dimensions)
+        # skip expensive remote vector searches (~4.5s GraphRAG taxonomy + ~4.2s Mem0 retrieval)
+        _skip_vector_search = (len(_words) <= 3 and not any(c.isdigit() for c in _txt_strip))
+        incoming._skip_vector_search = _skip_vector_search
+
         _t_prep = time.monotonic()
-        session_history, _, incoming._cached_state, taxonomy_hints = await asyncio.gather(
-            _gh(incoming),
-            _sm(incoming),
-            _gds(incoming.tenant_id, incoming.session_id),
-            get_taxonomy_hints_mcp(incoming.text),
-        )
+        if _skip_vector_search:
+            print(f"[TAXONOMY] Structural bypass for short input ('{_txt_strip}') — skipping remote vector searches")
+            session_history, _, incoming._cached_state = await asyncio.gather(
+                _gh(incoming),
+                _sm(incoming),
+                _gds(incoming.tenant_id, incoming.session_id),
+            )
+            taxonomy_hints = {}
+        else:
+            session_history, _, incoming._cached_state, taxonomy_hints = await asyncio.gather(
+                _gh(incoming),
+                _sm(incoming),
+                _gds(incoming.tenant_id, incoming.session_id),
+                get_taxonomy_hints_mcp(incoming.text),
+            )
         print(f"[TIMING] Parallel setup (history/save/state/taxonomy): {time.monotonic() - _t_prep:.2f}s")
 
         # ── Step 3: Update Dialogue State ───────────────────────

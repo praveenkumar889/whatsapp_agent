@@ -19,6 +19,12 @@ async def dispatch(incoming, state, session_history: list) -> str:
     """
     intent = state.intent
 
+    # Fast-path: check if single-pass State Tracker already produced a reply
+    if getattr(state, "reply", None) and state.reply.strip():
+        if intent in ("GREETING", "UNKNOWN") or getattr(state, "operation", "") == "OTHER":
+            print(f"[DISPATCH] Using State Tracker single-pass reply for {intent} (0.0s)")
+            return state.reply.strip()
+
     # Fast-path: GREETING and HUMAN_ESCALATION never need negotiation/invoice guards
     if intent == "GREETING":
         from ai.handlers import handle_greeting
