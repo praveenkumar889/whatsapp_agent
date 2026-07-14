@@ -136,6 +136,28 @@ def _get_time_greeting(timezone_str: str) -> tuple:
 
 async def handle_greeting(incoming: IncomingMessage) -> str:
     time_of_day, time_greeting = _get_time_greeting(incoming.timezone)
+    name = incoming.sender_name or "there"
+    biz = incoming.biz_name or "Inventaa LED Lights"
+    tagline = getattr(incoming, "tagline", None) or "LED Lighting Solutions | Made in India"
+
+    # Fast-path: return instant (<1ms) greeting template for standard greetings
+    # without making an expensive ~4-second Azure OpenAI LLM call.
+    if getattr(incoming, '_skip_taxonomy', False):
+        txt_lower = incoming.text.strip().lower()
+        if txt_lower in {"bye", "goodbye", "cya", "see you"}:
+            print(f"[GREETING] Instant fast-path GOODBYE")
+            return f"Thank you for contacting {biz}, {name}! 🙏 Have a wonderful {time_of_day}! Feel free to message us anytime you need assistance. 💡"
+        if txt_lower in {"thanks", "thank you", "thankyou", "thx", "🙏", "👍", "🙌"}:
+            print(f"[GREETING] Instant fast-path ACKNOWLEDGEMENT")
+            return f"You're very welcome, {name}! 😊 Let us know if you need any further help with our LED lighting collections or your orders. 💡"
+        print(f"[GREETING] Instant fast-path WELCOME MENU")
+        return (
+            f"{time_greeting}, {name}! 👋 Welcome to {biz} — {tagline}. 💡\n\n"
+            "How can I help you today?\n"
+            "• 💡 *Browse LED catalogue*\n"
+            "• 📦 *Place or track an order*\n"
+            "• 🙋 *Connect with our team*"
+        )
 
     system_prompt = get_prompt(
         incoming, "greeting_system_prompt",

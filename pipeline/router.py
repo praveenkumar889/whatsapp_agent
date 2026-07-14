@@ -17,6 +17,17 @@ async def dispatch(incoming, state, session_history: list) -> str:
     Main routing function — returns reply string.
     All imports are local to avoid circular import chain.
     """
+    intent = state.intent
+
+    # Fast-path: GREETING and HUMAN_ESCALATION never need negotiation/invoice guards
+    if intent == "GREETING":
+        from ai.handlers import handle_greeting
+        return await handle_greeting(incoming)
+
+    if intent == "HUMAN_ESCALATION":
+        from ai.handlers import handle_escalation
+        return await handle_escalation(incoming)
+
     # Performance: load negotiation state ONCE and cache on incoming object.
     # Previously loaded 3-4× per request across _neg_guard, _invoice_guard,
     # _resume_negotiation, and _try_resolve_product_followup.
@@ -34,17 +45,6 @@ async def dispatch(incoming, state, session_history: list) -> str:
     reply = await _invoice_guard(incoming, session_history)
     if reply:
         return reply
-
-    # Main intent routing
-    intent     = state.intent
-
-    if intent == "GREETING":
-        from ai.handlers import handle_greeting
-        return await handle_greeting(incoming)
-
-    if intent == "HUMAN_ESCALATION":
-        from ai.handlers import handle_escalation
-        return await handle_escalation(incoming)
 
     # All other intents dynamically defined in the tenant's prompt route to GraphRAG / Catalog
     from ai.graphrag_handler import call_graphrag_api

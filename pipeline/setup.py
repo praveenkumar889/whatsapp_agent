@@ -148,6 +148,10 @@ async def _resolve_quoted_caption(incoming: IncomingMessage) -> None:
 
 
 async def _get_history(incoming: IncomingMessage) -> list:
+    if getattr(incoming, '_skip_taxonomy', False):
+        pg = await get_session_history(incoming.tenant_id, incoming.session_id, limit=10)
+        print(f"[DB] History from Postgres (fast-path) — {len(pg)} turns")
+        return pg
     mem0 = await get_relevant_context(
         incoming.tenant_id, incoming.session_id, incoming.text, limit=6,
     )
