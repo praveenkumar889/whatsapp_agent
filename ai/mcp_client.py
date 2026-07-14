@@ -124,14 +124,18 @@ async def get_taxonomy_context_mcp(
             res = await client.call_tool("get_taxonomy_context", {"query": query, "threshold": threshold})
             data = getattr(res, "data", None)
             if data is not None and isinstance(data, dict):
-                return data.get("taxonomy", data.get("hints", {}))
+                hints = data.get("taxonomy", data.get("hints", {}))
+                print(f"[MCP-CLIENT] Ingested Taxonomy Hints: {json.dumps(hints)}")
+                return hints
             content = getattr(res, "content", None)
             if isinstance(content, list) and len(content) > 0:
                 for item in content:
                     if hasattr(item, "text") and item.text:
                         try:
                             parsed = json.loads(item.text)
-                            return parsed.get("taxonomy", parsed.get("hints", {}))
+                            hints = parsed.get("taxonomy", parsed.get("hints", {}))
+                            print(f"[MCP-CLIENT] Ingested Taxonomy Hints: {json.dumps(hints)}")
+                            return hints
                         except Exception:
                             pass
             return {}

@@ -304,22 +304,37 @@ async def _resolve_category_from_message(incoming, text: str, categories: list) 
             cleaned = _clean_category_name(cat)
             print(f"[CATEGORY] Exact match: '{cleaned}'")
             return cleaned
+
+    # Collect all substring matches
+    substring_matches = []
     for cat in categories:
         if cat.lower() in text_lower or text_lower in cat.lower():
-            cleaned = _clean_category_name(cat)
-            print(f"[CATEGORY] Substring match: '{cleaned}'")
-            return cleaned
+            substring_matches.append(cat)
+    if len(substring_matches) == 1:
+        cleaned = _clean_category_name(substring_matches[0])
+        print(f"[CATEGORY] Unambiguous substring match: '{cleaned}'")
+        return cleaned
+
+    # Collect all word-overlap matches
     text_words = {w for w in text_lower.split() if len(w) > 3}
-    best_cat, best_overlap = None, 0
+    best_overlap = 0
+    best_cats = []
     for cat in categories:
         cat_words = {w for w in cat.lower().split() if len(w) > 3}
         overlap = len(text_words & cat_words)
         if overlap > best_overlap:
-            best_overlap, best_cat = overlap, cat
-    if best_overlap >= 2 or (best_overlap >= 1 and len(text_words) <= 2):
-        cleaned = _clean_category_name(best_cat)
-        print(f"[CATEGORY] Word-overlap match ({best_overlap} words): '{cleaned}'")
+            best_overlap = overlap
+            best_cats = [cat]
+        elif overlap == best_overlap and overlap > 0:
+            best_cats.append(cat)
+            
+    if len(best_cats) == 1 and (best_overlap >= 2 or (best_overlap >= 1 and len(text_words) <= 2)):
+        cleaned = _clean_category_name(best_cats[0])
+        print(f"[CATEGORY] Unambiguous word-overlap match ({best_overlap} words): '{cleaned}'")
         return cleaned
+    
+    if len(substring_matches) > 1 or len(best_cats) > 1:
+        print(f"[CATEGORY] Ambiguous matches found (substrings: {len(substring_matches)}, overlaps: {len(best_cats)}). Deferring to broad query.")
 
     # 3. LLM semantic fallback
     try:
@@ -462,9 +477,7 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, st
             if _client_intent_data is None and state and getattr(state, "intent", None):
                 intent_val = str(state.intent).lower()
                 cat_kws = [state.category] if getattr(state, "category", "") else []
-                if not cat_kws and len(graphrag_text.split()) <= 6:
-                    cat_kws = [graphrag_text.strip()]
-                intent_to_use = "browse_category" if cat_kws and not getattr(state, "product_name", "") else (intent_val if intent_val in ("browse_category", "find_product", "get_product_info", "check_policy", "get_advice") else "find_product")
+                intent_to_use = "browse_category" if cat_kws and not getattr(state, "product_name", "") else (intent_val if intent_val in ("browse_category", "find_product", "get_product_info", "check_policy") else "find_product")
                 _client_intent_data = {
                     "intent": intent_to_use,
                     "category_keywords": cat_kws,

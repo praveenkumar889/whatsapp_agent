@@ -21,37 +21,6 @@ _client = AzureOpenAI(
     api_version    = AZURE_AI_API_VERSION,
 )
 
-SYSTEM_PROMPT = """You are an expert conversational Intent Classifier and Slot Extractor for an electrical & lighting catalog agent.
-Analyze the user's query and conversation context, and output ONLY a valid JSON object matching this schema:
-
-{
-  "intent": "browse_category" | "find_product" | "get_product_info" | "check_policy" | "get_advice" | "unknown",
-  "category_keywords": ["..."],
-  "feature_keywords": ["..."],
-  "product_name": "string or null",
-  "filters": {
-    "category": "string or null",
-    "application": "string or null",
-    "brand": "string or null"
-  },
-  "preferences": {
-    "max_price": number or null
-  }
-}
-
-Definitions:
-- browse_category: User asks to see collections or broad categories (e.g. "show indoor lights", "what outdoor categories do you have?").
-- find_product: User asks for products matching features/use case/name or comparing products (e.g. "compare athena and oxana", "solar gate lights under 1500").
-- get_product_info: User asks for specific details, price, or specs of a known product.
-- check_policy: User asks about warranty, returns, delivery, shipping, company info.
-- get_advice: User asks for recommendation or technical guidance.
-- unknown: Completely irrelevant greeting or random message.
-
-Rules:
-- Output ONLY pure JSON. No markdown backticks, no explanations.
-- If the user asks for a broad group like "indoor lights", "outdoor lights", or "solar lights", set "intent": "browse_category", set "category_keywords" to the broad term (e.g. ["indoor"]), and leave "filters.category" as null so the customer is shown the collection list.
-"""
-
 from ai.timing import log_timing
 
 @log_timing("IntentClassifier.classify_user_intent_client_side")
@@ -72,13 +41,13 @@ async def classify_user_intent_client_side(
         if taxonomy_hints:
             tax_str = f"\n\nCandidate Database Taxonomy Tags:\n{json.dumps(taxonomy_hints)}"
         
-        system_prompt = SYSTEM_PROMPT
+        system_prompt = "You are an expert conversational Intent Classifier."
         if incoming:
             try:
                 from db.prompt_store import get_prompt
-                tenant_prompt = get_prompt(incoming, "intent_system_prompt", biz_name=getattr(incoming, "biz_name", "Inventaa LED Lights"))
+                tenant_prompt = get_prompt(incoming, "graphrag_intent_prompt", biz_name=getattr(incoming, "biz_name", "Inventaa LED Lights"))
                 if tenant_prompt:
-                    system_prompt = f"{SYSTEM_PROMPT}\n\n=== TENANT SPECIFIC INTENT CLASSIFICATION RULES ===\n{tenant_prompt}"
+                    system_prompt = tenant_prompt
             except Exception as e:
                 logger.warning(f"[INTENT-CLIENT] Could not load tenant intent prompt from Supabase: {e}")
 
