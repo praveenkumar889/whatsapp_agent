@@ -93,25 +93,173 @@ class ContextBuilder:
         self.tenant_id  = arc.tenant_id
         self.session_id = arc.session_id
 
-    async def build(self, max_results: int = 3) -> "PromptContext":
-        """Builds PromptContext directly from database tables using CustomerDataService."""
+    async def build(self, max_results: int = 3, force_refresh: bool = False) -> "PromptContext":
+        """
+        Builds PromptContext directly from database tables using CustomerDataService.
+
+        force_refresh: bypasses the per-request (intent, workflow) cache below.
+        Needed when the caller just wrote fresh data (e.g. GraphRAG updating
+        product_cache) and must re-read it within the same request instead of
+        getting back the PromptContext built before that write happened.
+        """
         from ai.request_context import PromptContext
         from db.customer_data_service import CustomerDataService
-        from db.session_store import get_cached_product_by_name, get_session_history
-        from ai.product_context_resolver import ProductContextResolver
 
         # Check request cache first
         cache_key = f"_ctx_{self.arc.intent}_{self.arc.workflow}"
-        if hasattr(self.arc, cache_key):
+        if not force_refresh and hasattr(self.arc, cache_key):
             return getattr(self.arc, cache_key)
 
         cds = CustomerDataService(self.tenant_id, self.session_id)
 
-        # 1. Resolve product context and attach to request context envelope
-        pname = await ProductContextResolver.resolve(self.tenant_id, self.session_id, self.arc.neg_state)
+        # Dynamic, per-message signal already computed by the intent
+        # classifier (RoutingDecision) — not a hardcoded per-intent rule,
+        # so it works identically for every tenant. When routing is
+        # unavailable (e.g. main.py's NEG BYPASS / awaiting-quantity bypass
+        # skip classify_intent entirely), default to fetching everything —
+        # that matches current behavior and only skips when we have
+        # positive confirmation the data goes unused.
+        #
+        # Customer-profile data (preferences/negotiation history/orders) is
+        # only actually consumed downstream via the arc.customer_context
+        # text block, which is already gated on this exact condition a few
+        # lines below. Its OTHER outputs — customer_preferences/
+        # negotiation_profile/conversation_summary on PromptContext — aren't
+        # read by any live prompt yet (ai/product_followup.py's
+        # pf_main_followup_prompt call still hardcodes these to "" pending
+        # that wiring). So skipping the fetch entirely when neither flag is
+        # set removes several DB round-trips per message with no change in
+        # the actual reply.
+        #
+        # Product-context resolution stays unconditional — routing's own
+        # needs_product_context flag doesn't reliably track when
+        # arc.resolved_product is actually needed (production logs show it
+        # False even when requested_knowledge_field is set), so gating on
+        # it would risk breaking the installation/warranty/spec
+        # detail-lookup path.
+        routing = getattr(self.arc.result, "routing", None)
+        _customer_flags_true = bool(routing) and (
+            getattr(routing, "needs_customer_context", False)
+            or getattr(routing, "needs_customer_history", False)
+        )
+        _needs_customer_fetch = True if routing is None else _customer_flags_true
+
+        if _needs_customer_fetch:
+            # Product-context resolution and customer-profile/history are
+            # fully independent of each other (neither's DB reads depend on
+            # the other's result) — run both chains concurrently instead of
+            # sequentially, then combine their results below.
+            (pname, p, active_product_session, knowledge_state, knowledge_context), \
+            (prefs, summary, conv_str) = await asyncio.gather(
+                self._resolve_product_context(),
+                self._resolve_customer_context(cds),
+            )
+        else:
+            pname, p, active_product_session, knowledge_state, knowledge_context = \
+                await self._resolve_product_context()
+            prefs, summary, conv_str = {}, {}, ""
         self.arc.resolved_product = pname
 
-        # Determine if active product session
+        # 2. Format product details for LLM
+        product_str = ""
+        if pname and p:
+            fmt = getattr(self.arc.incoming, "cb_product_format", None) or "{name} | Rs.{price}"
+            product_str = fmt.replace("{name}", str(p.get("product_name") or pname)) \
+                             .replace("{price}", str(p.get("price") or 0)) \
+                             .replace("{warranty}", str(p.get("warranty") or "N/A")) \
+                             .replace("{waterproof}", str(p.get("waterproof") or "N/A"))
+            prefix = getattr(self.arc.incoming, "cb_product_marker", "PRODUCT_CONTEXT:")
+            product_str = f"{prefix} {product_str}"
+
+        # 3. Format workflow snapshot
+        workflow_str = ""
+        if self.arc.neg_state:
+            state = self.arc.workflow
+            fmt_state = getattr(self.arc.incoming, "cb_workflow_format_state", "State: {state}")
+            workflow_str = fmt_state.replace("{state}", state)
+            prod_name = self.arc.neg_state.get("product_name")
+            q = self.arc.neg_state.get("quantity")
+            op = self.arc.neg_state.get("offer_price")
+            if prod_name and q:
+                fmt_prod = getattr(self.arc.incoming, "cb_workflow_format_product", " - {product} x{quantity}")
+                workflow_str += fmt_prod.replace("{product}", prod_name).replace("{quantity}", str(q))
+            if op:
+                fmt_price = getattr(self.arc.incoming, "cb_workflow_format_price", " @ Rs.{offer_price}")
+                workflow_str += fmt_price.replace("{offer_price}", str(op))
+            prefix = getattr(self.arc.incoming, "cb_workflow_marker", "WORKFLOW_SNAPSHOT:")
+            workflow_str = f"{prefix} {workflow_str}"
+
+        # 4. Format preferences (reused from the customer summary fetch above —
+        # avoids a second query against the same customer_preferences row)
+        prefs_str = ""
+        if prefs:
+            parts = [f"{k}: {v}" for k, v in prefs.items() if v]
+            prefix = getattr(self.arc.incoming, "cb_preferences_prefix", "Preferences - ")
+            prefs_str = prefix + ", ".join(parts) if parts else ""
+
+        # 5. Format negotiation summary / profile (reuses the same limit=10
+        # negotiation list already fetched inside get_customer_summary()
+        # instead of issuing an identical second query)
+        neg_str = ""
+        avg_disc = summary.get("avg_negotiation_discount_pct")
+        if avg_disc is not None:
+            neg_str = f"Typically accepts {avg_disc}% discount"
+            negs = summary.get("_negotiations", [])
+            rounds = [int(n["rounds"]) for n in negs if n.get("rounds") is not None]
+            prices = [float(n["final_price"]) for n in negs if n.get("accepted") and n.get("final_price") is not None]
+            if rounds:
+                avg_rounds = round(sum(rounds)/len(rounds), 1)
+                neg_str += f" in {avg_rounds} rounds"
+            if len(prices) >= 2:
+                neg_str += f", budget Rs.{int(min(prices)):,} - Rs.{int(max(prices)):,}"
+
+        # 6. conv_str already computed by _resolve_customer_context()
+
+        # 7. Format customer history block if needs_customer_context or history is true
+        # (reuses _customer_flags_true computed above — same condition as
+        # the fetch gate, so `summary` is always real data here, never the
+        # {} placeholder from the skipped-fetch path)
+        customer_context = ""
+        if _customer_flags_true:
+            try:
+                customer_context = await self._build_customer_context_text(cds, summary)
+            except Exception as e:
+                print(f"[CONTEXT] Formatting customer_context failed: {e}")
+
+        # Save to request context envelope
+        self.arc.customer_context = customer_context
+
+        ctx = PromptContext(
+            product_context      = product_str,
+            customer_preferences = prefs_str,
+            negotiation_profile  = neg_str,
+            workflow_context     = workflow_str,
+            conversation_summary = conv_str,
+            customer_context     = customer_context,
+            active_product_session = active_product_session,
+            resolved_product     = pname,
+            knowledge_state      = knowledge_state,
+            knowledge_context    = knowledge_context,
+        )
+
+
+        setattr(self.arc, cache_key, ctx)
+        return ctx
+
+    async def _resolve_product_context(self):
+        """
+        Resolves the active product (if any) and its cached catalog details.
+        Independent of customer profile/history — safe to run concurrently
+        with _resolve_customer_context() via asyncio.gather in build().
+        """
+        from db.session_store import (
+            get_cached_product_by_name, get_last_discussed_product,
+            get_graphrag_product_selection, get_tenant_config,
+        )
+        from ai.product_context_resolver import ProductContextResolver
+
+        pname = await ProductContextResolver.resolve(self.tenant_id, self.session_id, self.arc.neg_state)
+
         active_product_session = False
         knowledge_state = {
             "available": False,
@@ -125,27 +273,30 @@ class ContextBuilder:
 
         p = None
         if pname:
-            from db.session_store import get_last_discussed_product, get_graphrag_product_selection
-            last_prod = await get_last_discussed_product(self.tenant_id, self.session_id)
-            selection = await get_graphrag_product_selection(self.tenant_id, self.session_id) or []
+            # These three reads only depend on pname (already resolved above),
+            # not on each other — fetch concurrently instead of in sequence.
+            last_prod, selection, p = await asyncio.gather(
+                get_last_discussed_product(self.tenant_id, self.session_id),
+                get_graphrag_product_selection(self.tenant_id, self.session_id),
+                get_cached_product_by_name(self.tenant_id, pname),
+            )
+            selection = selection or []
             selection_names = [(prod.get("product_name") or prod.get("name") or "").lower().strip() if isinstance(prod, dict) else str(prod).lower().strip() for prod in selection]
             neg_product = self.arc.neg_state.get("product_name") if self.arc.neg_state else None
-            
+
             pname_lower = pname.lower().strip()
             is_neg = (neg_product and neg_product.lower().strip() == pname_lower)
             is_last = (last_prod and last_prod.lower().strip() == pname_lower)
             is_select = (pname_lower in selection_names)
             active_product_session = bool(is_neg or is_last or is_select)
 
-            p = await get_cached_product_by_name(self.tenant_id, pname)
             if p:
                 cached_at_str = p.get("_cached_at")
-                
+
                 # Fetch TTL hours and policy from configurations
-                from db.session_store import get_tenant_config
                 refresh_policy = await get_tenant_config(self.tenant_id, "knowledge_refresh_policy") or {}
                 ttl_hours = refresh_policy.get("ttl_hours", 24)
-                
+
                 needs_refresh = False
                 reason = None
                 if active_product_session:
@@ -170,7 +321,7 @@ class ContextBuilder:
                 else:
                     needs_refresh = True
                     reason = "missing_timestamp"
-                    
+
                 knowledge_state = {
                     "available": True,
                     "source": "product_cache",
@@ -179,13 +330,13 @@ class ContextBuilder:
                     "needs_refresh": needs_refresh,
                     "reason": reason
                 }
-                
+
                 # Extract structured details into standard schema
                 installation = p.get("installation") or p.get("installation_instructions")
                 installation_url = p.get("installation_url") or (installation.get("pdf_url") if isinstance(installation, dict) else "")
                 manual_url = p.get("manual_url") or (installation.get("manual_url") if isinstance(installation, dict) else "")
                 video_url = p.get("video_url") or (installation.get("video_url") if isinstance(installation, dict) else "")
-                
+
                 knowledge_context = {
                     "product": {
                         "metadata": {
@@ -217,59 +368,19 @@ class ContextBuilder:
                     }
                 }
 
-        # 2. Format product details for LLM
-        product_str = ""
-        if pname and p:
-            fmt = getattr(self.arc.incoming, "cb_product_format", None) or "{name} | Rs.{price}"
-            product_str = fmt.replace("{name}", str(p.get("product_name") or pname)) \
-                             .replace("{price}", str(p.get("price") or 0)) \
-                             .replace("{warranty}", str(p.get("warranty") or "N/A")) \
-                             .replace("{waterproof}", str(p.get("waterproof") or "N/A"))
-            prefix = getattr(self.arc.incoming, "cb_product_marker", "PRODUCT_CONTEXT:")
-            product_str = f"{prefix} {product_str}"
+        return pname, p, active_product_session, knowledge_state, knowledge_context
 
-        # 3. Format workflow snapshot
-        workflow_str = ""
-        if self.arc.neg_state:
-            state = self.arc.workflow
-            fmt_state = getattr(self.arc.incoming, "cb_workflow_format_state", "State: {state}")
-            workflow_str = fmt_state.replace("{state}", state)
-            prod_name = self.arc.neg_state.get("product_name")
-            q = self.arc.neg_state.get("quantity")
-            op = self.arc.neg_state.get("offer_price")
-            if prod_name and q:
-                fmt_prod = getattr(self.arc.incoming, "cb_workflow_format_product", " - {product} x{quantity}")
-                workflow_str += fmt_prod.replace("{product}", prod_name).replace("{quantity}", str(q))
-            if op:
-                fmt_price = getattr(self.arc.incoming, "cb_workflow_format_price", " @ Rs.{offer_price}")
-                workflow_str += fmt_price.replace("{offer_price}", str(op))
-            prefix = getattr(self.arc.incoming, "cb_workflow_marker", "WORKFLOW_SNAPSHOT:")
-            workflow_str = f"{prefix} {workflow_str}"
+    async def _resolve_customer_context(self, cds: "CustomerDataService"):
+        """
+        Fetches the customer profile summary and recent conversation turns.
+        Independent of product resolution — safe to run concurrently with
+        _resolve_product_context() via asyncio.gather in build().
+        """
+        from db.session_store import get_session_history
 
-        # 4. Format preferences
-        prefs = await cds.get_customer_preferences()
-        prefs_str = ""
-        if prefs:
-            parts = [f"{k}: {v}" for k, v in prefs.items() if v]
-            prefix = getattr(self.arc.incoming, "cb_preferences_prefix", "Preferences - ")
-            prefs_str = prefix + ", ".join(parts) if parts else ""
-
-        # 5. Format negotiation summary / profile
         summary = await cds.get_customer_summary()
-        neg_str = ""
-        avg_disc = summary.get("avg_negotiation_discount_pct")
-        if avg_disc is not None:
-            neg_str = f"Typically accepts {avg_disc}% discount"
-            negs = await cds.get_negotiation_history(limit=10)
-            rounds = [int(n["rounds"]) for n in negs if n.get("rounds") is not None]
-            prices = [float(n["final_price"]) for n in negs if n.get("accepted") and n.get("final_price") is not None]
-            if rounds:
-                avg_rounds = round(sum(rounds)/len(rounds), 1)
-                neg_str += f" in {avg_rounds} rounds"
-            if len(prices) >= 2:
-                neg_str += f", budget Rs.{int(min(prices)):,} - Rs.{int(max(prices)):,}"
+        prefs = summary.get("preferences", {}) or {}
 
-        # 6. Format recent conversation turns
         conv_str = ""
         try:
             turns = await get_session_history(self.tenant_id, self.session_id, limit=2)
@@ -282,34 +393,7 @@ class ContextBuilder:
         except Exception as e:
             print(f"[CONTEXT] Conversation history fetch failed: {e}")
 
-        # 7. Format customer history block if needs_customer_context or history is true
-        customer_context = ""
-        routing = getattr(self.arc.result, "routing", None)
-        if routing and (routing.needs_customer_context or getattr(routing, "needs_customer_history", False)):
-            try:
-                customer_context = await self._build_customer_context_text(cds, summary)
-            except Exception as e:
-                print(f"[CONTEXT] Formatting customer_context failed: {e}")
-
-        # Save to request context envelope
-        self.arc.customer_context = customer_context
-
-        ctx = PromptContext(
-            product_context      = product_str,
-            customer_preferences = prefs_str,
-            negotiation_profile  = neg_str,
-            workflow_context     = workflow_str,
-            conversation_summary = conv_str,
-            customer_context     = customer_context,
-            active_product_session = active_product_session,
-            resolved_product     = pname,
-            knowledge_state      = knowledge_state,
-            knowledge_context    = knowledge_context,
-        )
-
-
-        setattr(self.arc, cache_key, ctx)
-        return ctx
+        return prefs, summary, conv_str
 
     async def _build_customer_context_text(self, cds: "CustomerDataService", summary: dict) -> str:
         """Formats structural customer metrics and order listings into a clean text block."""
@@ -338,7 +422,11 @@ class ContextBuilder:
         if summary_parts:
             sections.append("Customer Profile Summary:\n" + "\n".join(f"- {s}" for s in summary_parts))
 
-        orders = await cds.get_order_history(limit=5)
+        # Reused from the already-fetched (limit=10, newest-first) lists on
+        # `summary` instead of re-querying orders/negotiation_history a
+        # second time — slicing the top 5 of a limit=10 desc-ordered fetch
+        # is identical to a fresh limit=5 fetch.
+        orders = (summary.get("_orders") or [])[:5]
         if orders:
             order_list = []
             for o in orders:
@@ -351,7 +439,7 @@ class ContextBuilder:
             if order_list:
                 sections.append("Completed Orders:\n" + "\n".join(order_list))
 
-        negs = await cds.get_negotiation_history(limit=5)
+        negs = (summary.get("_negotiations") or [])[:5]
         if negs:
             negotiations = []
             for n in negs:

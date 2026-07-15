@@ -20,6 +20,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Optional
 from supabase import create_client, Client  # type: ignore[import]
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+from db.db_utils import run_sync
 
 _supabase: Optional[Client] = None
 
@@ -42,11 +43,11 @@ async def acquire_lock(session_id: str, tenant_id: str) -> bool:
     because only one INSERT can succeed for the same session_id.
     """
     try:
-        _get_client().table("processing_locks").insert({
+        await run_sync(lambda: _get_client().table("processing_locks").insert({
             "session_id": session_id,
             "tenant_id":  tenant_id,
             "locked_at":  datetime.now(timezone.utc).isoformat(),
-        }).execute()
+        }).execute())
         print(f"[LOCK] Acquired for {session_id}")
         return True
 
@@ -70,7 +71,7 @@ async def release_lock(session_id: str, tenant_id: str = None) -> None:
             .eq("session_id", session_id)
         if tenant_id:
             q = q.eq("tenant_id", tenant_id)
-        q.execute()
+        await run_sync(q.execute)
         print(f"[LOCK] Released for {session_id}")
     except Exception as e:
         print(f"[LOCK] Release failed: {e}")
@@ -94,10 +95,10 @@ async def cleanup_stale_locks() -> None:
             datetime.now(timezone.utc) - timedelta(minutes=2)
         ).isoformat()
 
-        _get_client().table("processing_locks") \
-            .delete() \
-            .lt("locked_at", cutoff) \
-            .execute()
+        await run_sync(lambda: _get_client().table("processing_locks")
+            .delete()
+            .lt("locked_at", cutoff)
+            .execute())
 
     except Exception as e:
         print(f"[LOCK] Stale cleanup failed: {e}")

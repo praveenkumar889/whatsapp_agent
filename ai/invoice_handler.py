@@ -32,6 +32,8 @@ _client = AzureOpenAI(
     timeout        = 30.0,
     max_retries    = 0,
 )
+from ai.request_profiler import wrap_llm_client as _wrap_llm_client
+_wrap_llm_client(_client)
 
 async def _is_invoice_inquiry(incoming) -> bool:
     """

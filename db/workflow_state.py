@@ -21,6 +21,7 @@ from typing import Optional, cast
 from supabase import create_client, Client  # type: ignore[import]
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
 from models.schemas import EntityResult
+from db.db_utils import run_sync
 
 # ── Supabase client — lazy singleton ──────────────────────────────────────────
 _supabase: Optional[Client] = None
@@ -60,15 +61,15 @@ async def get_pending_state(tenant_id: str, session_id: str) -> Optional[dict]:
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
 
-        result = _get_client().table("workflow_sessions") \
-            .select("*") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "WORKFLOW_PENDING") \
-            .gt("expires_at", now_utc) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "WORKFLOW_PENDING")
+            .gt("expires_at", now_utc)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
 
         if result.data:
             state = cast(dict, result.data[0])
@@ -108,13 +109,13 @@ async def save_pending_state(
         now_utc    = datetime.now(timezone.utc)
         expires_at = (now_utc + timedelta(minutes=20)).isoformat()
 
-        existing = _get_client().table("workflow_sessions") \
-            .select("id") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "WORKFLOW_PENDING") \
-            .limit(1) \
-            .execute()
+        existing = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "WORKFLOW_PENDING")
+            .limit(1)
+            .execute())
 
         # Serialize items list to JSON for storage
         items_json_str = None
@@ -143,15 +144,15 @@ async def save_pending_state(
         }
 
         if existing.data:
-            _get_client().table("workflow_sessions") \
-                .update(row) \
-                .eq("id", cast(dict, existing.data[0])["id"]) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .update(row)
+                .eq("id", cast(dict, existing.data[0])["id"])
+                .execute())
             print(f"[STATE] WORKFLOW_PENDING updated — items={len(items) if items else 1} missing={missing_fields}")
         else:
-            _get_client().table("workflow_sessions") \
-                .insert(row) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .insert(row)
+                .execute())
             print(f"[STATE] WORKFLOW_PENDING created — items={len(items) if items else 1} missing={missing_fields} expires={expires_at}")
 
         return True
@@ -293,15 +294,15 @@ async def complete_state(tenant_id: str, session_id: str) -> bool:
         False → failed (logged, pipeline continues)
     """
     try:
-        _get_client().table("workflow_sessions") \
+        await run_sync(lambda: _get_client().table("workflow_sessions")
             .update({
                 "status":     "COMPLETED",
                 "updated_at": datetime.now(timezone.utc).isoformat(),
-            }) \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "WORKFLOW_PENDING") \
-            .execute()
+            })
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "WORKFLOW_PENDING")
+            .execute())
 
         print(f"[STATE] WORKFLOW_PENDING -> COMPLETED for {session_id}")
         return True
@@ -327,16 +328,16 @@ async def expire_state(tenant_id: str, session_id: str) -> bool:
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
 
-        _get_client().table("workflow_sessions") \
+        await run_sync(lambda: _get_client().table("workflow_sessions")
             .update({
                 "status":     "EXPIRED",
                 "updated_at": now_utc,
-            }) \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "WORKFLOW_PENDING") \
-            .lt("expires_at", now_utc) \
-            .execute()
+            })
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "WORKFLOW_PENDING")
+            .lt("expires_at", now_utc)
+            .execute())
 
         print(f"[STATE] Expired pending state for {session_id}")
         return True

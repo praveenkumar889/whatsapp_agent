@@ -11,6 +11,41 @@
 import asyncio
 from typing import Optional
 
+from openai import AzureOpenAI
+from config import (
+    AZURE_AI_ENDPOINT, AZURE_AI_API_KEY,
+    AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION,
+)
+
+# Module-level client — reused across requests instead of instantiating a
+# fresh AzureOpenAI client (and its own connection pool) on every call to
+# _check_fast_confirm(), matching the pattern already used in ai/negotiator.py,
+# ai/product_followup.py, and ai/handlers.py.
+_client = AzureOpenAI(
+    azure_endpoint=AZURE_AI_ENDPOINT, api_key=AZURE_AI_API_KEY,
+    api_version=AZURE_AI_API_VERSION, timeout=10.0, max_retries=0,
+)
+from ai.request_profiler import wrap_llm_client as _wrap_llm_client
+_wrap_llm_client(_client)
+
+
+async def _call_graphrag_timed(incoming, session_history):
+    """
+    Times the whole call_graphrag_api() call from the caller side into the
+    "graphrag" profiling category, without modifying ai/graphrag_handler.py
+    itself — its internals (any LLM/DB work it does) are folded into this
+    one wall-clock span, not decomposed, per the standing instruction not to
+    touch GraphRAG.
+    """
+    import time
+    from ai.graphrag_handler import call_graphrag_api
+    from ai.request_profiler import add as _profile_add
+    _t0 = time.monotonic()
+    try:
+        return await call_graphrag_api(incoming, session_history)
+    finally:
+        _profile_add("graphrag", (time.monotonic() - _t0) * 1000)
+
 
 async def dispatch(incoming, result, session_history: list) -> str:
     """
@@ -22,16 +57,24 @@ async def dispatch(incoming, result, session_history: list) -> str:
         from db.session_store import get_negotiation_state as _gns
         incoming._cached_neg_state = await _gns(incoming.tenant_id, incoming.session_id)
 
-    # Centralized RequestContext ContextBuilder assembly
-    arc = getattr(incoming, "_cached_arc", None)
-    if arc:
-        from ai.context_builder import ContextBuilder
-        await ContextBuilder(arc).build()
-
-    # Dynamic Knowledge Resolution Intercept Guard
+    # Dynamic Knowledge Resolution Intercept Guard — computed early so we know
+    # whether the dynamic-knowledge path (which needs arc.resolved_product /
+    # arc.llm_context regardless of intent) will fire before deciding whether
+    # ContextBuilder needs to run at all.
     _routing = getattr(incoming, "_routing", None)
     requested_field = _routing.requested_knowledge_field if _routing else None
     domain = (_routing.knowledge_domain or "product") if _routing else "product"
+    _wants_dynamic_knowledge = bool(requested_field and requested_field.upper() != "NONE")
+
+    # Centralized RequestContext ContextBuilder assembly.
+    # Skipped for GREETING/HUMAN_ESCALATION — their handlers only take
+    # `incoming` and never read arc.llm_context/arc.resolved_product — UNLESS
+    # the dynamic-knowledge guard below needs it regardless of intent.
+    arc = getattr(incoming, "_cached_arc", None)
+    _needs_context = _wants_dynamic_knowledge or result.intent not in ("GREETING", "HUMAN_ESCALATION")
+    if arc and _needs_context:
+        from ai.context_builder import ContextBuilder
+        arc.llm_context = await ContextBuilder(arc).build()
 
     if arc and requested_field and requested_field.upper() != "NONE":
         # Check messages table for the last graphrag_response in this session
@@ -120,13 +163,12 @@ async def dispatch(incoming, result, session_history: list) -> str:
         
         if not is_available or needs_refresh:
             print(f"[ROUTER] Cache miss or expired for '{arc.resolved_product}' (domain: {domain}, field: {requested_field}) — calling GraphRAG")
-            from ai.graphrag_handler import call_graphrag_api
             # Temporarily rewrite query to request the details
             original_text = incoming.text
             incoming.text = f"Product: {arc.resolved_product}. Query: {original_text}"
-            
+
             # This calls GraphRAG, fetches from Neo4j, formats/sends, and updates product_cache
-            res = await call_graphrag_api(incoming, session_history)
+            res = await _call_graphrag_timed(incoming, session_history)
             
             # Restore original text
             incoming.text = original_text
@@ -134,9 +176,12 @@ async def dispatch(incoming, result, session_history: list) -> str:
             if res is not None:
                 return res
             
-            # Rebuild context to reload refreshed details
+            # Rebuild context to reload refreshed details — force_refresh=True
+            # bypasses ContextBuilder's per-request cache so this actually
+            # re-reads product_cache instead of returning the pre-refresh
+            # PromptContext built at the top of dispatch().
             from ai.context_builder import ContextBuilder
-            await ContextBuilder(arc).build()
+            arc.llm_context = await ContextBuilder(arc).build(force_refresh=True)
             
         # Access structured knowledge
         kstate = getattr(arc.llm_context, "knowledge_state", {})
@@ -266,8 +311,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
             print(f"[ROUTER] customer_history_handler query failed: {e}")
 
     if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
-        from ai.graphrag_handler import call_graphrag_api
-        return await call_graphrag_api(incoming, session_history)
+        return await _call_graphrag_timed(incoming, session_history)
 
     from ai.handlers import handle_unknown
     return await handle_unknown(incoming)
@@ -303,6 +347,48 @@ def _has_invoice_keyword(incoming) -> bool:
     return any(kw.casefold() in text_lower for kw in kws)
 
 
+async def check_is_shipping_address(incoming) -> bool:
+    from db.prompt_store import get_prompt
+    import asyncio
+    import json
+
+    text = incoming.text.strip()
+    # Simple check for very short inputs or greetings
+    if len(text) < 4:
+        return False
+
+    try:
+        from ai.negotiator import _client, AZURE_OPENAI_DEPLOYMENT
+        prompt = get_prompt(incoming, "validate_shipping_address_prompt", message=text)
+
+        r = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: _client.chat.completions.create(
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0,
+                messages=[{"role": "system", "content": prompt}],
+            )
+        )
+        content = r.choices[0].message.content
+        if not content:
+            return False
+
+        raw = content.strip()
+        if raw.startswith("```"):
+            lines = raw.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].startswith("```"):
+                lines = lines[:-1]
+            raw = "\n".join(lines).strip()
+
+        parsed = json.loads(raw)
+        is_address = bool(parsed.get("is_shipping_address", False))
+        print(f"[NEGOTIATOR] Shipping address validation: is_address={is_address} reason='{parsed.get('reason')}'")
+        return is_address
+    except Exception as e:
+        print(f"[NEGOTIATOR] Shipping address validation failed: {e} — falling back to True")
+        return True
+
+
 async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
     """
     Guards the negotiation state machine.
@@ -323,10 +409,59 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
     from db.session_store import get_negotiation_state, save_negotiation_state, get_tenant_offers
     from ai.invoice_handler import _is_invoice_confirmation_request
 
-    pre_neg_state = getattr(incoming, '_cached_neg_state', None) or \
-                    await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+    if hasattr(incoming, '_cached_neg_state'):
+        pre_neg_state = incoming._cached_neg_state
+    else:
+        pre_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
     if pre_neg_state is None:
         return None
+
+    # ── Shipping Address Intercept ──────────────────────────────────────────────
+    if pre_neg_state.get("awaiting_address_and_confirm"):
+        # Validate that the customer is actually providing an address
+        is_address = await check_is_shipping_address(incoming)
+        if not is_address:
+            print(f"[NEGOTIATOR] Customer message is not a shipping address. Re-enabling negotiation.")
+            # Clear the address-intercept mode to allow renegotiation or handling questions
+            updated_state = {**pre_neg_state, "awaiting_address_and_confirm": False}
+            await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated_state)
+            incoming._cached_neg_state = updated_state
+            # Return None to let the router process the message normally (workflow action/negotiation)
+            return None
+
+        shipping_address = incoming.text.strip()
+        order_id = pre_neg_state.get("pending_order_id")
+        if not isinstance(order_id, str):
+            print(f"[NEGOTIATOR] Error: order_id is missing or not a string: {order_id}")
+            return None
+
+        print(f"[NEGOTIATOR] Customer provided address for order {order_id}: {shipping_address}")
+
+        from db.product_store import update_order_status_and_address
+        from db.session_store import clear_negotiation_state
+        from ai.invoice_handler import handle_invoice_request
+
+        # 1. Update the order with status CONFIRMED and the shipping address
+        updated_order = await update_order_status_and_address(
+            order_id=order_id,
+            tenant_id=incoming.tenant_id,
+            status="CONFIRMED",
+            shipping_address=shipping_address
+        )
+
+        if updated_order:
+            try:
+                from ai.pricing import PricingResult
+                pr = PricingResult.from_neg_state(pre_neg_state, incoming.gst_rate)
+                updated_order.update(pr.to_invoice_fields())
+            except Exception as pe:
+                print(f"[NEGOTIATOR] Error reconstructing invoice fields from neg_state: {pe}")
+
+        # 2. Clear the negotiation state
+        await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
+
+        # 3. Generate the invoice and return
+        return await handle_invoice_request(incoming, negotiated_order=updated_order)
 
     # Capability-driven bypass: only intercept intents that require active workflow state
     # All other intents (FAQ_KNOWLEDGE, GREETING, escalation) bypass negotiation guard and fall through
@@ -338,68 +473,8 @@ async def _neg_guard(incoming, result, session_history: list) -> Optional[str]:
         # Safe fallback if no routing decision metadata is attached
         return None
 
-    # ── Phase 2: counter_offer_presented — bot has shown its best price ────────
-    # Customer hasn't accepted yet. They may be making another offer (still
-    # negotiating) or accepting. Handle here before falling through to normal flow.
-    counter_offer_presented = pre_neg_state.get("counter_offer_presented", False)
-    if counter_offer_presented and not pre_neg_state.get("awaiting_invoice_confirmation", False):
-        from ai.negotiator import detect_acceptance
-        accepted = await detect_acceptance(incoming.text, incoming, session_history)
-        if accepted:
-            # Customer accepted → show the full pre-confirm order summary using
-            # PricingResult (single source of truth), then wait for "Confirm".
-            from ai.pricing import PricingResult
-            pr = PricingResult.from_neg_state(pre_neg_state, getattr(incoming, "gst_rate", 0.18))
-            product = pre_neg_state.get("product_name", "your product")
-
-            updated = {**pre_neg_state, "awaiting_invoice_confirmation": True,
-                       "counter_offer_presented": False, "last_offer_price": pr.negotiated_unit_price}
-            await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated)
-            return pr.to_whatsapp_summary(product, incoming.sender_name, incoming=incoming)
-        else:
-            # Customer still negotiating — politely hold our final price
-            final_price = float(pre_neg_state.get("last_offer_price", 0))
-            quantity    = int(pre_neg_state.get("quantity", 0))
-            total       = round(final_price * quantity, 2)
-            product     = pre_neg_state.get("product_name", "this product")
-            print(f"[NEG GUARD] Customer still bargaining after final offer — holding price Rs.{final_price:,.0f}")
-            from db.prompt_store import get_prompt
-            try:
-                return get_prompt(
-                    incoming, "neg_still_bargaining_prompt",
-                    sender_name=incoming.sender_name, final_price=f"{final_price:,.0f}",
-                    product=product, quantity=quantity, total=f"{total:,.2f}",
-                )
-            except RuntimeError:
-                return (
-                    f"I understand, {incoming.sender_name}. 🙏 Rs.*{final_price:,.0f}/unit* is already "
-                    f"our absolute best price for *{product}* — we can't reduce it further.\n\n"
-                    f"For *{quantity} units*, your total would be *Rs.{total:,.2f}* + GST.\n\n"
-                    f"Would you like to proceed at this price? Reply *Confirm* to place your order!"
-                )
-
-    # ── Phase 3: awaiting_invoice_confirmation — customer has accepted ──────────
-    awaiting_conf = (
-        pre_neg_state.get("awaiting_invoice_confirmation", False)
-        and pre_neg_state.get("quantity")
-        and pre_neg_state.get("last_offer_price")
-    )
-    if not awaiting_conf:
-        return None
-
-    # FIX: narrow type for checker
-    neg_state: dict = pre_neg_state  # type: ignore[assignment]
-
-    reply = await _handle_qty_confirm_split(incoming, neg_state, session_history)
-    if reply:
-        return reply
-
-    is_actual_confirm = await _is_invoice_confirmation_request(incoming, session_history)
-    if is_actual_confirm:
-        return None
-
-    print(f"[NEG GUARD] Message while awaiting confirmation — re-entering negotiation")
-    return await _resume_negotiation(incoming, neg_state, session_history)
+    # Let the message fall through to the negotiator for dynamic intent extraction (including ACCEPTED, COUNTER_OFFER, etc.)
+    return None
 
 
 async def _handle_qty_confirm_split(incoming, neg_state: dict, session_history: list) -> Optional[str]:
@@ -474,7 +549,6 @@ async def _handle_qty_confirm_split(incoming, neg_state: dict, session_history: 
 
 async def _resume_negotiation(incoming, neg_state: dict, session_history: list) -> Optional[str]:
     from ai.negotiator import handle_negotiation
-    from ai.graphrag_handler import call_graphrag_api
     from db.session_store import get_tenant_offers, save_negotiation_state
 
     product   = neg_state.get("product_name", "")
@@ -483,7 +557,7 @@ async def _resume_negotiation(incoming, neg_state: dict, session_history: list) 
     disc_pct  = int(neg_state.get("graphrag_discount_pct") or 0)
 
     if not product or price_num <= 0:
-        return await call_graphrag_api(incoming, session_history)
+        return await _call_graphrag_timed(incoming, session_history)
 
     resumed       = {**neg_state, "awaiting_invoice_confirmation": False}
     global_offers = neg_state.get("global_offers")
@@ -566,7 +640,10 @@ async def _invoice_guard(incoming, session_history: list) -> Optional[str]:
     )
     from db.session_store import get_negotiation_state
 
-    pre_neg_state = getattr(incoming, '_cached_neg_state', None) or         await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+    if hasattr(incoming, '_cached_neg_state'):
+        pre_neg_state = incoming._cached_neg_state
+    else:
+        pre_neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
     # Only treat this as a possible "confirmation" message if the bot is
     # ACTUALLY waiting on a Confirm/Proceed reply right now.
@@ -585,15 +662,78 @@ async def _invoice_guard(incoming, session_history: list) -> Optional[str]:
     invoice_confirm_req  = False
     if awaiting_conf:
         is_fast_confirm = await _check_fast_confirm(incoming, pre_neg_state)
-        invoice_confirm_req = await _is_invoice_confirmation_request(incoming, session_history)
+        # Skip the LLM confirmation check entirely once the cheap phrase-match
+        # already confirms it — the final result below is OR'd together, so
+        # this extra ~1-3s LLM call can't change the outcome when already True.
+        if not is_fast_confirm:
+            invoice_confirm_req = await _is_invoice_confirmation_request(incoming, session_history)
 
     if not (invoice_inquiry or is_fast_confirm or invoice_confirm_req):
         return None
 
     if pre_neg_state and pre_neg_state.get("quantity") and pre_neg_state.get("last_offer_price"):
-        return await _confirm_negotiated_order(incoming, pre_neg_state)
+        return await _transition_to_address_and_payment(incoming, pre_neg_state)
 
     return await handle_invoice_request(incoming)
+
+
+async def _transition_to_address_and_payment(incoming, neg_state: dict) -> str:
+    from ai.pricing import PricingResult
+    from ai.order_service import complete_order
+    from db.session_store import save_negotiation_state
+
+    product = neg_state.get("product_name", "")
+    quantity = int(neg_state.get("quantity", 0))
+    last_price = neg_state.get("last_offer_price")
+    agreed = float(last_price) if last_price is not None else 0.0
+
+    # 1. Build PricingResult
+    pr = PricingResult.from_neg_state(neg_state, incoming.gst_rate)
+    agreed = pr.negotiated_unit_price
+
+    # 2. Complete order as PENDING_PAYMENT
+    items = [{
+        "product_name":   product,
+        "quantity_value": quantity,
+        "quantity_unit":  "units",
+        "unit_price":     agreed,
+        "total_price":    pr.subtotal,
+    }]
+    pending_order = await complete_order(
+        tenant_id   = incoming.tenant_id,
+        session_id  = incoming.session_id,
+        sender_name = incoming.sender_name,
+        items       = items,
+        gst_rate    = incoming.gst_rate,
+        extra_fields = pr.to_invoice_fields(),
+        status      = "PENDING_PAYMENT"
+    )
+    order_id = pending_order.order_id if pending_order else "N/A"
+    payment_link = f"https://demo.payment.gateway/pay?order_id={order_id}"
+
+    # 3. Fetch prompt and format reply
+    from db.prompt_store import get_prompt
+    confirm_msg = get_prompt(
+        incoming, "neg_payment_and_address_request_prompt",
+        product_name=product,
+        quantity=quantity,
+        agreed_price=f"{agreed:,.0f}",
+        total_with_gst=f"{pr.total_payable:,.2f}",
+        payment_link=payment_link
+    )
+
+    # 4. Save updated state with awaiting_address_and_confirm=True
+    updated_state = {
+        **neg_state,
+        "awaiting_address_and_confirm": True,
+        "awaiting_invoice_confirmation": False,
+        "pending_order_id": order_id,
+        "last_offer_price": agreed
+    }
+    await save_negotiation_state(incoming.tenant_id, incoming.session_id, updated_state)
+    incoming._cached_neg_state = updated_state
+
+    return confirm_msg
 
 
 async def _check_fast_confirm(incoming, neg_state) -> bool:
@@ -604,15 +744,6 @@ async def _check_fast_confirm(incoming, neg_state) -> bool:
         print(f"[FAST CONFIRM] Phrase match (no LLM): '{incoming.text.strip()}'")
         return True
     try:
-        from openai import AzureOpenAI
-        from config import (
-            AZURE_AI_ENDPOINT, AZURE_AI_API_KEY,
-            AZURE_OPENAI_DEPLOYMENT, AZURE_AI_API_VERSION,
-        )
-        _client = AzureOpenAI(
-            azure_endpoint=AZURE_AI_ENDPOINT, api_key=AZURE_AI_API_KEY,
-            api_version=AZURE_AI_API_VERSION, timeout=10.0, max_retries=0,
-        )
         resp = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _client.chat.completions.create(

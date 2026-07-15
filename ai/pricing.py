@@ -16,6 +16,7 @@ used slightly different rounding or different source fields.
 """
 
 from __future__ import annotations
+import asyncio
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -126,7 +127,7 @@ class PricingResult:
     def gst_pct(self) -> int:
         return int(self.gst_rate * 100)
 
-    def to_whatsapp_summary(self, product_name: str, sender_name: str, incoming=None) -> str:
+    async def to_whatsapp_summary(self, product_name: str, sender_name: str, incoming=None) -> str:
         """
         Renders the pre-confirm order summary in WhatsApp format.
         Single source — used by both the negotiation acceptance path and
@@ -136,18 +137,24 @@ class PricingResult:
         that hasn't been updated) but should always be passed — without it,
         this always falls back to the hardcoded English text below rather
         than ever attempting the tenant's DB prompt.
+
+        The body/savings/footer prompt templates are independent of each
+        other (only one body variant and one savings variant are ever
+        needed, decided synchronously below from self's own fields, with no
+        I/O involved in that decision) — so they're loaded concurrently via
+        asyncio.gather instead of one after another.
         """
-        def _prompt(key: str, fallback: str, **kwargs) -> str:
+        async def _prompt(key: str, fallback: str, **kwargs) -> str:
             if incoming is None:
                 return fallback
             try:
-                from db.prompt_store import get_prompt
-                return get_prompt(incoming, key, **kwargs)
+                from db.prompt_store import aget_prompt
+                return await aget_prompt(incoming, key, **kwargs)
             except RuntimeError:
                 return fallback
 
         if self.was_negotiated:
-            body = _prompt(
+            body_coro = _prompt(
                 "pricing_order_summary_full_discount_prompt",
                 (
                     f"Here's your order summary, {sender_name}! Please review:\n\n"
@@ -167,7 +174,7 @@ class PricingResult:
                 total_payable=f"{self.total_payable:,.2f}",
             )
         elif self.store_disc_pct > 0:
-            body = _prompt(
+            body_coro = _prompt(
                 "pricing_order_summary_store_discount_only_prompt",
                 (
                     f"Here's your order summary, {sender_name}! Please review:\n\n"
@@ -186,7 +193,7 @@ class PricingResult:
                 total_payable=f"{self.total_payable:,.2f}",
             )
         else:
-            body = _prompt(
+            body_coro = _prompt(
                 "pricing_order_summary_plain_price_prompt",
                 (
                     f"Here's your order summary, {sender_name}! Please review:\n\n"
@@ -203,9 +210,10 @@ class PricingResult:
                 total_payable=f"{self.total_payable:,.2f}",
             )
 
+        savings_coro = None
         if self.total_discount_amount > 0:
             if self.was_negotiated and self.store_discount_amount > 0:
-                body += "\n\n" + _prompt(
+                savings_coro = _prompt(
                     "pricing_order_summary_savings_breakdown_prompt",
                     (
                         f"🎁 *Total savings: Rs.{self.total_discount_amount:,.0f}*\n"
@@ -217,16 +225,26 @@ class PricingResult:
                     negotiation_discount_amount=f"{self.negotiation_discount_amount:,.0f}",
                 )
             else:
-                body += "\n\n" + _prompt(
+                savings_coro = _prompt(
                     "pricing_order_summary_savings_prompt",
                     f"🎁 *You save Rs.{self.total_discount_amount:,.0f} on this order!*",
                     total_discount_amount=f"{self.total_discount_amount:,.0f}",
                 )
 
-        body += "\n\n" + _prompt(
+        footer_coro = _prompt(
             "pricing_order_summary_footer_prompt",
             "Reply *Confirm* to place your order and receive your invoice! 🎉",
         )
+
+        if savings_coro is not None:
+            body, savings, footer = await asyncio.gather(body_coro, savings_coro, footer_coro)
+        else:
+            body, footer = await asyncio.gather(body_coro, footer_coro)
+            savings = None
+
+        if savings:
+            body += "\n\n" + savings
+        body += "\n\n" + footer
         return body
 
     def to_invoice_fields(self) -> dict:

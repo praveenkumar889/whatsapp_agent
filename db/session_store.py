@@ -6,6 +6,7 @@ from typing import Optional, List, cast
 from supabase import create_client, Client  # type: ignore[import]
 from models.schemas import IncomingMessage, EntityResult
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY
+from db.db_utils import run_sync, TTLCache
 
 _supabase: Optional[Client] = None
 
@@ -14,6 +15,13 @@ def _get_client() -> Client:
     if _supabase is None:
         _supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     return _supabase
+
+# Tenant profile + tenant_configurations rarely change (a business's name,
+# GST rate, prompts config, knowledge_refresh_policy etc. are edited by an
+# admin, not by end customers) — so, exactly like db/prompt_store.py's prompt
+# cache, they're cached in-memory per key with a 5-minute TTL instead of being
+# re-fetched from Postgres on every single incoming message.
+_tenant_cache = TTLCache(ttl_seconds=300)
 
 
 async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
@@ -42,15 +50,21 @@ async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
         dict → full tenant profile if found
         None → phone_number_id not registered, reject message
     """
+    cache_key = f"tenant::{phone_number_id}"
+    cached = _tenant_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        result = _get_client().table("tenants") \
-            .select("*") \
-            .eq("phone_number_id", phone_number_id) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("tenants")
+            .select("*")
+            .eq("phone_number_id", phone_number_id)
+            .limit(1)
+            .execute())
 
         if result.data:
             row = cast(dict, result.data[0])
+            _tenant_cache.set(cache_key, row)
             print(f"[DB] Tenant resolved: {row['tenant_id']} ({row.get('biz_name', 'N/A')}) "
                   f"for phone_number_id={phone_number_id}")
             return row
@@ -66,13 +80,13 @@ async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
 async def get_session_history(tenant_id: str, session_id: str, limit: int = 10) -> List[dict]:
     """Fetches the last N messages for a customer session from the DB."""
     try:
-        result = _get_client().table("messages") \
-            .select("text, reply_text, direction, original_type, created_at") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("messages")
+            .select("text, reply_text, direction, original_type, created_at")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute())
 
         if not result.data:
             return []
@@ -98,12 +112,12 @@ async def get_session_history(tenant_id: str, session_id: str, limit: int = 10) 
 async def is_duplicate(message_id: str, tenant_id: str) -> bool:
     """Checks if message_id already exists in DB, scoped to this tenant."""
     try:
-        result = _get_client().table("messages") \
-            .select("id") \
-            .eq("message_id", message_id) \
-            .eq("tenant_id", tenant_id) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("messages")
+            .select("id")
+            .eq("message_id", message_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute())
         return len(result.data) > 0
     except Exception as e:
         print(f"[DB] Duplicate check failed: {e}")
@@ -142,7 +156,7 @@ async def save_message(incoming: IncomingMessage) -> bool:
             "replied_at":          None,
             "received_at":         incoming.received_at,
         }
-        _get_client().table("messages").insert(row).execute()
+        await run_sync(lambda: _get_client().table("messages").insert(row).execute())
         print(f"[DB] Message saved — trace_id={incoming.trace_id}")
         return True
     except Exception as e:
@@ -158,7 +172,7 @@ async def update_intent(message_id: str, intent: str, confidence: float, tenant_
             .eq("message_id", message_id)
         if tenant_id:
             q = q.eq("tenant_id", tenant_id)
-        q.execute()
+        await run_sync(q.execute)
         print(f"[DB] Intent updated — {intent} ({confidence})")
         return True
     except Exception as e:
@@ -169,7 +183,7 @@ async def update_intent(message_id: str, intent: str, confidence: float, tenant_
 async def update_entities(message_id: str, entities: EntityResult) -> bool:
     """Stores extracted entities after entity extraction engine runs."""
     try:
-        _get_client().table("messages") \
+        await run_sync(lambda: _get_client().table("messages")
             .update({
                 "product_name":      entities.product_name,
                 "quantity_value":    entities.quantity_value,
@@ -178,9 +192,9 @@ async def update_entities(message_id: str, entities: EntityResult) -> bool:
                 "invoice_number":    entities.invoice_number,
                 "payment_reference": entities.payment_reference,
                 "missing_entities":  json.dumps(entities.missing_entities),
-            }) \
-            .eq("message_id", message_id) \
-            .execute()
+            })
+            .eq("message_id", message_id)
+            .execute())
         print(f"[DB] Entities updated — product={entities.product_name} qty_value={entities.quantity_value} qty_unit={entities.quantity_unit}")
         return True
     except Exception as e:
@@ -200,10 +214,10 @@ async def update_reply(
         if graphrag_response is not None:
             # Store complete GraphRAG response — DB column is TEXT (unlimited)
             update_data["graphrag_response"] = graphrag_response
-        _get_client().table("messages") \
-            .update(update_data) \
-            .eq("message_id", message_id) \
-            .execute()
+        await run_sync(lambda: _get_client().table("messages")
+            .update(update_data)
+            .eq("message_id", message_id)
+            .execute())
         print(f"[DB] Reply stored — replied_at={replied_at}")
         return True
     except Exception as e:
@@ -214,14 +228,14 @@ async def update_reply(
 async def get_latest_graphrag_response(tenant_id: str, session_id: str) -> Optional[str]:
     """Fetches the most recent raw GraphRAG response from messages table for this session."""
     try:
-        result = _get_client().table("messages") \
-            .select("graphrag_response") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .not_.is_("graphrag_response", "null") \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("messages")
+            .select("graphrag_response")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .not_.is_("graphrag_response", "null")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
         if result.data:
             row = cast(dict, result.data[0])
             return cast(Optional[str], row.get("graphrag_response"))
@@ -270,7 +284,7 @@ async def save_outbound_message(
             "replied_at":          None,
             "received_at":         datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
-        _get_client().table("messages").insert(row).execute()
+        await run_sync(lambda: _get_client().table("messages").insert(row).execute())
         print(f"[DB] Outbound message saved — message_id={message_id}")
         return True
     except Exception as e:
@@ -281,12 +295,12 @@ async def save_outbound_message(
 async def get_reply_by_message_id(tenant_id: str, message_id: str) -> Optional[str]:
     """Looks up reply_text or text for a given message ID from the messages table."""
     try:
-        result = _get_client().table("messages") \
-            .select("text, reply_text") \
-            .eq("tenant_id", tenant_id) \
-            .eq("message_id", message_id) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("messages")
+            .select("text, reply_text")
+            .eq("tenant_id", tenant_id)
+            .eq("message_id", message_id)
+            .limit(1)
+            .execute())
 
         if result.data:
             row = cast(dict, result.data[0])
@@ -320,24 +334,24 @@ async def save_pending_order(
             "updated_at":     now_utc.isoformat(),
         }
         # Update or insert
-        existing = _get_client().table("workflow_sessions") \
-            .select("id") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "ORDER_PENDING") \
-            .limit(1) \
-            .execute()
+        existing = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("id")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "ORDER_PENDING")
+            .limit(1)
+            .execute())
 
         if existing.data:
             existing_row = cast(dict, existing.data[0])
-            _get_client().table("workflow_sessions") \
-                .update(row) \
-                .eq("id", existing_row["id"]) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .update(row)
+                .eq("id", existing_row["id"])
+                .execute())
         else:
-            _get_client().table("workflow_sessions") \
-                .insert(row) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .insert(row)
+                .execute())
         return True
     except Exception as e:
         print(f"[DB] save_pending_order failed: {e}")
@@ -348,15 +362,15 @@ async def get_pending_order(tenant_id: str, session_id: str) -> Optional[dict]:
     """Retrieves the pending order from workflow_sessions table if not expired."""
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
-        result = _get_client().table("workflow_sessions") \
-            .select("product_name, quantity_value, quantity_unit") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "ORDER_PENDING") \
-            .gt("expires_at", now_utc) \
-            .order("updated_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("product_name, quantity_value, quantity_unit")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "ORDER_PENDING")
+            .gt("expires_at", now_utc)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute())
         return cast(dict, result.data[0]) if result.data else None
     except Exception as e:
         print(f"[DB] get_pending_order failed: {e}")
@@ -366,12 +380,12 @@ async def get_pending_order(tenant_id: str, session_id: str) -> Optional[dict]:
 async def delete_pending_order(tenant_id: str, session_id: str) -> bool:
     """Deletes a pending order from workflow_sessions."""
     try:
-        _get_client().table("workflow_sessions") \
-            .delete() \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "ORDER_PENDING") \
-            .execute()
+        await run_sync(lambda: _get_client().table("workflow_sessions")
+            .delete()
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "ORDER_PENDING")
+            .execute())
         return True
     except Exception as e:
         print(f"[DB] delete_pending_order failed: {e}")
@@ -381,15 +395,15 @@ async def delete_pending_order(tenant_id: str, session_id: str) -> bool:
 async def get_last_order(tenant_id: str, session_id: str) -> Optional[dict]:
     """Fetches the most recent WORKFLOW_ACTION message with extracted entities."""
     try:
-        result = _get_client().table("messages") \
-            .select("product_name, quantity_value, quantity_unit, delivery_date, created_at, text") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("intent", "WORKFLOW_ACTION") \
-            .not_.is_("product_name", "null") \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("messages")
+            .select("product_name, quantity_value, quantity_unit, delivery_date, created_at, text")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("intent", "WORKFLOW_ACTION")
+            .not_.is_("product_name", "null")
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
 
         if result.data:
             return cast(dict, result.data[0])
@@ -418,15 +432,15 @@ async def get_last_n_orders(tenant_id: str, session_id: str, n: int = 2) -> list
         Empty list if no orders found or DB fails.
     """
     try:
-        result = _get_client().table("messages") \
-            .select("product_name, quantity_value, quantity_unit, delivery_date, created_at") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("intent", "WORKFLOW_ACTION") \
-            .not_.is_("product_name", "null") \
-            .order("created_at", desc=True) \
-            .limit(n) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("messages")
+            .select("product_name, quantity_value, quantity_unit, delivery_date, created_at")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .eq("intent", "WORKFLOW_ACTION")
+            .not_.is_("product_name", "null")
+            .order("created_at", desc=True)
+            .limit(n)
+            .execute())
 
         return result.data if result.data else []
 
@@ -442,14 +456,14 @@ async def get_last_order_from_orders(tenant_id: str, session_id: str) -> Optiona
     Used for SINGLE_ORDER_INQUIRY to show invoice link.
     """
     try:
-        result = _get_client().table("orders") \
+        result = await run_sync(lambda: _get_client().table("orders")
             .select("order_id, tenant_id, session_id, sender_name, product_name, quantity_value, quantity_unit, "
-                    "unit_price, total_price, total_with_gst, invoice_url, status, created_at, items_count") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+                    "unit_price, total_price, total_with_gst, invoice_url, status, created_at, items_count")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
 
         return cast(dict, result.data[0]) if result.data else None
 
@@ -465,14 +479,14 @@ async def get_last_n_orders_from_orders(tenant_id: str, session_id: str, n: int 
     Used for MULTI_ORDER_INQUIRY to show order history with invoice links.
     """
     try:
-        result = _get_client().table("orders") \
+        result = await run_sync(lambda: _get_client().table("orders")
             .select("order_id, tenant_id, session_id, sender_name, product_name, quantity_value, quantity_unit, "
-                    "unit_price, total_price, total_with_gst, invoice_url, status, created_at, items_count") \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .order("created_at", desc=True) \
-            .limit(n) \
-            .execute()
+                    "unit_price, total_price, total_with_gst, invoice_url, status, created_at, items_count")
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .order("created_at", desc=True)
+            .limit(n)
+            .execute())
 
         return result.data if result.data else []
 
@@ -508,9 +522,9 @@ async def save_product_api_response(
             "cached_at":    datetime.now(timezone.utc).isoformat(),
         }
         # UPSERT — update if exists, insert if not
-        _get_client().table("product_cache") \
-            .upsert(row, on_conflict="tenant_id,sku") \
-            .execute()
+        await run_sync(lambda: _get_client().table("product_cache")
+            .upsert(row, on_conflict="tenant_id,sku")
+            .execute())
         print(f"[DB] Product API response saved — SKU={sku}")
         return True
     except Exception as e:
@@ -575,9 +589,9 @@ async def save_product_api_responses_batch(
         if not rows:
             return True
 
-        _get_client().table("product_cache") \
-            .upsert(rows, on_conflict="tenant_id,sku") \
-            .execute()
+        await run_sync(lambda: _get_client().table("product_cache")
+            .upsert(rows, on_conflict="tenant_id,sku")
+            .execute())
         print(f"[DB] Batch saved {len(rows)} products to product_cache in 1 call")
         return True
 
@@ -614,13 +628,13 @@ async def get_product_api_response(
             datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
         ).isoformat()
 
-        result = _get_client().table("product_cache") \
-            .select("api_response, cached_at") \
-            .eq("tenant_id", tenant_id) \
-            .eq("sku", sku.upper()) \
-            .gt("cached_at", cutoff) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("product_cache")
+            .select("api_response, cached_at")
+            .eq("tenant_id", tenant_id)
+            .eq("sku", sku.upper())
+            .gt("cached_at", cutoff)
+            .limit(1)
+            .execute())
 
         if result.data:
             row = cast(dict, result.data[0])
@@ -653,17 +667,20 @@ async def get_cached_product_by_name(
         dict with product data including list_price, sku etc.
         None if not found in cache.
     """
+    # Strip any options appended in parentheses e.g. "Reva LED Garden Bollard Outdoor Light (18W, 2ft)" -> "Reva LED Garden Bollard Outdoor Light"
+    if "(" in product_name:
+        product_name = product_name.split("(")[0].strip()
     name_lower = product_name.lower().strip()
 
     # Primary path: server-side ilike filter — O(log n) with a column index.
     # This avoids a full table scan that scales badly as the cache grows.
     try:
-        result = _get_client().table("product_cache") \
-            .select("sku, api_response, cached_at") \
-            .eq("tenant_id", tenant_id) \
-            .ilike("product_name", name_lower) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("product_cache")
+            .select("sku, api_response, cached_at")
+            .eq("tenant_id", tenant_id)
+            .ilike("product_name", name_lower)
+            .limit(1)
+            .execute())
 
         if result.data:
             row  = cast(dict, result.data[0])
@@ -682,10 +699,10 @@ async def get_cached_product_by_name(
     # Fallback path: in-memory scan for schemas without product_name column.
     # Fetches all rows for this tenant only (tenant_id scoped).
     try:
-        result2 = _get_client().table("product_cache") \
-            .select("sku, api_response, cached_at") \
-            .eq("tenant_id", tenant_id) \
-            .execute()
+        result2 = await run_sync(lambda: _get_client().table("product_cache")
+            .select("sku, api_response, cached_at")
+            .eq("tenant_id", tenant_id)
+            .execute())
 
         if not result2.data:
             return None
@@ -760,13 +777,13 @@ async def save_graphrag_product_selection(
         # ordering, an UPDATE could silently target a different, older row
         # than the one later reads return — causing position lookups to
         # resolve against stale, unrelated product data.
-        existing = _get_client().table("workflow_sessions") \
-            .select("id") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "PRODUCT_SELECTION") \
-            .order("created_at", desc=True) \
-            .execute()
+        existing = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("id")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "PRODUCT_SELECTION")
+            .order("created_at", desc=True)
+            .execute())
 
         row = {
             "tenant_id":      tenant_id,
@@ -786,24 +803,24 @@ async def save_graphrag_product_selection(
             # Update the most recent row (first in desc-ordered results).
             most_recent_row = cast(dict, existing.data[0])
             most_recent_id = most_recent_row["id"]
-            _get_client().table("workflow_sessions") \
-                .update(row) \
-                .eq("id", most_recent_id) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .update(row)
+                .eq("id", most_recent_id)
+                .execute())
 
             # Defensively remove any OTHER stale PRODUCT_SELECTION rows for
             # this session so save/read can never disagree on which is current.
             if len(existing.data) > 1:
                 stale_ids = [cast(dict, r)["id"] for r in existing.data[1:]]
-                _get_client().table("workflow_sessions") \
-                    .delete() \
-                    .in_("id", stale_ids) \
-                    .execute()
+                await run_sync(lambda: _get_client().table("workflow_sessions")
+                    .delete()
+                    .in_("id", stale_ids)
+                    .execute())
                 print(f"[DB] Removed {len(stale_ids)} stale PRODUCT_SELECTION row(s) for {session_id}")
         else:
-            _get_client().table("workflow_sessions") \
-                .insert(row) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .insert(row)
+                .execute())
 
         print(f"[DB] PRODUCT_SELECTION saved — {len(products)} options for {session_id}")
         return True
@@ -825,15 +842,15 @@ async def get_graphrag_product_selection(
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
 
-        result = _get_client().table("workflow_sessions") \
-            .select("items_json") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "PRODUCT_SELECTION") \
-            .gt("expires_at", now_utc) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("items_json")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "PRODUCT_SELECTION")
+            .gt("expires_at", now_utc)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
 
         if result.data:
             first_row = cast(dict, result.data[0])
@@ -863,13 +880,13 @@ async def save_category_selection(
         now_utc    = datetime.now(timezone.utc)
         expires_at = (now_utc + timedelta(minutes=20)).isoformat()
 
-        existing = _get_client().table("workflow_sessions") \
-            .select("id") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "CATEGORY_SELECTION") \
-            .order("created_at", desc=True) \
-            .execute()
+        existing = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("id")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "CATEGORY_SELECTION")
+            .order("created_at", desc=True)
+            .execute())
 
         row = {
             "tenant_id":      tenant_id,
@@ -886,20 +903,20 @@ async def save_category_selection(
         if existing.data:
             most_recent_row = cast(dict, existing.data[0])
             most_recent_id = most_recent_row["id"]
-            _get_client().table("workflow_sessions") \
-                .update(row) \
-                .eq("id", most_recent_id) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .update(row)
+                .eq("id", most_recent_id)
+                .execute())
             if len(existing.data) > 1:
                 stale_ids = [cast(dict, r)["id"] for r in existing.data[1:]]
-                _get_client().table("workflow_sessions") \
-                    .delete() \
-                    .in_("id", stale_ids) \
-                    .execute()
+                await run_sync(lambda: _get_client().table("workflow_sessions")
+                    .delete()
+                    .in_("id", stale_ids)
+                    .execute())
         else:
-            _get_client().table("workflow_sessions") \
-                .insert(row) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .insert(row)
+                .execute())
 
         print(f"[DB] CATEGORY_SELECTION saved — {len(categories)} options for {session_id}")
         return True
@@ -919,15 +936,15 @@ async def get_category_selection(
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
 
-        result = _get_client().table("workflow_sessions") \
-            .select("items_json") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "CATEGORY_SELECTION") \
-            .gt("expires_at", now_utc) \
-            .order("created_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("items_json")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "CATEGORY_SELECTION")
+            .gt("expires_at", now_utc)
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute())
 
         if result.data:
             first_row = cast(dict, result.data[0])
@@ -950,12 +967,12 @@ async def clear_category_selection(
 ) -> bool:
     """Clears the category selection state after a category is picked."""
     try:
-        _get_client().table("workflow_sessions") \
-            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()}) \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "CATEGORY_SELECTION") \
-            .execute()
+        await run_sync(lambda: _get_client().table("workflow_sessions")
+            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()})
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "CATEGORY_SELECTION")
+            .execute())
         print(f"[DB] CATEGORY_SELECTION cleared for {session_id}")
         return True
     except Exception as e:
@@ -994,13 +1011,24 @@ async def save_negotiation_state(
             "updated_at":     now_utc.isoformat(),
         }
 
-        existing = _get_client().table("workflow_sessions")             .select("id")             .eq("tenant_id",  tenant_id)             .eq("session_id", session_id)             .eq("status", "NEGOTIATING")             .limit(1)             .execute()
+        existing = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("id")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "NEGOTIATING")
+            .limit(1)
+            .execute())
 
         if existing.data:
             existing_row = cast(dict, existing.data[0])
-            _get_client().table("workflow_sessions")                 .update(row)                 .eq("id", existing_row["id"])                 .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .update(row)
+                .eq("id", existing_row["id"])
+                .execute())
         else:
-            _get_client().table("workflow_sessions")                 .insert(row)                 .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .insert(row)
+                .execute())
 
         print(f"[DB] Negotiation state saved — rounds={state.get('rounds')} "
               f"product={state.get('product_name')} qty={state.get('quantity')}")
@@ -1019,7 +1047,15 @@ async def get_negotiation_state(
     """
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
-        result  = _get_client().table("workflow_sessions")             .select("items_json")             .eq("tenant_id",  tenant_id)             .eq("session_id", session_id)             .eq("status", "NEGOTIATING")             .gt("expires_at", now_utc)             .order("updated_at", desc=True)             .limit(1)             .execute()
+        result = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("items_json")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "NEGOTIATING")
+            .gt("expires_at", now_utc)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute())
 
         if result.data:
             first_row = cast(dict, result.data[0])
@@ -1044,7 +1080,12 @@ async def clear_negotiation_state(
     Clears the negotiation state after order is placed or negotiation ends.
     """
     try:
-        _get_client().table("workflow_sessions")             .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()})             .eq("tenant_id",  tenant_id)             .eq("session_id", session_id)             .eq("status", "NEGOTIATING")             .execute()
+        await run_sync(lambda: _get_client().table("workflow_sessions")
+            .update({"status": "COMPLETED", "updated_at": datetime.now(timezone.utc).isoformat()})
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "NEGOTIATING")
+            .execute())
         print(f"[DB] Negotiation state cleared for {session_id}")
         return True
     except Exception as e:
@@ -1077,12 +1118,12 @@ async def clear_post_order_context(tenant_id: str, session_id: str) -> bool:
             "CATEGORY_SELECTION"
         ]
 
-        _get_client().table("workflow_sessions") \
-            .update({"status": "COMPLETED", "updated_at": now_iso}) \
-            .eq("tenant_id", tenant_id) \
-            .eq("session_id", session_id) \
-            .in_("status", statuses_to_clear) \
-            .execute()
+        await run_sync(lambda: _get_client().table("workflow_sessions")
+            .update({"status": "COMPLETED", "updated_at": now_iso})
+            .eq("tenant_id", tenant_id)
+            .eq("session_id", session_id)
+            .in_("status", statuses_to_clear)
+            .execute())
 
         print(f"[DB] Supabase post-order context cleared for {session_id}")
 
@@ -1096,11 +1137,11 @@ async def clear_post_order_context(tenant_id: str, session_id: str) -> bool:
 async def update_order_invoice_url(order_id: str, tenant_id: str, invoice_url: str) -> bool:
     """Updates the invoice URL for a specific order in the database."""
     try:
-        _get_client().table("orders") \
-            .update({"invoice_url": invoice_url}) \
-            .eq("order_id", order_id) \
-            .eq("tenant_id", tenant_id) \
-            .execute()
+        await run_sync(lambda: _get_client().table("orders")
+            .update({"invoice_url": invoice_url})
+            .eq("order_id", order_id)
+            .eq("tenant_id", tenant_id)
+            .execute())
         print(f"[DB] Invoice URL updated for order {order_id}: {invoice_url}")
         return True
     except Exception as e:
@@ -1130,24 +1171,24 @@ async def save_last_discussed_product(
             "updated_at":     now_utc.isoformat(),
         }
         # Update or insert
-        existing = _get_client().table("workflow_sessions") \
-            .select("id") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "LAST_DISCUSSED_PRODUCT") \
-            .limit(1) \
-            .execute()
+        existing = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("id")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "LAST_DISCUSSED_PRODUCT")
+            .limit(1)
+            .execute())
 
         if existing.data:
             existing_row = cast(dict, existing.data[0])
-            _get_client().table("workflow_sessions") \
-                .update(row) \
-                .eq("id", existing_row["id"]) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .update(row)
+                .eq("id", existing_row["id"])
+                .execute())
         else:
-            _get_client().table("workflow_sessions") \
-                .insert(row) \
-                .execute()
+            await run_sync(lambda: _get_client().table("workflow_sessions")
+                .insert(row)
+                .execute())
         print(f"[DB] Saved last discussed product: {product_name}")
         return True
     except Exception as e:
@@ -1159,15 +1200,15 @@ async def get_last_discussed_product(tenant_id: str, session_id: str) -> Optiona
     """Retrieves the last discussed product name from workflow_sessions table if not expired."""
     try:
         now_utc = datetime.now(timezone.utc).isoformat()
-        result = _get_client().table("workflow_sessions") \
-            .select("product_name") \
-            .eq("tenant_id",  tenant_id) \
-            .eq("session_id", session_id) \
-            .eq("status", "LAST_DISCUSSED_PRODUCT") \
-            .gt("expires_at", now_utc) \
-            .order("updated_at", desc=True) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("workflow_sessions")
+            .select("product_name")
+            .eq("tenant_id",  tenant_id)
+            .eq("session_id", session_id)
+            .eq("status", "LAST_DISCUSSED_PRODUCT")
+            .gt("expires_at", now_utc)
+            .order("updated_at", desc=True)
+            .limit(1)
+            .execute())
         if result.data:
             first_row = cast(dict, result.data[0])
             return cast(Optional[str], first_row.get("product_name"))
@@ -1176,8 +1217,6 @@ async def get_last_discussed_product(tenant_id: str, session_id: str) -> Optiona
         print(f"[DB] get_last_discussed_product failed: {e}")
         return None
 
-
-        #
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TENANT OFFERS TABLE
@@ -1229,9 +1268,9 @@ async def save_tenant_offers(
             "updated_at":  datetime.now(timezone.utc).isoformat(),
         }
         # Upsert — update if already exists, insert if not
-        _get_client().table("tenant_offers") \
-            .upsert(row, on_conflict="tenant_id") \
-            .execute()
+        await run_sync(lambda: _get_client().table("tenant_offers")
+            .upsert(row, on_conflict="tenant_id")
+            .execute())
         print(f"[DB] tenant_offers saved for {tenant_id}")
         return True
     except Exception as e:
@@ -1248,11 +1287,11 @@ async def get_tenant_offers(tenant_id: str) -> Optional[dict]:
         None if not stored yet
     """
     try:
-        result = _get_client().table("tenant_offers") \
-            .select("offers_text, tiers_json") \
-            .eq("tenant_id", tenant_id) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("tenant_offers")
+            .select("offers_text, tiers_json")
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute())
         if result.data:
             return cast(dict, result.data[0])
         return None
@@ -1265,17 +1304,25 @@ async def get_tenant_config(tenant_id: str, key: str) -> Optional[dict]:
     """
     Fetches JSONB configuration value from tenant_configurations table.
     """
+    cache_key = f"tenant_config::{tenant_id}::{key}"
+    cached = _tenant_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        result = _get_client().table("tenant_configurations") \
-            .select("config_value") \
-            .eq("tenant_id", tenant_id) \
-            .eq("config_key", key) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("tenant_configurations")
+            .select("config_value")
+            .eq("tenant_id", tenant_id)
+            .eq("config_key", key)
+            .limit(1)
+            .execute())
         if result.data:
             row = cast(dict, result.data[0])
-            return cast(Optional[dict], row.get("config_value"))
+            value = cast(Optional[dict], row.get("config_value"))
+            if value is not None:
+                _tenant_cache.set(cache_key, value)
+            return value
         return None
     except Exception as e:
         print(f"[DB] Failed to load tenant configuration '{key}': {e}")
-        return None
+        return None

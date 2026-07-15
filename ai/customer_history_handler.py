@@ -23,6 +23,8 @@ _client = AzureOpenAI(
     timeout        = 15.0,
     max_retries    = 0,
 )
+from ai.request_profiler import wrap_llm_client as _wrap_llm_client
+_wrap_llm_client(_client)
 
 
 def _get_prompt_safe(incoming, key: str, fallback: str, **kwargs) -> str:

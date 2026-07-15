@@ -18,8 +18,10 @@ _client = AzureOpenAI(
     azure_endpoint=AZURE_AI_ENDPOINT, api_key=AZURE_AI_API_KEY,
     api_version=AZURE_AI_API_VERSION, timeout=30.0, max_retries=0,
 )
+from ai.request_profiler import wrap_llm_client as _wrap_llm_client
+_wrap_llm_client(_client)
 
-MAX_NEGOTIATION_ROUNDS = 4
+MAX_NEGOTIATION_ROUNDS = 5
 DEFAULT_FLOOR_DISC_PCT = 5
 
 
@@ -473,7 +475,7 @@ async def _reply_no_discount(incoming, product_name, price_num, regular_price, d
 
     from ai.pricing import PricingResult
     pr = PricingResult.build(
-        regular_unit_price=regular_price,
+        regular_unit_price=price_num,
         quantity=quantity,
         gst_rate=getattr(incoming, "gst_rate", 0.18),
         store_disc_pct=0,
@@ -481,7 +483,7 @@ async def _reply_no_discount(incoming, product_name, price_num, regular_price, d
         negotiation_rounds=0,
         tiers=tiers or [],
     )
-    base_reply = pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
+    base_reply = await pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
 
     # Append "order N more to unlock X% off" upsell hint
     if tiers:
@@ -573,15 +575,15 @@ async def _reply_first_offer(incoming, product_name, price_num, regular_price, g
     from ai.pricing import PricingResult
 
     pr = PricingResult.build(
-        regular_unit_price=regular_price,
+        regular_unit_price=price_num,
         quantity=offer["quantity"],
         gst_rate=getattr(incoming, "gst_rate", 0.18),
         store_disc_pct=offer.get("current_tier_disc", 0),
         negotiated_unit_price=offer["offer_price"],
-        negotiation_rounds=0, # Initial offer presentation
+        negotiation_rounds=1, # Initial offer presentation
         tiers=tiers or [],
     )
-    base_reply = pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
+    base_reply = await pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
 
     # Append "order N more to unlock X% off" upsell hint or max discount unlocked
     upsell_line = None
@@ -778,7 +780,7 @@ async def handle_negotiation(
     if accepted:
         from ai.pricing import PricingResult
         pr = PricingResult.build(
-            regular_unit_price=regular_price,
+            regular_unit_price=price_num,
             quantity=quantity,
             gst_rate=getattr(incoming, "gst_rate", 0.18),
             store_disc_pct=int(negotiation_state.get("auto_offer_disc_pct") or 0),
@@ -786,96 +788,166 @@ async def handle_negotiation(
             negotiation_rounds=rounds,
             tiers=tiers,
         )
-        confirm_msg = pr.to_whatsapp_summary(product_name, incoming.sender_name, incoming=incoming)
+
+        from ai.order_service import complete_order
+        items = [{
+            "product_name":   product_name,
+            "quantity_value": quantity,
+            "quantity_unit":  "units",
+            "unit_price":     last_offer,
+            "total_price":    pr.subtotal,
+        }]
+        pending_order = await complete_order(
+            tenant_id=incoming.tenant_id,
+            session_id=incoming.session_id,
+            sender_name=incoming.sender_name,
+            items=items,
+            gst_rate=getattr(incoming, "gst_rate", 0.18),
+            extra_fields=pr.to_invoice_fields(),
+            status="PENDING_PAYMENT"
+        )
+        order_id = pending_order.order_id if pending_order else "N/A"
+        payment_link = f"https://demo.payment.gateway/pay?order_id={order_id}"
+
+        confirm_msg = get_prompt(
+            incoming, "neg_payment_and_address_request_prompt",
+            product_name=product_name,
+            quantity=quantity,
+            agreed_price=f"{last_offer:,.0f}",
+            total_with_gst=f"{pr.total_payable:,.2f}",
+            payment_link=payment_link
+        )
+
         return {"reply": confirm_msg,
-                "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer, awaiting_invoice_confirmation=True),
+                "state": _state(quantity=quantity, rounds=rounds, last_offer_price=last_offer,
+                                pending_order_id=order_id, awaiting_address_and_confirm=True),
                 "order_ready": True, "escalate": False, "agreed_price": last_offer, "quantity": quantity}
 
     # SET/ADD/REMOVE arithmetic happens here, in Python — extract_negotiation_intent()
     # only classified the operation and raw value, never computed the new total itself.
     new_qty = None
-    if parsed.intent == "QTY_CHANGE":
+    if parsed.quantity_value is not None:
         new_qty = _apply_quantity_operation(quantity, parsed.quantity_operation, parsed.quantity_value)
     if new_qty and new_qty != quantity:
+        prev_qty = quantity
         quantity = new_qty
         offer    = calculate_offer(price_num, quantity, tiers)
 
-        upsell_line = ""
-        next_tier = get_next_tier(offer["order_value"], tiers)
-        if next_tier:
-            next_min_val, next_disc_pct = next_tier
-            value_gap    = round(next_min_val - offer["order_value"], 0)
-            units_needed = max(1, int(value_gap / price_num) + 1)
-            upsell_line = get_prompt(
-                incoming, "neg_upsell_hint_prompt",
-                value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
-                next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct
+        # Update baseline and floor price for the new quantity in negotiation state
+        negotiation_state.update({
+            "quantity": quantity,
+            "auto_offer_unit_price": offer["offer_price"],
+            "auto_offer_disc_pct": offer.get("current_tier_disc", 0),
+            "current_tier_disc": offer.get("current_tier_disc", 0),
+        })
+
+        if parsed.intent == "QTY_CHANGE":
+            # Decide (synchronously, no I/O) which upsell prompt — if any —
+            # is needed. The actual fetch happens below, concurrently with
+            # everything else.
+            _upsell_kind: Optional[str] = None
+            _upsell_vars: dict = {}
+            next_tier = get_next_tier(offer["order_value"], tiers)
+            if next_tier:
+                next_min_val, next_disc_pct = next_tier
+                value_gap    = round(next_min_val - offer["order_value"], 0)
+                units_needed = max(1, int(value_gap / price_num) + 1)
+                _upsell_kind = "hint"
+                _upsell_vars = dict(
+                    value_gap=f"{value_gap:,.0f}", units_needed=units_needed,
+                    next_min_val=f"{next_min_val:,}", next_disc_pct=next_disc_pct,
+                )
+            elif tiers and offer.get("current_tier_disc", 0) > 0:
+                prev_tier_disc = negotiation_state.get("current_tier_disc", 0)
+                max_disc       = max(d for _, d in tiers)
+                if offer.get("current_tier_disc", 0) >= max_disc and offer.get("current_tier_disc", 0) > prev_tier_disc:
+                    _upsell_kind = "max_discount"
+                    _upsell_vars = dict(max_disc=max_disc, qualifier="")
+
+            # Same tenant-configurable disclosure gate as product_followup.py's
+            # auto-apply block — a store discount the customer never asked about
+            # shouldn't silently appear in a quantity-update reply, or become the
+            # baseline price they end up negotiating against.
+            _require_disclosure = bool(getattr(incoming, "require_offer_disclosure", False))
+            _offer_disclosed = bool(negotiation_state.get("offer_disclosed"))
+            _disclosure_blocked = _require_disclosure and not _offer_disclosed
+
+            _eff_tier_disc = 0 if _disclosure_blocked else offer.get("current_tier_disc", 0)
+            _eff_price     = price_num if _disclosure_blocked else offer["offer_price"]
+
+            sub_price         = round(_eff_price * quantity, 2)
+            gst_amount        = round(sub_price * getattr(incoming, "gst_rate", 0.18), 2)
+            total_pay         = round(sub_price + gst_amount, 2)
+            gst_pct           = int(getattr(incoming, "gst_rate", 0.18) * 100)
+            current_tier_disc = _eff_tier_disc
+            total_disc        = round((price_num - _eff_price) * quantity, 2) if current_tier_disc > 0 else 0
+
+            # ── Independent async operations — run concurrently ──────────────
+            # The upsell prompt, the product-summary LLM call, the main
+            # update-reply prompt, the savings prompt, and the footer prompt
+            # don't depend on each other's results — only on the pricing
+            # math above (pure Python, already done). Previously these ran
+            # one after another; asyncio.gather collapses them to the
+            # slowest single call.
+            from db.prompt_store import aget_prompt
+
+            async def _upsell() -> str:
+                if _upsell_kind == "hint":
+                    return await aget_prompt(incoming, "neg_upsell_hint_prompt", **_upsell_vars)
+                if _upsell_kind == "max_discount":
+                    return await aget_prompt(incoming, "neg_max_discount_unlocked_prompt", **_upsell_vars)
+                return ""
+
+            async def _update_body() -> str:
+                if current_tier_disc > 0:
+                    return await aget_prompt(
+                        incoming, "neg_qty_update_with_discount_prompt",
+                        prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
+                        product_name=product_name, price_num=f"{price_num:,.0f}",
+                        current_tier_disc=current_tier_disc, tier_price=f"{_eff_price:,.0f}",
+                        sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct,
+                        gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
+                    )
+                return await aget_prompt(
+                    incoming, "neg_qty_update_no_discount_prompt",
+                    prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
+                    product_name=product_name, price_num=f"{price_num:,.0f}",
+                    tier_price=f"{_eff_price:,.0f}", sub_price=f"{sub_price:,.2f}",
+                    gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
+                )
+
+            async def _savings() -> str:
+                if total_disc > 0:
+                    try:
+                        return await aget_prompt(incoming, "pricing_order_summary_savings_prompt", total_discount_amount=f"{total_disc:,.0f}")
+                    except Exception:
+                        return f"🎁 *You save Rs.{total_disc:,.0f} on this order!*"
+                return ""
+
+            async def _footer() -> str:
+                return await aget_prompt(incoming, "neg_qty_update_footer_prompt")
+
+            upsell_line, update_reply, savings_line, summary_text, footer_text = await asyncio.gather(
+                _upsell(), _update_body(), _savings(),
+                build_product_summary(incoming, product_data),
+                _footer(),
             )
-        elif tiers and offer.get("current_tier_disc", 0) > 0:
-            prev_tier_disc = negotiation_state.get("current_tier_disc", 0)
-            max_disc       = max(d for _, d in tiers)
-            if offer.get("current_tier_disc", 0) >= max_disc and offer.get("current_tier_disc", 0) > prev_tier_disc:
-                upsell_line = get_prompt(incoming, "neg_max_discount_unlocked_prompt", max_disc=max_disc, qualifier="")
+            summary_block = summary_text.strip() if summary_text else ""
 
-        summary_text = await build_product_summary(incoming, product_data)
-        summary_block = summary_text.strip() if summary_text else ""
-
-        # Same tenant-configurable disclosure gate as product_followup.py's
-        # auto-apply block — a store discount the customer never asked about
-        # shouldn't silently appear in a quantity-update reply, or become the
-        # baseline price they end up negotiating against.
-        _require_disclosure = bool(getattr(incoming, "require_offer_disclosure", False))
-        _offer_disclosed = bool(negotiation_state.get("offer_disclosed"))
-        _disclosure_blocked = _require_disclosure and not _offer_disclosed
-
-        _eff_tier_disc = 0 if _disclosure_blocked else offer.get("current_tier_disc", 0)
-        _eff_price     = price_num if _disclosure_blocked else offer["offer_price"]
-
-        sub_price         = round(_eff_price * quantity, 2)
-        gst_amount        = round(sub_price * getattr(incoming, "gst_rate", 0.18), 2)
-        total_pay         = round(sub_price + gst_amount, 2)
-        gst_pct           = int(getattr(incoming, "gst_rate", 0.18) * 100)
-        current_tier_disc = _eff_tier_disc
-
-        prev_qty = negotiation_state.get("quantity", quantity)
-        if current_tier_disc > 0:
-            update_reply = get_prompt(
-                incoming, "neg_qty_update_with_discount_prompt",
-                prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
-                product_name=product_name, price_num=f"{price_num:,.0f}",
-                current_tier_disc=current_tier_disc, tier_price=f"{_eff_price:,.0f}",
-                sub_price=f"{sub_price:,.2f}", gst_pct=gst_pct,
-                gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
-            )
-            # Add total savings display if store discount applies
-            total_disc = round((price_num - _eff_price) * quantity, 2)
-            if total_disc > 0:
-                try:
-                    savings_line = get_prompt(incoming, "pricing_order_summary_savings_prompt", total_discount_amount=f"{total_disc:,.0f}")
-                except Exception:
-                    savings_line = f"🎁 *You save Rs.{total_disc:,.0f} on this order!*"
+            if total_disc > 0 and savings_line:
                 update_reply += "\n\n" + savings_line
-        else:
-            update_reply = get_prompt(
-                incoming, "neg_qty_update_no_discount_prompt",
-                prev_qty=prev_qty, quantity=quantity, sender_name=incoming.sender_name,
-                product_name=product_name, price_num=f"{price_num:,.0f}",
-                tier_price=f"{_eff_price:,.0f}", sub_price=f"{sub_price:,.2f}",
-                gst_pct=gst_pct, gst_amount=f"{gst_amount:,.2f}", total_pay=f"{total_pay:,.2f}"
-            )
+            if upsell_line and not _disclosure_blocked:
+                update_reply += "\n\n" + upsell_line.strip()
+            if summary_block:
+                update_reply += "\n\n" + summary_block
+            update_reply += "\n\n" + footer_text
 
-        if upsell_line and not _disclosure_blocked:
-            update_reply += "\n\n" + upsell_line.strip()
-        if summary_block:
-            update_reply += "\n\n" + summary_block
-        update_reply += "\n\n" + get_prompt(incoming, "neg_qty_update_footer_prompt")
-
-        return {"reply": update_reply,
-                "state": _state(quantity=quantity, rounds=rounds, last_offer_price=_eff_price,
-                                current_tier_disc=_eff_tier_disc,
-                                auto_offer_disc_pct=_eff_tier_disc,
-                                auto_offer_unit_price=_eff_price),
-                "order_ready": False, "escalate": False, "agreed_price": _eff_price, "quantity": quantity}
+            return {"reply": update_reply,
+                    "state": _state(quantity=quantity, rounds=rounds, last_offer_price=_eff_price,
+                                    current_tier_disc=_eff_tier_disc,
+                                    auto_offer_disc_pct=_eff_tier_disc,
+                                    auto_offer_unit_price=_eff_price),
+                    "order_ready": False, "escalate": False, "agreed_price": _eff_price, "quantity": quantity}
 
     counter = _resolve_counter_offer_price(
         parsed.counter_offer_value, parsed.counter_offer_price_type, quantity
@@ -950,7 +1022,7 @@ async def handle_negotiation(
     #
     # 4. CUSTOMER OFFER MEMORY: track trajectory so we can acknowledge
     #    when customers raise their budget ("you've moved from Rs.X to Rs.Y").
-    STEP_PCTS         = [0.15, 0.25, 0.35, 0.25]   # % of total gap conceded per round
+    STEP_PCTS         = [0.15, 0.20, 0.25, 0.25, 0.15]   # % of total gap conceded per round
     MAX_REACTIVE_MOVE = 50    # max extra Rs. conceded toward customer's ask per round
     CLOSE_THRESHOLD   = 25    # Rs. gap below which we accept customer's offer directly
 

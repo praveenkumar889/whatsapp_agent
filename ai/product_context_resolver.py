@@ -1,11 +1,18 @@
 # ai/product_context_resolver.py — Resolves active product name from session/history
-from typing import Optional
+from typing import Any, Optional
 from db.session_store import get_negotiation_state, get_last_discussed_product
 from db.customer_data_service import CustomerDataService
 
+# Sentinel distinguishing "caller didn't pass a value" (need to fetch) from
+# "caller explicitly passed None" (already fetched — genuinely no active
+# negotiation). A plain `None` default can't tell these apart, which used to
+# cause a redundant get_negotiation_state() DB round-trip on every message
+# for the common case of a customer who isn't mid-negotiation.
+_NOT_PROVIDED: Any = object()
+
 class ProductContextResolver:
     @staticmethod
-    async def resolve(tenant_id: str, session_id: str, incoming_cached_neg: Optional[dict] = None) -> Optional[str]:
+    async def resolve(tenant_id: str, session_id: str, incoming_cached_neg: Optional[dict] = _NOT_PROVIDED) -> Optional[str]:
         """
         Resolves active product name using a waterfall priority:
         1. Active negotiation state
@@ -13,7 +20,11 @@ class ProductContextResolver:
         3. Latest completed order product from customer history
         """
         # 1. Active negotiation
-        active_neg = incoming_cached_neg or await get_negotiation_state(tenant_id, session_id)
+        active_neg: Optional[dict]
+        if incoming_cached_neg is _NOT_PROVIDED:
+            active_neg = await get_negotiation_state(tenant_id, session_id)
+        else:
+            active_neg = incoming_cached_neg
         if active_neg:
             product = active_neg.get("product_name")
             if product:
