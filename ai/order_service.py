@@ -58,6 +58,7 @@ class OrderResult:
 async def complete_order(
     tenant_id: str, session_id: str, sender_name: str,
     items: list, gst_rate: float = 0.18, extra_fields: Optional[dict] = None,
+    shipping_address: Optional[str] = None, status: str = "CONFIRMED",
 ) -> Optional[OrderResult]:
     """
     Creates the order and saves product_context, order_history, and offer_history
@@ -68,6 +69,7 @@ async def complete_order(
     new_order = await create_order(
         tenant_id=tenant_id, session_id=session_id, sender_name=sender_name,
         items=items, gst_rate=gst_rate, extra_fields=extra_fields,
+        shipping_address=shipping_address, status=status,
     )
 
     if not new_order:

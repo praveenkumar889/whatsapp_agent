@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from typing import Optional, cast
 from supabase import create_client, Client  # type: ignore[import]
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, PRODUCTS_API_URL
+from db.db_utils import run_sync
 
 _supabase: Optional[Client] = None
 
@@ -121,24 +122,19 @@ async def _fetch_from_products_api(skus: list) -> list:
             sku   = p.get("sku")
             if not price or not name:
                 continue
-            results.append({
-                "product_name":  name,
-                "list_price":    float(price),
-                "floor_price":   float(price) * 0.85,
-                "sku":           sku,
-                "image_url":     p.get("image_url"),
-                "product_url":   p.get("url"),
-                "discount_pct":  p.get("discount_percentage", 0),
-                "regular_price": p.get("regular_price", price),
-                "categories":    p.get("categories", []),
-                "features":      p.get("features", []),
-                "specs":         p.get("specs", []),
-                "use_cases":     p.get("use_cases", []),
-                "review_count":  p.get("review_count", 0),
-                "warranties":    p.get("warranties", []),
-                "policies":      p.get("policies", []),
-                "faqs":          p.get("faqs", []),
-            })
+
+            # Start by copying the entire product dictionary from the API response
+            item_dict = p.copy()
+
+            # Normalize and augment keys the application relies on
+            item_dict["product_name"]  = name
+            item_dict["list_price"]    = float(price)
+            item_dict["floor_price"]   = float(price) * 0.85
+            item_dict["product_url"]   = p.get("url")
+            item_dict["discount_pct"]  = p.get("discount_percentage", 0)
+            item_dict["regular_price"] = p.get("regular_price", price)
+
+            results.append(item_dict)
             print(f"[PRODUCTS API] {sku} -> '{name}' @ Rs.{price}")
 
         return results
@@ -198,6 +194,8 @@ async def create_order(
     items:        list,
     gst_rate:     float = 0.18,
     extra_fields: Optional[dict] = None,
+    shipping_address: Optional[str] = None,
+    status:       str = "CONFIRMED",
 ) -> Optional[dict]:
     """
     Creates a confirmed order with one or more line items.
@@ -232,10 +230,11 @@ async def create_order(
             "total_price":    total_price,
             "total_with_gst": total_with_gst,
             "items_count":    len(items),
-            "status":         "CONFIRMED",
+            "status":         status,
+            "shipping_address": shipping_address,
         }
         print(f"[ORDER] Inserting header {order_id} - {len(items)} item(s)")
-        result = _get_client().table("orders").insert(order_row).execute()
+        result = await run_sync(lambda: _get_client().table("orders").insert(order_row).execute())
 
         if not result.data:
             print(f"[ORDER] Header insert returned no data")
@@ -254,7 +253,7 @@ async def create_order(
                 "total_price":    item_total,
             })
         print(f"[ORDER] Inserting {len(item_rows)} order_items rows")
-        _get_client().table("order_items").insert(item_rows).execute()
+        await run_sync(lambda: _get_client().table("order_items").insert(item_rows).execute())
 
         order = cast(dict, result.data[0])
         order["items"] = item_rows
@@ -275,13 +274,38 @@ async def create_order(
 async def get_order_by_id(order_id: str, tenant_id: str) -> Optional[dict]:
     """Fetches a specific order by order_id."""
     try:
-        result = _get_client().table("orders") \
-            .select("*") \
-            .eq("order_id", order_id) \
-            .eq("tenant_id", tenant_id) \
-            .limit(1) \
-            .execute()
+        result = await run_sync(lambda: _get_client().table("orders")
+            .select("*")
+            .eq("order_id", order_id)
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+            .execute())
         return cast(dict, result.data[0]) if result.data else None
     except Exception as e:
         print(f"[ORDER] Fetch by ID failed: {e}")
+        return None
+
+
+async def update_order_status_and_address(
+    order_id: str, tenant_id: str, status: str, shipping_address: str
+) -> Optional[dict]:
+    """Updates order status and shipping address, and retrieves multi-item rows if present."""
+    try:
+        result = await run_sync(lambda: _get_client().table("orders")
+            .update({"status": status, "shipping_address": shipping_address})
+            .eq("order_id", order_id)
+            .eq("tenant_id", tenant_id)
+            .execute())
+        if not result.data:
+            return None
+        order = cast(dict, result.data[0])
+        # Retrieve items for this order so the invoice generator can list them correctly
+        items_result = await run_sync(lambda: _get_client().table("order_items")
+            .select("*")
+            .eq("order_id", order_id)
+            .execute())
+        order["items"] = items_result.data or []
+        return order
+    except Exception as e:
+        print(f"[ORDER] Update status and address failed: {e}")
         return None

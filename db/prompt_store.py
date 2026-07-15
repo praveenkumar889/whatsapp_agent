@@ -132,6 +132,44 @@ class _PromptLoader:
             print(f"[PROMPT] DB read failed for '{name}': {e}")
             return None
 
+    @staticmethod
+    async def aload(tenant_id: str, name: str, lang: str,
+                     incoming: Any = None) -> Optional[PromptTemplate]:
+        """
+        Async variant of load() — identical resolution order (CACHE → DB →
+        LEGACY), but the DB read is offloaded to a worker thread via
+        db.db_utils.run_sync instead of blocking the event loop. Use this
+        (via aget_prompt()) when loading several independent prompts that
+        can be fetched concurrently with asyncio.gather.
+        """
+        cached = _cache_get(tenant_id, name, lang)
+        if cached:
+            print(f"[PROMPT] source=CACHE  tenant={tenant_id}  prompt={name}  lang={lang}")
+            return PromptTemplate(name=name, template=cached, source="CACHE",
+                                  language=lang, tenant_id=tenant_id)
+
+        from db.db_utils import run_sync
+        db_result = await run_sync(lambda: _PromptLoader._from_db(tenant_id, name, lang))
+        if db_result:
+            text, version = db_result
+            _cache_set(tenant_id, name, lang, text)
+            print(f"[PROMPT] source=DB     tenant={tenant_id}  prompt={name}"
+                  f"  lang={lang}  version={version}")
+            return PromptTemplate(name=name, template=text, source="DB",
+                                  version=version, language=lang, tenant_id=tenant_id)
+
+        if incoming is not None:
+            attr   = PROMPT_KEYS.get(name, name)
+            legacy = getattr(incoming, attr, None)
+            if legacy:
+                _cache_set(tenant_id, name, lang, legacy)
+                print(f"[PROMPT] source=LEGACY tenant={tenant_id}  prompt={name}"
+                      f"  (migrate to prompt_templates)")
+                return PromptTemplate(name=name, template=legacy, source="LEGACY",
+                                      language=lang, tenant_id=tenant_id)
+
+        return None
+
 
 # ── Renderer ───────────────────────────────────────────────────────────────────
 
@@ -185,6 +223,42 @@ def get_prompt(incoming: Any, key: str, **template_vars: Any) -> str:
         )
 
     pt = _PromptLoader.load(tenant_id, key, language, incoming)
+    if not pt:
+        raise RuntimeError(
+            f"[PROMPT] '{key}' not found for tenant '{tenant_id}' (lang={language}). "
+            f"Run 014_migrate_hardcoded_prompts.sql to seed prompt_templates."
+        )
+
+    return _PromptRenderer.render(pt, **template_vars)
+
+
+async def aget_prompt(incoming: Any, key: str, **template_vars: Any) -> str:
+    """
+    Async variant of get_prompt() — load + render, same behavior and same
+    RuntimeError-on-missing contract, but non-blocking on a DB cache-miss.
+
+    Use this (instead of get_prompt()) specifically when a caller needs to
+    load several independent prompts for one reply and can fetch them
+    concurrently, e.g.:
+
+        body, footer = await asyncio.gather(
+            aget_prompt(incoming, "some_body_prompt", **body_vars),
+            aget_prompt(incoming, "some_footer_prompt"),
+        )
+
+    For single, standalone prompt loads, the existing synchronous
+    get_prompt() is unchanged and still the simpler choice.
+    """
+    tenant_id = getattr(incoming, "tenant_id", "")
+    language  = getattr(incoming, "language",  "en") or "en"
+
+    if key not in PROMPT_KEYS:
+        raise RuntimeError(
+            f"[PROMPT] Unknown key: '{key}'. "
+            f"Add it to PROMPT_KEYS and to prompt_templates in DB."
+        )
+
+    pt = await _PromptLoader.aload(tenant_id, key, language, incoming)
     if not pt:
         raise RuntimeError(
             f"[PROMPT] '{key}' not found for tenant '{tenant_id}' (lang={language}). "
@@ -396,4 +470,6 @@ PROMPT_KEYS: dict = {
     "memory_no_orders_found_prompt":                    "memory_no_orders_found_prompt",
     "memory_order_formatter_prompt":                    "memory_order_formatter_prompt",
     "memory_offers_formatter_prompt":                   "memory_offers_formatter_prompt",
+    "neg_payment_and_address_request_prompt":           "neg_payment_and_address_request_prompt",
+    "validate_shipping_address_prompt":                 "validate_shipping_address_prompt",
 }

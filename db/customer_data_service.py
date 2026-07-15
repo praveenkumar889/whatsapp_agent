@@ -5,10 +5,12 @@
 #   (orders, negotiations, offers, preferences, product views).
 #   This replaces the unstructured conversational memories of Mem0.
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional, cast
 from db.session_store import _get_client
+from db.db_utils import run_sync
 
 class CustomerDataService:
     def __init__(self, tenant_id: str, session_id: str):
@@ -24,20 +26,20 @@ class CustomerDataService:
                 "product_name": product_name,
                 "viewed_at": datetime.now(timezone.utc).isoformat()
             }
-            _get_client().table("product_views").insert(row).execute()
+            await run_sync(lambda: _get_client().table("product_views").insert(row).execute())
         except Exception as e:
             print(f"[CustomerData] save_product_view failed (possibly missing table): {e}")
 
     async def get_recent_product_views(self, limit: int = 5) -> List[dict]:
         """Fetches recently viewed products from Postgres."""
         try:
-            res = _get_client().table("product_views") \
-                .select("*") \
-                .eq("tenant_id", self.tenant_id) \
-                .eq("session_id", self.session_id) \
-                .order("viewed_at", desc=True) \
-                .limit(limit) \
-                .execute()
+            res = await run_sync(lambda: _get_client().table("product_views")
+                .select("*")
+                .eq("tenant_id", self.tenant_id)
+                .eq("session_id", self.session_id)
+                .order("viewed_at", desc=True)
+                .limit(limit)
+                .execute())
             return cast(List[dict], res.data or [])
         except Exception as e:
             print(f"[CustomerData] get_recent_product_views failed (possibly missing table): {e}")
@@ -53,18 +55,18 @@ class CustomerDataService:
                 "value": value,
                 "updated_at": datetime.now(timezone.utc).isoformat()
             }
-            _get_client().table("customer_preferences").upsert(row, on_conflict="tenant_id,session_id,pref_type").execute()
+            await run_sync(lambda: _get_client().table("customer_preferences").upsert(row, on_conflict="tenant_id,session_id,pref_type").execute())
         except Exception as e:
             print(f"[CustomerData] save_preference failed (possibly missing table): {e}")
 
     async def get_preferences(self) -> Dict[str, str]:
         """Fetches all customer preferences as a dictionary."""
         try:
-            res = _get_client().table("customer_preferences") \
-                .select("pref_type,value") \
-                .eq("tenant_id", self.tenant_id) \
-                .eq("session_id", self.session_id) \
-                .execute()
+            res = await run_sync(lambda: _get_client().table("customer_preferences")
+                .select("pref_type,value")
+                .eq("tenant_id", self.tenant_id)
+                .eq("session_id", self.session_id)
+                .execute())
             data = cast(List[dict], res.data or [])
             return {str(r["pref_type"]): str(r["value"]) for r in data if r.get("pref_type")}
         except Exception as e:
@@ -88,20 +90,20 @@ class CustomerDataService:
                 "quantity": quantity,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
-            _get_client().table("negotiation_history").insert(row).execute()
+            await run_sync(lambda: _get_client().table("negotiation_history").insert(row).execute())
         except Exception as e:
             print(f"[CustomerData] save_negotiation_outcome failed (possibly missing table): {e}")
 
     async def get_negotiation_history(self, limit: int = 5) -> List[dict]:
         """Fetches past negotiations from Postgres."""
         try:
-            res = _get_client().table("negotiation_history") \
-                .select("*") \
-                .eq("tenant_id", self.tenant_id) \
-                .eq("session_id", self.session_id) \
-                .order("created_at", desc=True) \
-                .limit(limit) \
-                .execute()
+            res = await run_sync(lambda: _get_client().table("negotiation_history")
+                .select("*")
+                .eq("tenant_id", self.tenant_id)
+                .eq("session_id", self.session_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute())
             return cast(List[dict], res.data or [])
         except Exception as e:
             print(f"[CustomerData] get_negotiation_history failed (possibly missing table): {e}")
@@ -122,20 +124,20 @@ class CustomerDataService:
                 "accepted": accepted,
                 "created_at": datetime.now(timezone.utc).isoformat()
             }
-            _get_client().table("customer_offers").insert(row).execute()
+            await run_sync(lambda: _get_client().table("customer_offers").insert(row).execute())
         except Exception as e:
             print(f"[CustomerData] save_offer_history failed (possibly missing table): {e}")
 
     async def get_offer_history(self, limit: int = 5) -> List[dict]:
         """Fetches past offers from Postgres."""
         try:
-            res = _get_client().table("customer_offers") \
-                .select("*") \
-                .eq("tenant_id", self.tenant_id) \
-                .eq("session_id", self.session_id) \
-                .order("created_at", desc=True) \
-                .limit(limit) \
-                .execute()
+            res = await run_sync(lambda: _get_client().table("customer_offers")
+                .select("*")
+                .eq("tenant_id", self.tenant_id)
+                .eq("session_id", self.session_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute())
             return cast(List[dict], res.data or [])
         except Exception as e:
             print(f"[CustomerData] get_offer_history failed (possibly missing table): {e}")
@@ -144,13 +146,13 @@ class CustomerDataService:
     async def get_order_history(self, limit: int = 5) -> List[dict]:
         """Fetches completed orders from standard orders table."""
         try:
-            res = _get_client().table("orders") \
-                .select("*") \
-                .eq("tenant_id", self.tenant_id) \
-                .eq("session_id", self.session_id) \
-                .order("created_at", desc=True) \
-                .limit(limit) \
-                .execute()
+            res = await run_sync(lambda: _get_client().table("orders")
+                .select("*")
+                .eq("tenant_id", self.tenant_id)
+                .eq("session_id", self.session_id)
+                .order("created_at", desc=True)
+                .limit(limit)
+                .execute())
             return cast(List[dict], res.data or [])
         except Exception as e:
             print(f"[CustomerData] get_order_history failed: {e}")
@@ -181,14 +183,14 @@ class CustomerDataService:
     async def get_latest_invoice(self) -> Optional[dict]:
         """Fetches the latest completed order invoice from database."""
         try:
-            res = _get_client().table("orders") \
-                .select("*") \
-                .eq("tenant_id", self.tenant_id) \
-                .eq("session_id", self.session_id) \
-                .not_.is_("invoice_url", "null") \
-                .order("created_at", desc=True) \
-                .limit(1) \
-                .execute()
+            res = await run_sync(lambda: _get_client().table("orders")
+                .select("*")
+                .eq("tenant_id", self.tenant_id)
+                .eq("session_id", self.session_id)
+                .not_.is_("invoice_url", "null")
+                .order("created_at", desc=True)
+                .limit(1)
+                .execute())
             return cast(List[dict], res.data)[0] if res.data else None
         except Exception as e:
             print(f"[CustomerData] get_latest_invoice failed: {e}")
@@ -206,10 +208,14 @@ class CustomerDataService:
     async def get_customer_summary(self) -> dict:
         """Fetches unified customer profile details (preferences, average negotiations, purchase stats)."""
         try:
-            prefs = await self.get_preferences()
-            negs = await self.get_negotiation_history(limit=10)
-            orders = await self.get_order_history(limit=10)
-            
+            # These three reads are independent of each other — fetch
+            # concurrently instead of one after another.
+            prefs, negs, orders = await asyncio.gather(
+                self.get_preferences(),
+                self.get_negotiation_history(limit=10),
+                self.get_order_history(limit=10),
+            )
+
             fav_cat = prefs.get("category") or "N/A"
             total_orders = len(orders)
             total_spent = sum(float(o.get("total_price") or 0) for o in orders)
@@ -245,6 +251,11 @@ class CustomerDataService:
                 "last_purchase_date": last_purchase_date,
                 "avg_negotiation_discount_pct": avg_discount,
                 "total_negotiations": len(negs),
+                # Raw fetched lists (already limit=10, newest-first) exposed so
+                # callers needing per-item detail (e.g. ContextBuilder) can
+                # slice these instead of re-querying the same tables again.
+                "_negotiations": negs,
+                "_orders": orders,
             }
         except Exception as e:
             print(f"[CustomerData] get_customer_summary failed: {e}")

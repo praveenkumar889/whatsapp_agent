@@ -25,6 +25,8 @@ _client = AzureOpenAI(
     timeout        = 30.0,
     max_retries    = 0,
 )
+from ai.request_profiler import wrap_llm_client as _wrap_llm_client
+_wrap_llm_client(_client)
 
 DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION", "GREETING", "UNKNOWN"}
 DEFAULT_INTENT_MIN_CONFIDENCE = 0.50  # default — see incoming.intent_min_confidence for tenant override

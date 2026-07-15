@@ -138,26 +138,22 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     for p in products:
         sku = p.get("sku")
         if sku:
-            cached_item = [{
-                "product_name":               p.get("name"),
-                "list_price":                 float(p.get("price_num", 0)),
-                "sku":                        sku,
-                "image_url":                  p.get("image_url"),
-                "installation_url":           p.get("installation_url"),
-                "product_url":                p.get("url"),
-                "discount_pct":               p.get("discount_percentage", 0),
-                "regular_price":              p.get("regular_price", p.get("price_num", 0)),
-                "features":                   [],
-                "specs":                      [],
-                "review_count":               p.get("review_count", 0),
-                "rating":                     p.get("rating", 0),
-                "policies":                   [],
-                "faqs":                       [],
-                "warranties":                 [],
-                "warranty":                   p.get("warranty", ""),
-                "replacement_exchange_policy": p.get("replacement_exchange_policy", ""),
-                "feature_descriptions":       p.get("feature_descriptions", ""),
-            }]
+            # Copy all fields from GraphRAG response dynamically
+            item_dict = p.copy()
+
+            # Normalize standard keys the application relies on
+            if "name" in p:
+                item_dict["product_name"] = p.get("name")
+            if "price_num" in p:
+                item_dict["list_price"]   = float(p.get("price_num", 0))
+            if "url" in p:
+                item_dict["product_url"]  = p.get("url")
+            if "discount_percentage" in p:
+                item_dict["discount_pct"] = p.get("discount_percentage", 0)
+            if "regular_price" not in item_dict:
+                item_dict["regular_price"] = p.get("regular_price", p.get("price_num", 0))
+
+            cached_item = [item_dict]
             batch_items.append({"sku": sku, "api_response": cached_item})
 
     # Fire-and-forget: all three cache saves are for future requests only.

@@ -29,6 +29,7 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT, TA_LEFT
 
 from supabase import create_client, Client  # type: ignore[import]
 from config import SUPABASE_URL, SUPABASE_SERVICE_KEY, SUPABASE_STORAGE_BUCKET
+from db.db_utils import run_sync
 
 _supabase: Optional[Client] = None
 
@@ -52,7 +53,7 @@ R = "Rs."
 
 
 def generate_invoice_pdf(
-    order:         dict,
+    order:         "Union[dict, OrderResult]",
     biz_name:      str,
     tagline:       Optional[str] = None,
     city:          Optional[str] = None,
@@ -163,7 +164,7 @@ def generate_invoice_pdf(
         [lbl("Customer:"),  val(customer_name),
          lbl("Status:"),    val(order.get("status","CONFIRMED"))],
         [lbl("Phone:"),     val(customer_phone),
-         lbl(""),           val("")],
+         lbl("Address:"),   val(order.get("shipping_address") or "N/A")],
     ], colWidths=[c1, c2, c3, c4])
     meta.setStyle(TableStyle([
         ("TOPPADDING",    (0,0),(-1,-1), 4),
@@ -350,11 +351,11 @@ async def upload_invoice_to_storage(
         )
 
         try:
-            _get_client().storage.from_(SUPABASE_STORAGE_BUCKET).upload(
+            await run_sync(lambda: _get_client().storage.from_(SUPABASE_STORAGE_BUCKET).upload(
                 path         = path,
                 file         = pdf_bytes,
                 file_options = {"content-type": "application/pdf", "upsert": "true"},
-            )
+            ))
             print(f"[INVOICE] Uploaded -> {public_url}")
         except Exception as upload_err:
             err_msg = str(upload_err)
@@ -392,7 +393,10 @@ async def generate_and_upload_invoice(
     gst_rate and gstin are forwarded to the PDF generator for correct tax display.
     """
     try:
-        pdf_bytes = generate_invoice_pdf(
+        # generate_invoice_pdf() is synchronous, CPU-bound ReportLab rendering —
+        # offloaded to a worker thread so it doesn't stall the shared event loop
+        # (and every other tenant's in-flight conversation) while it runs.
+        pdf_bytes = await run_sync(lambda: generate_invoice_pdf(
             order         = order,
             biz_name      = biz_name or "Order Tracking AI",
             tagline       = tagline,
@@ -406,7 +410,7 @@ async def generate_and_upload_invoice(
             sender_phone  = sender_phone,
             gst_rate      = gst_rate,
             gstin         = gstin,
-        )
+        ))
         return await upload_invoice_to_storage(
             pdf_bytes = pdf_bytes,
             order_id  = order["order_id"],

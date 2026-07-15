@@ -215,6 +215,8 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
     Core 8-step pipeline. Lightweight orchestrator — no business logic here.
     All logic lives in pipeline/setup.py, pipeline/router.py, and ai/ modules.
     """
+    from ai import request_profiler
+    request_profiler.start()
     _t0 = time.monotonic()
 
     # ── Steps 1-5: Setup (tenant, dedup, lock, history, save, neg_state) ───
@@ -232,11 +234,33 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         # FIX: During active negotiation the intent classifier oscillates between
         # FAQ_KNOWLEDGE and WORKFLOW_ACTION wasting 2.5-3s per message.
         # Bypass saves that time and keeps intent consistent.
+        #
+        # Also bypasses while awaiting_quantity=True — the bot just asked one
+        # specific question ("how many units?"), so the reply is overwhelmingly
+        # the answer to that, not a topic change. This is deliberately narrow:
+        # both conditions describe a single well-defined state the negotiation
+        # state machine is waiting on (like awaiting_invoice_confirmation is
+        # deliberately EXCLUDED below — that state is money-adjacent and kept
+        # on full classification). It is NOT extended to the broader
+        # PRODUCT_SELECTION browsing state (customer looking at a shown list,
+        # no negotiation started yet) — that state is genuinely open-ended
+        # (the customer might ask about installation, warranty, specs on any
+        # item) and skipping classify_intent there would break the
+        # requested_knowledge_field routing that "tell me the features/
+        # installation/warranty of X" depends on.
+        #
+        # Trade-off: if a customer asks something unrelated to quantity while
+        # awaiting_quantity=True (rare — the bot just asked a narrow
+        # question), the routing decision that would normally catch that is
+        # skipped. product_followup.py's own classifiers (offer-inquiry,
+        # installation-intent, etc.) still run independently of routing and
+        # can still catch it — this only loses the fast dynamic-knowledge
+        # intercept shortcut, not the underlying handling.
         _t_intent = time.monotonic()
         _in_active_neg = (
             _neg is not None
-            and int(_neg.get("rounds", 0)) > 0
             and not _neg.get("awaiting_invoice_confirmation", False)
+            and (int(_neg.get("rounds", 0)) > 0 or _neg.get("awaiting_quantity", False))
         )
         if _in_active_neg:
             class _BypassResult:
@@ -256,7 +280,9 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         incoming._routing = getattr(result, "routing", None)
 
         # ── Step 4: Update intent in DB ──────────────────────────────────────
-        await update_intent(incoming.message_id, result.intent, result.confidence_score, incoming.tenant_id)
+        # Fire-and-forget: this is an audit-log write nothing downstream reads,
+        # so it shouldn't block the customer's reply waiting on it.
+        asyncio.create_task(update_intent(incoming.message_id, result.intent, result.confidence_score, incoming.tenant_id))
 
         # ── Step 4.5: Build AIRequestContext ─────────────────────────────────
         from ai.request_context import AIRequestContext
@@ -269,7 +295,9 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         incoming._cached_arc = arc
 
         # ── Step 5: Dispatch to handler ──────────────────────────────────────
+        _t_dispatch = time.monotonic()
         reply = await dispatch(incoming, result, session_history)
+        request_profiler.add("dispatch", (time.monotonic() - _t_dispatch) * 1000)
 
         # ── Step 6: Send reply ───────────────────────────────────────────────
         sent_wamid = await _send_reply_chunked(incoming, reply)
@@ -293,7 +321,12 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
 
         # ── Step 8: Return debug info ────────────────────────────────────────
         latency = round(time.monotonic() - _t0, 2)
+        _profile = request_profiler.snapshot()
         print(f"[TIMING] TOTAL pipeline time: {latency}s")
+        print(f"[PROFILE] db={_profile.get('db_ms', 0)}ms ({_profile.get('db_calls', 0)} calls)  "
+              f"llm={_profile.get('llm_ms', 0)}ms ({_profile.get('llm_calls', 0)} calls)  "
+              f"graphrag={_profile.get('graphrag_ms', 0)}ms ({_profile.get('graphrag_calls', 0)} calls)  "
+              f"dispatch={_profile.get('dispatch_ms', 0)}ms")
         # If the negotiator deferred (message wasn't negotiation-related —
         # e.g. an escalation request arriving mid-negotiation), the ACTUAL
         # intent used for routing differs from result.intent (which may
@@ -308,6 +341,7 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
                 "route":      _get_route(result) if _reported_intent == result.intent
                               else _get_route_for_intent(_reported_intent),
                 "tenant_id":  incoming.tenant_id,
+                "profile":    _profile,
             },
         }
 

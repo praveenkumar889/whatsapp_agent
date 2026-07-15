@@ -43,6 +43,8 @@ _client = AzureOpenAI(
     timeout        = 30.0,
     max_retries    = 0,
 )
+from ai.request_profiler import wrap_llm_client as _wrap_llm_client
+_wrap_llm_client(_client)
 
 
 async def _parse_followup_message(incoming, selection: list, session_history: Optional[list] = None) -> dict:
@@ -94,6 +96,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
             "selected_product_name": None,
             "quantity": None,
             "quantity_unit": None,
+            "selected_options": None,
             "is_comparison": False,
             "is_recommendation": False,
             "is_offer_inquiry": False,
@@ -289,64 +292,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         else:
             return None
 
-    # ── NUMBER SELECTION RESOLVER ────────────────────────────────────────────
-    # Runs BEFORE any LLM call. When a numbered product list was shown,
-    # resolve number references to product names while preserving intent context.
-    #
-    # Handles:
-    #   "compare 11 and 12"       → "compare Figo Solar Wall Light and Nyla Solar Wall Light"
-    #   "give me details about 11" → "give me details about Figo Solar Wall Light"
-    #   "11" (bare)               → "Figo Solar Wall Light"
-    #   "I want 2 units"          → skip (qty context)
-    if selection and len(selection) > 1:
-        import re as _re
-        _txt = incoming.text.strip()
-        _q_regex = getattr(incoming, "quantity_ctx_regex", None) or r'\b(units?|pieces?|pcs?|qty|quantity|of them)\b'
-        _qty_ctx = bool(_re.search(_q_regex, _txt, _re.IGNORECASE))
-        if not _qty_ctx:
-            # Extract all numbers from the message
-            _num_regex = getattr(incoming, "number_selection_regex", None) or r'(?<![\d])(?:#|no\.?\s*|sr\.?\s*|option\s+|product\s+|item\s+|number\s+)?(\d+)(?![\d])'
-            _all_nums = _re.findall(_num_regex, _txt, _re.IGNORECASE)
-            _in_range = [int(n) for n in _all_nums if 1 <= int(n) <= len(selection)]
-
-            if len(_in_range) >= 2:
-                # COMPARISON: supports N products — "compare 3,7,10" or "compare 10 and 11"
-                # Previously only resolved _in_range[0] and _in_range[1], silently
-                # dropping product 10 from "compare 3,7,10". Now passes all N names.
-                _all_pnames = []
-                for _idx in _in_range:
-                    _pn = selection[_idx-1].get("product_name") or selection[_idx-1].get("name", "")
-                    if _pn:
-                        _all_pnames.append(_pn)
-
-                if len(_all_pnames) >= 2:
-                    _comp_regex = getattr(incoming, "comparison_ctx_regex", None) or r'\b(compare|vs\.?|versus|difference|better|which)\b'
-                    _is_compare = bool(_re.search(_comp_regex, _txt, _re.IGNORECASE))
-                    _nums_str = ", ".join(f"#{n}" for n in _in_range[:len(_all_pnames)])
-                    print(f"[NUMBER-SELECT] Compare {_nums_str}: {_all_pnames}")
-                    incoming.text = "compare " + " and ".join(_all_pnames)
-
-            elif len(_in_range) == 1:
-                _n = _in_range[0]
-                _chosen = selection[_n - 1]
-                _chosen_name = _chosen.get("product_name") or _chosen.get("name", "")
-                if _chosen_name:
-                    # Replace just the number (and its optional prefix) in the message,
-                    # preserving any intent context before/after it.
-                    # "give me details about 11" → "give me details about Figo Solar..."
-                    # "order 11" → "order Figo Solar..."
-                    # "11" → "Figo Solar..."
-                    _repl_pat = getattr(incoming, "number_replacement_pattern", None) or r'(?:#|no\.?\s*|sr\.?\s*|option\s+|product\s+|item\s+|number\s+)?\b{num}\b'
-                    _repl_regex = _repl_pat.replace("{num}", str(_n))
-                    _replaced = _re.sub(
-                        _repl_regex,
-                        _chosen_name,
-                        _txt,
-                        count=1,
-                        flags=_re.IGNORECASE
-                    ).strip()
-                    print(f"[NUMBER-SELECT] #{_n} → '{_chosen_name}' | '{_txt}' → '{_replaced}'")
-                    incoming.text = _replaced
+    # (Number selection is now handled dynamically by the DB prompt templates)
 
     # ── Standard follow-up parsing ────────────────────────────────────────────
     # ── Negotiation check ────────────────────────────────────────────────────
@@ -365,37 +311,61 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         _bypass_negotiation = True
         neg_state = None
 
-    # ── DEDICATED OFFER INQUIRY PRE-CHECK ────────────────────────────────────
-    # Runs BEFORE parse and is_negotiation_request.
-    # "Currently is there any offers?" / "is there any offers?" →
-    # is_negotiation_request returns True (sees "offers" as discount).
-    # This focused YES/NO check catches it first and blocks the negotiation path.
-    _is_offer_inq = False
-    try:
-        _oiq = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
-                messages=[
-                    {"role": "system", "content": get_prompt(incoming, "pf_offer_inquiry_check_prompt")},
-                    {"role": "user", "content": incoming.text},
-                ],
-            )
-        )
-        _content = _oiq.choices[0].message.content
-        if _content and "YES" in _content.strip().upper():
-            _is_offer_inq = True
-            print(f"[OFFER INQUIRY] Pre-check YES: '{incoming.text}'")
-    except Exception as _oiqe:
-        print(f"[OFFER INQUIRY] Pre-check failed: {_oiqe}")
-
-    # ── Always parse the follow-up BEFORE the negotiation check ─────────────
+    # ── Independent early classifiers — run concurrently ─────────────────────
+    # Offer-inquiry precheck, the main follow-up parser, and the dedicated
+    # negotiation-intent check don't depend on each other's *inputs*, so they
+    # were previously paying for their latency sequentially (~4-7s combined
+    # per production timing logs) even though nothing required that ordering.
+    # Running them via asyncio.gather collapses that to the slowest single
+    # call (~2-2.7s).
+    #
+    # Trade-off: is_negotiation_request() can no longer be skipped based on
+    # the offer-inquiry precheck's result (that isn't known until both calls
+    # finish together) — it's still skipped when _bypass_negotiation is
+    # already True from routing (known ahead of time, no LLM call needed).
+    # On messages where the precheck later confirms an offer inquiry, this
+    # means one extra LLM call whose result gets discarded below, traded for
+    # not waiting on it sequentially.
     _t_parse_early = time.monotonic()
-    quick_parsed = await _parse_followup_message(incoming, selection, session_history)
-    print(f"[TIMING] early _parse_followup_message: {time.monotonic() - _t_parse_early:.2f}s")
+
+    async def _offer_inquiry_precheck() -> bool:
+        try:
+            _oiq = await asyncio.get_event_loop().run_in_executor(
+                None,
+                lambda: _client.chat.completions.create(
+                    model=AZURE_OPENAI_DEPLOYMENT, max_tokens=5, temperature=0,
+                    messages=[
+                        {"role": "system", "content": get_prompt(incoming, "pf_offer_inquiry_check_prompt")},
+                        {"role": "user", "content": incoming.text},
+                    ],
+                )
+            )
+            _content = _oiq.choices[0].message.content
+            if _content and "YES" in _content.strip().upper():
+                print(f"[OFFER INQUIRY] Pre-check YES: '{incoming.text}'")
+                return True
+        except Exception as _oiqe:
+            print(f"[OFFER INQUIRY] Pre-check failed: {_oiqe}")
+        return False
+
+    async def _neg_request_check() -> bool:
+        if _bypass_negotiation:
+            return False
+        return await is_negotiation_request(incoming.text, incoming, session_history)
+
+    _is_offer_inq, quick_parsed, _is_neg_req = await asyncio.gather(
+        _offer_inquiry_precheck(),
+        _parse_followup_message(incoming, selection, session_history),
+        _neg_request_check(),
+    )
+    print(f"[TIMING] early classifiers (parallel — offer/parse/neg-check): {time.monotonic() - _t_parse_early:.2f}s")
 
     # Merge pre-check with parser
     _is_offer_inq = _is_offer_inq or quick_parsed.get("is_offer_inquiry", False)
+    # Precheck/parser confirming an offer-inquiry after the fact overrides
+    # whatever the concurrently-run negotiation check returned.
+    if _is_offer_inq:
+        _is_neg_req = False
 
     # is_comparison/recommendation/offer_inquiry = never a price negotiation.
     if (quick_parsed.get("is_comparison", False)
@@ -443,9 +413,8 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     await clear_negotiation_state(incoming.tenant_id, incoming.session_id)
                     neg_state = None
 
-    _t_neg_check_start = time.monotonic()
-    _is_neg_req = False if (_is_offer_inq or _bypass_negotiation) else await is_negotiation_request(incoming.text, incoming, session_history)
-    print(f"[TIMING] is_negotiation_request: {time.monotonic() - _t_neg_check_start:.2f}s")
+    # _is_neg_req was already computed concurrently above (in the
+    # asyncio.gather with the offer-inquiry precheck and the parser).
     if neg_state or _is_neg_req:
         # Resolve which product is being negotiated — priority order:
         # 1. Active negotiation state (already has product_name)
@@ -1017,29 +986,43 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         compared = []
         text_lower = incoming.text.lower()
 
-        # Sort selection by name length (longest first) so we match more
-        # specific names before any shorter substring could collide
-        # (e.g. "Olly 5W Outdoor LED Wall Light" before a hypothetical "Olly").
-        _sorted_selection = sorted(
-            selection,
-            key=lambda p: len((p.get("product_name") or p.get("name") or "")),
-            reverse=True,
-        )
-        for p in _sorted_selection:
-            pname = (p.get("product_name") or p.get("name") or "").lower().strip()
-            if pname and pname in text_lower:
-                already_added = any(
-                    (c.get("product_name") or c.get("name") or "").lower() == pname
-                    for c in compared
-                )
-                if not already_added:
-                    compared.append(p)
+        # 1. Resolve compared products from the LLM parsed output (if populated)
+        parsed_compared = parsed.get("compared_product_names")
+        if isinstance(parsed_compared, list) and parsed_compared:
+            for name in parsed_compared:
+                name_lower = name.lower().strip()
+                for p in selection:
+                    pname = (p.get("product_name") or p.get("name") or "").lower().strip()
+                    if name_lower == pname or name_lower in pname or pname in name_lower:
+                        if p not in compared:
+                            compared.append(p)
+                            break
 
-        # Preserve the order products appear in the text (e.g. "X and Y" → [X, Y])
-        if len(compared) >= 2:
-            compared.sort(key=lambda p: text_lower.find(
-                (p.get("product_name") or p.get("name") or "").lower()
-            ))
+        # 2. Fallback: Scan text directly for exact product names
+        if not compared:
+            # Sort selection by name length (longest first) so we match more
+            # specific names before any shorter substring could collide
+            # (e.g. "Olly 5W Outdoor LED Wall Light" before a hypothetical "Olly").
+            _sorted_selection = sorted(
+                selection,
+                key=lambda p: len((p.get("product_name") or p.get("name") or "")),
+                reverse=True,
+            )
+            for p in _sorted_selection:
+                pname = (p.get("product_name") or p.get("name") or "").lower().strip()
+                if pname and pname in text_lower:
+                    already_added = any(
+                        (c.get("product_name") or c.get("name") or "").lower() == pname
+                        for c in compared
+                    )
+                    if not already_added:
+                        compared.append(p)
+
+            # Preserve the order products appear in the text (e.g. "X and Y" → [X, Y])
+            if len(compared) >= 2:
+                compared.sort(key=lambda p: text_lower.find(
+                    (p.get("product_name") or p.get("name") or "").lower()
+                ))
 
         # ── Fallback: single-name match from LLM parser (old behavior) ─────
         # Only used if direct text scan above found nothing — covers cases
@@ -1212,11 +1195,15 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         msg_lower = incoming.text.lower().strip()
         msg_words = set(re.findall(r'\b[a-z]+\b', msg_lower))
         best_score = 0
+        
+        # Skip common stopwords/prepositions/conjunctions to avoid matching on words like "with"
+        _stopwords = {"with", "this", "that", "want", "order", "have", "your", "from", "here", "about", "need", "like"}
+        
         for p in selection:
             pname  = (p.get("product_name") or p.get("name") or "").lower()
             pwords = set(re.findall(r'\b[a-z]+\b', pname))
-            # Only count words >3 chars — skip "led", "12w", "the", "and"
-            score = sum(1 for w in pwords if len(w) > 3 and w in msg_words)
+            # Only count words >3 chars — skip stopwords, "led", "12w", "the", "and"
+            score = sum(1 for w in pwords if len(w) > 3 and w in msg_words and w not in _stopwords)
             if score > best_score:
                 best_score      = score
                 matched_product = p
@@ -1365,6 +1352,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     product_name = matched_product.get("product_name") or matched_product.get("name")
     if not product_name:
         return None
+
+    # Dynamically append selected options (wattages, size, color) to product name
+    selected_options = parsed.get("selected_options")
+    if selected_options:
+        if "(" not in product_name:
+            product_name = f"{product_name} ({selected_options})"
     
     # Save as the last discussed product in the database so context is retained
     try:
@@ -1540,9 +1533,12 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     region        = incoming.region,
                 )
 
-    product_context = {
+    # Start with a copy of all cached product fields so no custom fields (e.g. wattages) are lost
+    product_context = cached_product.copy()
+
+    # Overlay only the formatted, casted, or external helper fields that the LLM/negotiator expect
+    product_context.update({
         "name":                       cached_product.get("product_name"),
-        "sku":                        cached_product.get("sku"),
         "price":                      f"Rs.{float(cached_product.get('list_price') or 0):,.0f}",
         "list_price":                 float(cached_product.get("list_price") or 0),
         "discount_pct":               cached_product.get("discount_pct", 0),
@@ -1551,25 +1547,14 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         "discount":                   f"{cached_product.get('discount_pct', 0)}% off",
         "gst_rate":                   getattr(incoming, "gst_rate", 0.18),
         "gst_rate_pct":               int(getattr(incoming, "gst_rate", 0.18) * 100),
-        "rating":                     cached_product.get("rating", 0),
-        "review_count":               cached_product.get("review_count", 0),
-        "features":                   cached_product.get("features", []),
-        "feature_descriptions":       cached_product.get("feature_descriptions", ""),
-        "specs":                      cached_product.get("specs", []),
-        "warranties":                 cached_product.get("warranties", []),
-        "warranty":                   cached_product.get("warranty", ""),
-        "replacement_exchange_policy": cached_product.get("replacement_exchange_policy", ""),
-        "installation_url":           cached_product.get("installation_url", ""),
-        "global_offers":              cached_product.get("global_offers", ""),
         "delivery_policy":            [
             pol.get("content", "") for pol in cached_product.get("policies", [])
-        ],
+        ] if "policies" in cached_product else [],
         "faqs": [
             {"q": f.get("question"), "a": f.get("answer")}
             for f in cached_product.get("faqs", [])
-        ],
-        "product_url": cached_product.get("product_url"),
-    }
+        ] if "faqs" in cached_product else [],
+    })
 
     # Inject parsed quantity if present
     number_was_list_position = parsed.get("_number_was_list_position", False)
