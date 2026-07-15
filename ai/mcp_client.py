@@ -14,6 +14,35 @@ logger = logging.getLogger(__name__)
 
 from ai.timing import log_timing
 
+_mcp_clients: Dict[str, Client] = {}
+_mcp_locks: Dict[str, asyncio.Lock] = {}
+
+async def _get_mcp_client(url: str) -> Client:
+    if url not in _mcp_locks:
+        _mcp_locks[url] = asyncio.Lock()
+    async with _mcp_locks[url]:
+        client = _mcp_clients.get(url)
+        if client is None:
+            client = Client(url)
+            await client.__aenter__()
+            _mcp_clients[url] = client
+        return client
+
+async def _call_mcp_tool(url: str, tool_name: str, tool_args: dict) -> Any:
+    try:
+        client = await _get_mcp_client(url)
+        return await client.call_tool(tool_name, tool_args)
+    except Exception as e:
+        print(f"[MCP-CLIENT] Connection error on {url} during '{tool_name}' ({e}), reconnecting...")
+        if url in _mcp_clients:
+            try:
+                await _mcp_clients[url].__aexit__(None, None, None)
+            except Exception:
+                pass
+            _mcp_clients.pop(url, None)
+        client = await _get_mcp_client(url)
+        return await client.call_tool(tool_name, tool_args)
+
 @log_timing("MCPClient.query_mcp_catalog")
 async def query_mcp_catalog(
     query: str,
@@ -25,7 +54,7 @@ async def query_mcp_catalog(
     state: Optional[Dict[str, Any]] = None
 ) -> Optional[Dict[str, Any]]:
     """
-    Calls the `search_catalog` tool on the FastMCP server.
+    Calls the `search_catalog` tool on the FastMCP server using persistent connection.
     
     Returns a dictionary containing:
         - status: str ("success" or error)
@@ -34,41 +63,40 @@ async def query_mcp_catalog(
         - product_links: list of product links
         - response: str (natural language synthesis or advice)
     
-    Returns None if connection or tool call fails, allowing seamless fallback to REST API.
+    Returns None if connection or tool call fails, allowing seamless fallback.
     """
     url = server_url or MCP_SERVER_URL
-    print(f"[MCP-CLIENT] Connecting to MCP server at {url} for query: '{query[:50]}' (tenant_id: {tenant_id})")
+    print(f"[MCP-CLIENT] Calling MCP server at {url} for query: '{query[:50]}' (tenant_id: {tenant_id})")
     try:
-        async with Client(url) as client:
-            tool_args = {
-                "query": query,
-                "limit": limit,
-                "session_id": session_id
-            }
-            if tenant_id:
-                tool_args["tenant_id"] = tenant_id
-            if intent_data:
-                tool_args["intent_data"] = intent_data
-            if state:
-                tool_args["dialogue_state"] = state
-            res = await client.call_tool("search_catalog", tool_args)
-            # res.data contains the tool return value (dict) when calling via FastMCP
-            data = getattr(res, "data", None)
-            if data is not None and isinstance(data, dict):
-                print(f"[MCP-CLIENT] Tool 'search_catalog' succeeded — returned {len(data.get('products', []))} products (intent: {data.get('intent')})")
-                return data
-            
-            content = getattr(res, "content", None)
-            if isinstance(content, list) and len(content) > 0:
-                for item in content:
-                    if hasattr(item, "text") and item.text:
-                        try:
-                            return json.loads(item.text)
-                        except Exception:
-                            return {"status": "success", "response": item.text, "products": []}
-            if isinstance(data, dict):
-                return data
-            return {"status": "success", "products": [], "response": str(data or content)}
+        tool_args = {
+            "query": query,
+            "limit": limit,
+            "session_id": session_id
+        }
+        if tenant_id:
+            tool_args["tenant_id"] = tenant_id
+        if intent_data:
+            tool_args["intent_data"] = intent_data
+        if state:
+            tool_args["dialogue_state"] = state
+        res = await _call_mcp_tool(url, "search_catalog", tool_args)
+        # res.data contains the tool return value (dict) when calling via FastMCP
+        data = getattr(res, "data", None)
+        if data is not None and isinstance(data, dict):
+            print(f"[MCP-CLIENT] Tool 'search_catalog' succeeded — returned {len(data.get('products', []))} products (intent: {data.get('intent')})")
+            return data
+        
+        content = getattr(res, "content", None)
+        if isinstance(content, list) and len(content) > 0:
+            for item in content:
+                if hasattr(item, "text") and item.text:
+                    try:
+                        return json.loads(item.text)
+                    except Exception:
+                        return {"status": "success", "response": item.text, "products": []}
+        if isinstance(data, dict):
+            return data
+        return {"status": "success", "products": [], "response": str(data or content)}
     except Exception as e:
         print(f"[MCP-CLIENT] Failed to call 'search_catalog' on {url}: {e}")
         logger.warning(f"[MCP-CLIENT] Error calling MCP tool search_catalog: {e}")
@@ -88,23 +116,22 @@ async def get_product_details_mcp(
     url = server_url or MCP_SERVER_URL
     print(f"[MCP-CLIENT] Requesting product details for SKU '{sku}' via MCP ({url}) (tenant_id: {tenant_id})")
     try:
-        async with Client(url) as client:
-            tool_args = {"sku": sku}
-            if tenant_id:
-                tool_args["tenant_id"] = tenant_id
-            res = await client.call_tool("get_product_details", tool_args)
-            data = getattr(res, "data", None)
-            if data is not None and isinstance(data, dict):
-                return data
-            content = getattr(res, "content", None)
-            if isinstance(content, list) and len(content) > 0:
-                for item in content:
-                    if hasattr(item, "text") and item.text:
-                        try:
-                            return json.loads(item.text)
-                        except Exception:
-                            pass
-            return None
+        tool_args = {"sku": sku}
+        if tenant_id:
+            tool_args["tenant_id"] = tenant_id
+        res = await _call_mcp_tool(url, "get_product_details", tool_args)
+        data = getattr(res, "data", None)
+        if data is not None and isinstance(data, dict):
+            return data
+        content = getattr(res, "content", None)
+        if isinstance(content, list) and len(content) > 0:
+            for item in content:
+                if hasattr(item, "text") and item.text:
+                    try:
+                        return json.loads(item.text)
+                    except Exception:
+                        pass
+        return None
     except Exception as e:
         print(f"[MCP-CLIENT] Failed to call 'get_product_details' for SKU '{sku}': {e}")
         return None
@@ -120,27 +147,27 @@ async def get_taxonomy_context_mcp(
     """
     url = server_url or MCP_SERVER_URL
     try:
-        async with Client(url) as client:
-            res = await client.call_tool("get_taxonomy_context", {"query": query, "threshold": threshold})
-            data = getattr(res, "data", None)
-            if data is not None and isinstance(data, dict):
-                hints = data.get("taxonomy", data.get("hints", {}))
-                print(f"[MCP-CLIENT] Ingested Taxonomy Hints: {json.dumps(hints)}")
-                return hints
-            content = getattr(res, "content", None)
-            if isinstance(content, list) and len(content) > 0:
-                for item in content:
-                    if hasattr(item, "text") and item.text:
-                        try:
-                            parsed = json.loads(item.text)
-                            hints = parsed.get("taxonomy", parsed.get("hints", {}))
-                            print(f"[MCP-CLIENT] Ingested Taxonomy Hints: {json.dumps(hints)}")
-                            return hints
-                        except Exception:
-                            pass
-            return {}
+        res = await _call_mcp_tool(url, "get_taxonomy_context", {"query": query, "threshold": threshold})
+        data = getattr(res, "data", None)
+        if data is not None and isinstance(data, dict):
+            hints = data.get("taxonomy", data.get("hints", {}))
+            print(f"[MCP-CLIENT] Ingested Taxonomy Hints: {json.dumps(hints)}")
+            return hints
+        content = getattr(res, "content", None)
+        if isinstance(content, list) and len(content) > 0:
+            for item in content:
+                if hasattr(item, "text") and item.text:
+                    try:
+                        parsed = json.loads(item.text)
+                        hints = parsed.get("taxonomy", parsed.get("hints", {}))
+                        print(f"[MCP-CLIENT] Ingested Taxonomy Hints: {json.dumps(hints)}")
+                        return hints
+                    except Exception:
+                        pass
+        return {}
     except Exception as e:
         print(f"[MCP-CLIENT] Failed to call 'get_taxonomy_context': {e}")
         return {}
 
 get_taxonomy_hints_mcp = get_taxonomy_context_mcp
+

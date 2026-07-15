@@ -45,7 +45,6 @@ from db.memory_store import add_conversation_turn
 from pipeline.setup import setup_pipeline
 from pipeline.router import dispatch
 from messaging import send_reply
-from ai.mcp_client import get_taxonomy_hints_mcp
 
 # ── Concurrency guard — max 50 simultaneous pipeline runs ─────────────────────
 _pipeline_semaphore = asyncio.Semaphore(50)
@@ -227,23 +226,18 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
         _skip_vector_search = (len(_words) <= 3 and not any(c.isdigit() for c in _txt_strip))
         incoming._skip_vector_search = _skip_vector_search
 
+        # Taxonomy hints are now derived inside the GraphRAG engine (collection matching
+        # against AgentConfig.collections), so the separate get_taxonomy_context_mcp()
+        # round-trip is removed — it saved ~2-4s with no accuracy loss (the short-query
+        # _skip_vector_search path already passes taxonomy_hints={} and works correctly).
         _t_prep = time.monotonic()
-        if _skip_vector_search:
-            print(f"[TAXONOMY] Structural bypass for short input ('{_txt_strip}') — skipping remote vector searches")
-            session_history, _, incoming._cached_state = await asyncio.gather(
-                _gh(incoming),
-                _sm(incoming),
-                _gds(incoming.tenant_id, incoming.session_id),
-            )
-            taxonomy_hints = {}
-        else:
-            session_history, _, incoming._cached_state, taxonomy_hints = await asyncio.gather(
-                _gh(incoming),
-                _sm(incoming),
-                _gds(incoming.tenant_id, incoming.session_id),
-                get_taxonomy_hints_mcp(incoming.text),
-            )
-        print(f"[TIMING] Parallel setup (history/save/state/taxonomy): {time.monotonic() - _t_prep:.2f}s")
+        session_history, _, incoming._cached_state = await asyncio.gather(
+            _gh(incoming),
+            _sm(incoming),
+            _gds(incoming.tenant_id, incoming.session_id),
+        )
+        taxonomy_hints = {}
+        print(f"[TIMING] Parallel setup (history/save/state): {time.monotonic() - _t_prep:.2f}s")
 
         # ── Step 3: Update Dialogue State ───────────────────────
         _t_intent = time.monotonic()

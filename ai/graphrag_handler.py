@@ -469,8 +469,9 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, st
         effective_graphrag_url = graphrag_url or GRAPHRAG_API_URL
 
         data = None
-        if USE_MCP_SERVER or (effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url)):
-            mcp_url = effective_graphrag_url if effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url) else MCP_SERVER_URL
+        is_mcp = USE_MCP_SERVER or (effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url))
+        mcp_url = effective_graphrag_url if effective_graphrag_url and ("/mcp" in effective_graphrag_url or "/sse" in effective_graphrag_url) else MCP_SERVER_URL
+        if is_mcp:
             print(f"[GRAPHRAG-MCP] Routing via MCP Server at {mcp_url}")
             from ai.mcp_client import query_mcp_catalog, get_taxonomy_context_mcp
             
@@ -514,10 +515,17 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, st
                 else:
                     data = {"response_text": []}
             else:
-                print(f"[GRAPHRAG-MCP] MCP query did not return success, falling back to REST: {effective_graphrag_url}")
+                print(f"[GRAPHRAG-MCP] MCP query did not return success. mcp_res={mcp_res}")
+                if mcp_res and mcp_res.get("response"):
+                    data = {"response_text": mcp_res.get("response"), "intent": mcp_res.get("intent")}
+                elif mcp_res and mcp_res.get("error"):
+                    data = {"response_text": f"Sorry, I couldn't search the catalog right now: {mcp_res.get('error')}"}
+                else:
+                    data = {"response_text": []}
 
-        if data is None:
+        if data is None and not is_mcp:
             if not effective_graphrag_url:
+
                 print(f"[GRAPHRAG] No GraphRAG URL configured for tenant {incoming.tenant_id}")
                 support = getattr(incoming, 'support_email', None) or incoming.biz_name
                 return (
@@ -595,10 +603,10 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, st
                 lines.append("")
                 lines.append("Just reply with the collection name and I'll show you the options! 💡")
                 try:
-                    await save_category_selection(incoming.tenant_id, incoming.session_id, collections)
-                    print(f"[CATEGORY] Saved {len(collections)} category options for follow-up")
+                    asyncio.create_task(save_category_selection(incoming.tenant_id, incoming.session_id, collections))
+                    print(f"[CATEGORY] Dispatched save_category_selection task ({len(collections)} options)")
                 except Exception as _ce:
-                    print(f"[CATEGORY] save_category_selection failed (non-critical): {_ce}")
+                    print(f"[CATEGORY] save_category_selection dispatch failed: {_ce}")
 
             return "\n".join(lines)
 
@@ -628,10 +636,10 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, st
         _plaintext_cats = _parse_plaintext_categories(reply_str)
         if _plaintext_cats:
             try:
-                await save_category_selection(incoming.tenant_id, incoming.session_id, _plaintext_cats)
-                print(f"[CATEGORY] Parsed {len(_plaintext_cats)} categories from plain-text response — saved")
+                asyncio.create_task(save_category_selection(incoming.tenant_id, incoming.session_id, _plaintext_cats))
+                print(f"[CATEGORY] Dispatched save_category_selection task ({len(_plaintext_cats)} options)")
             except Exception as _pce:
-                print(f"[CATEGORY] Plain-text category save failed (non-critical): {_pce}")
+                print(f"[CATEGORY] Plain-text category save task dispatch failed: {_pce}")
 
         # If GraphRAG returned a short error message (≤100 chars), retry once
         # with an even simpler query — just the last 1-2 words as keywords
@@ -641,44 +649,56 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, st
             simple_query = " ".join(words[-2:]) if words else graphrag_text
             if simple_query and simple_query != graphrag_text:
                 print(f"[GRAPHRAG] Retry query: '{simple_query}'")
-                payload["text"] = simple_query
                 try:
-                    async with httpx.AsyncClient(timeout=graphrag_timeout) as retry_client:
-                        retry_resp = await retry_client.post(
-                            GRAPHRAG_API_URL,
-                            json    = payload,
-                            headers = {"Content-Type": "application/json"},
+                    if is_mcp:
+                        retry_res = await query_mcp_catalog(
+                            query=simple_query,
+                            session_id=incoming.session_id,
+                            tenant_id=incoming.tenant_id,
+                            server_url=mcp_url,
+                            intent_data=_client_intent_data,
+                            state=state.__dict__ if state and hasattr(state, "__dict__") else (state if isinstance(state, dict) else None)
                         )
-                    if retry_resp.status_code == 200:
-                        retry_data = retry_resp.json()
-                        retry_text = retry_data.get("response_text", [])
-                        retry_text = _coerce_pythonic_dict(retry_text)
-                        if isinstance(retry_text, list) and retry_text and isinstance(retry_text[0], dict):
-                            print(f"[GRAPHRAG] Retry succeeded — {len(retry_text)} products")
-                            # BUG FIX: previously this only set response_text with a comment
-                            # "fall through to handling below" — but no such handling existed
-                            # after this point, so the retry's real products were silently
-                            # discarded and the ORIGINAL error text was returned instead.
-                            return await _send_structured_product_list(incoming, retry_text)
-                        elif isinstance(retry_text, dict) and retry_text.get("status") == "needs_clarification":
-                            collections = retry_text.get("available_collections", [])
-                            clarify_msg = retry_text.get(
-                                "message",
-                                "Could you let me know which category you're interested in?"
+                        if retry_res and retry_res.get("status") == "success":
+                            retry_products = retry_res.get("products", [])
+                            if retry_products and isinstance(retry_products, list) and isinstance(retry_products[0], dict):
+                                print(f"[GRAPHRAG-MCP] Retry succeeded — {len(retry_products)} products")
+                                return await _send_structured_product_list(incoming, retry_products)
+                    else:
+                        payload["text"] = simple_query
+                        async with httpx.AsyncClient(timeout=graphrag_timeout) as retry_client:
+                            retry_resp = await retry_client.post(
+                                GRAPHRAG_API_URL,
+                                json    = payload,
+                                headers = {"Content-Type": "application/json"},
                             )
-                            lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
-                            if collections:
-                                lines.append("")
-                                for i, c in enumerate(collections, 1):
-                                    lines.append(f"*{i}.* {c}")
-                                lines.append("")
-                                lines.append("Just reply with the collection name and I'll show you the options! 💡")
-                                try:
-                                    await save_category_selection(incoming.tenant_id, incoming.session_id, collections)
-                                    print(f"[CATEGORY] Saved {len(collections)} category options (retry path)")
-                                except Exception as _ce:
-                                    print(f"[CATEGORY] save_category_selection failed (non-critical): {_ce}")
-                            return "\n".join(lines)
+                        if retry_resp.status_code == 200:
+                            retry_data = retry_resp.json()
+                            retry_text = retry_data.get("response_text", [])
+                            retry_text = _coerce_pythonic_dict(retry_text)
+                            if isinstance(retry_text, list) and retry_text and isinstance(retry_text[0], dict):
+                                print(f"[GRAPHRAG] Retry succeeded — {len(retry_text)} products")
+                                return await _send_structured_product_list(incoming, retry_text)
+                            elif isinstance(retry_text, dict) and retry_text.get("status") == "needs_clarification":
+                                collections = retry_text.get("available_collections", [])
+                                clarify_msg = retry_text.get(
+                                    "message",
+                                    "Could you let me know which category you're interested in?"
+                                )
+                                lines = [f"Hi {incoming.sender_name}! {clarify_msg}"]
+                                if collections:
+                                    lines.append("")
+                                    for i, c in enumerate(collections, 1):
+                                        lines.append(f"*{i}.* {c}")
+                                    lines.append("")
+                                    lines.append("Just reply with the collection name and I'll show you the options! 💡")
+                                    try:
+                                        asyncio.create_task(save_category_selection(incoming.tenant_id, incoming.session_id, collections))
+                                        print(f"[CATEGORY] Dispatched save_category_selection task ({len(collections)} options)")
+                                    except Exception as _ce:
+                                        print(f"[CATEGORY] save_category_selection dispatch failed: {_ce}")
+                                return "\n".join(lines)
+
                         elif isinstance(retry_text, str) and len(retry_text) > 100:
                             reply_str = retry_text
                 except Exception as retry_err:

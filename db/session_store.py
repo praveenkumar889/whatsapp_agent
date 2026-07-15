@@ -1,6 +1,7 @@
 # db/session_store.py — Supabase PostgreSQL Message Store
 
 import json
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, cast
 from supabase import create_client, Client  # type: ignore[import]
@@ -24,6 +25,15 @@ def _get_tenant_client() -> Client:
     if _tenant_supabase is None:
         _tenant_supabase = create_client(TENANT_SUPABASE_URL, TENANT_SUPABASE_SECRET_KEY)
     return _tenant_supabase
+
+
+# ── Tenant resolution cache (TTL 5 min) ────────────────────────────────────────
+# resolve_tenant_id runs a select("*") on the tenants table on EVERY request and
+# was measured at ~1-2s of the request budget. Tenant rows (including the dynamic
+# prompt columns) change rarely, so a short-TTL in-memory cache eliminates that
+# cost with negligible staleness risk.
+_TENANT_CACHE: dict = {}
+_TENANT_CACHE_TTL = 300  # seconds
 
 
 async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
@@ -52,6 +62,9 @@ async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
         dict → full tenant profile if found
         None → phone_number_id not registered, reject message
     """
+    cached = _TENANT_CACHE.get(phone_number_id)
+    if cached and cached[1] > time.monotonic():
+        return cached[0]
     try:
         result = _get_tenant_client().table("tenants") \
             .select("*") \
@@ -59,9 +72,9 @@ async def resolve_tenant_id(phone_number_id: str) -> Optional[dict]:
             .limit(1) \
             .execute()
 
-
         if result.data:
             row = cast(dict, result.data[0])
+            _TENANT_CACHE[phone_number_id] = (row, time.monotonic() + _TENANT_CACHE_TTL)
             print(f"[DB] Tenant resolved: {row['tenant_id']} ({row.get('biz_name', 'N/A')}) "
                   f"for phone_number_id={phone_number_id}")
             return row

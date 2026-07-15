@@ -3,6 +3,8 @@
 # Loads ALL prompt columns from tenants table into incoming object.
 # No defaults, no fallbacks — every prompt must be set in DB.
 
+import asyncio
+
 from models.schemas import IncomingMessage
 from db.session_store import (
     resolve_tenant_id, is_duplicate, get_session_history, save_message,
@@ -75,11 +77,17 @@ async def setup_pipeline(incoming: IncomingMessage) -> tuple:
 
     await _resolve_quoted_caption(incoming)
 
-    if await is_duplicate(incoming.message_id, incoming.tenant_id):
+    # is_duplicate and acquire_lock are independent — run them concurrently.
+    dup, locked = await asyncio.gather(
+        is_duplicate(incoming.message_id, incoming.tenant_id),
+        acquire_lock(incoming.session_id, incoming.tenant_id),
+    )
+
+    if dup:
         print(f"[PIPELINE] Duplicate — skipping {incoming.message_id}")
         return False, None
 
-    if not await acquire_lock(incoming.session_id, incoming.tenant_id):
+    if not locked:
         print(f"[PIPELINE] Already processing {incoming.session_id} — skipping")
         return False, None
 
@@ -148,16 +156,17 @@ async def _resolve_quoted_caption(incoming: IncomingMessage) -> None:
 
 
 async def _get_history(incoming: IncomingMessage) -> list:
-    if getattr(incoming, '_skip_vector_search', False):
-        pg = await get_session_history(incoming.tenant_id, incoming.session_id, limit=10)
-        print(f"[DB] History from Postgres (fast-path) — {len(pg)} turns")
+    # Postgres history (last N turns, in order) is the fast, complete source of truth
+    # for conversation context. Mem0 semantic search is slower (~1-2s) and returns
+    # out-of-order recall that hurts dialogue coherence — it's only used as a fallback
+    # when Postgres has no history. Product follow-up resolution does its own Mem0
+    # lookup separately, so this change does not affect follow-up accuracy.
+    pg = await get_session_history(incoming.tenant_id, incoming.session_id, limit=10)
+    if pg:
+        print(f"[DB] History from Postgres — {len(pg)} turns")
         return pg
     mem0 = await get_relevant_context(
         incoming.tenant_id, incoming.session_id, incoming.text, limit=6,
     )
-    if mem0:
-        print(f"[DB] Context from Mem0 — {len(mem0)} memories")
-        return mem0
-    pg = await get_session_history(incoming.tenant_id, incoming.session_id, limit=10)
-    print(f"[DB] History from Postgres — {len(pg)} turns")
-    return pg
+    print(f"[DB] Context from Mem0 (Postgres empty) — {len(mem0 or [])} memories")
+    return mem0 or []

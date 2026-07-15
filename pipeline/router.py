@@ -34,6 +34,16 @@ async def dispatch(incoming, state, session_history: list) -> str:
         from ai.handlers import handle_escalation
         return await handle_escalation(incoming)
 
+    # Product / catalog intents never need the negotiation or invoice guards.
+    # Those guards only matter for WORKFLOW_ACTION / an active negotiation, and
+    # _invoice_guard otherwise burns a SECOND LLM call (_is_invoice_inquiry) on
+    # every product query for no benefit — it always returns False when there is
+    # no active negotiation. Skip straight to GraphRAG for these intents.
+    product_intents = {"BROWSE_CATEGORY", "FIND_PRODUCT", "GET_PRODUCT_INFO", "CHECK_POLICY"}
+    if intent in product_intents:
+        from ai.graphrag_handler import call_graphrag_api
+        return await call_graphrag_api(incoming, session_history, state)
+
     # Performance: load negotiation state ONCE and cache on incoming object.
     # Previously loaded 3-4× per request across _neg_guard, _invoice_guard,
     # _resume_negotiation, and _try_resolve_product_followup.
