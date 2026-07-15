@@ -206,6 +206,20 @@ class _PromptRenderer:
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
+def get_raw_prompt(incoming: Any, key: str) -> Optional[str]:
+    """
+    Load a prompt template text WITHOUT rendering any variables.
+    Used for JSON config payloads (e.g. product_field_aliases) where the text
+    IS the data and must not be passed through the renderer.
+    Returns None if not found; does NOT raise.
+    Does not require the key to be in PROMPT_KEYS.
+    """
+    tenant_id = getattr(incoming, "tenant_id", "")
+    language  = getattr(incoming, "language",  "en") or "en"
+    pt = _PromptLoader.load(tenant_id, key, language, incoming)
+    return pt.template if pt else None
+
+
 def get_prompt(incoming: Any, key: str, **template_vars: Any) -> str:
     """
     Load prompt + render variables. Primary public API.
@@ -472,4 +486,9 @@ PROMPT_KEYS: dict = {
     "memory_offers_formatter_prompt":                   "memory_offers_formatter_prompt",
     "neg_payment_and_address_request_prompt":           "neg_payment_and_address_request_prompt",
     "validate_shipping_address_prompt":                 "validate_shipping_address_prompt",
+
+    # Migration 030 — dynamic product cache field alias map (JSON config)
+    # Maps intent-classifier field names to actual product_cache column names.
+    # Stored as JSON in prompt_templates; loaded by router.py at runtime.
+    "product_field_aliases":                            "product_field_aliases",
 }

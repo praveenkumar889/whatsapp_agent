@@ -114,14 +114,38 @@ async def dispatch(incoming, result, session_history: list) -> str:
             if cached_product:
                 matched_product = cached_product
 
+        # Load per-tenant field alias config from DB (prompt_templates).
+        # Maps logical intent field names (e.g. "specifications") to the actual
+        # product cache keys (e.g. ["feature_descriptions", "specifications"]).
+        # Loaded once per request; fully dynamic — no hardcoding.
+        _field_aliases: dict = {}
+        try:
+            from db.prompt_store import get_raw_prompt
+            _alias_json = get_raw_prompt(incoming, "product_field_aliases")
+            if _alias_json:
+                _field_aliases = json.loads(_alias_json)
+        except Exception as _ae:
+            print(f"[ROUTER] Could not load product_field_aliases: {_ae}")
+
         val = None
         if matched_product:
-            if requested_field.lower() == "installation":
-                val = matched_product.get("installation_url") or matched_product.get("installation") or matched_product.get("pdf_url")
-                if isinstance(val, dict):
-                    val = val.get("pdf_url") or val.get("manual_url") or val.get("video_url")
+            # Resolve actual cache keys: try alias list first, then direct key, then key_url
+            _lookup_keys = _field_aliases.get(requested_field.lower(), [])
+            if not _lookup_keys:
+                _lookup_keys = [requested_field, f"{requested_field}_url"]
+            else:
+                _lookup_keys = list(_lookup_keys) + [requested_field, f"{requested_field}_url"]
+
+            for _key in _lookup_keys:
+                _candidate = matched_product.get(_key)
+                if _candidate and _candidate != {} and _candidate != []:
+                    val = _candidate
+                    break
+
+            # Special handling: if val is a dict or list for installation, extract URL
+            if requested_field.lower() == "installation" and not val:
+                val = matched_product.get("installation_url") or matched_product.get("pdf_url")
                 if not val:
-                    # check nested installation column string in product_cache
                     installation = matched_product.get("installation")
                     if isinstance(installation, str):
                         try:
@@ -130,8 +154,8 @@ async def dispatch(incoming, result, session_history: list) -> str:
                             installation = None
                     if isinstance(installation, dict):
                         val = installation.get("pdf_url") or installation.get("manual_url") or installation.get("video_url")
-            else:
-                val = matched_product.get(requested_field) or matched_product.get(f"{requested_field}_url")
+            elif isinstance(val, dict):
+                val = val.get("url") or val.get("pdf_url") or val.get("value") or str(val)
 
         if val:
             from db.prompt_store import get_prompt
