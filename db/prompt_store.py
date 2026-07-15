@@ -474,6 +474,7 @@ PROMPT_KEYS: dict = {
     "pricing_order_summary_footer_prompt":              "pricing_order_summary_footer_prompt",
 
     # Custom Dynamic Pipeline Prompts
+    "knowledge_asset_answer_prompt":                    "knowledge_asset_answer_prompt",
     "followup_installation_footer_prompt":              "followup_installation_footer_prompt",
     "followup_installation_header_prompt":              "followup_installation_header_prompt",
     "followup_installation_pdf_prompt":                 "followup_installation_pdf_prompt",
