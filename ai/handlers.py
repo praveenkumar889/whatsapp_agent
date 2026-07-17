@@ -28,7 +28,10 @@ _client = AzureOpenAI(
 from ai.request_profiler import wrap_llm_client as _wrap_llm_client
 _wrap_llm_client(_client)
 
-DEFAULT_VALID_INTENTS = {"WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION", "GREETING", "UNKNOWN"}
+DEFAULT_VALID_INTENTS = {
+    "WORKFLOW_ACTION", "FAQ_KNOWLEDGE", "HUMAN_ESCALATION", "GREETING", "UNKNOWN",
+    "FIND_PRODUCT", "BROWSE_CATEGORY", "GET_PRODUCT_INFO", "GET_ADVICE", "CHECK_POLICY"
+}
 DEFAULT_INTENT_MIN_CONFIDENCE = 0.50  # default — see incoming.intent_min_confidence for tenant override
 
 
@@ -54,10 +57,21 @@ async def classify_intent(
             messages.extend(session_history)
         messages.append({"role": "user", "content": customer_message})
 
+        # Load max_tokens configuration dynamically from database
+        max_tokens = 400
+        if incoming and incoming.tenant_id:
+            try:
+                from db.session_store import get_tenant_config
+                cfg = await get_tenant_config(incoming.tenant_id, "intent_classifier_config")
+                if cfg and isinstance(cfg, dict):
+                    max_tokens = int(cfg.get("max_tokens", 400))
+            except Exception as e:
+                print(f"[INTENT ROUTER] Failed to read dynamic max_tokens: {e}")
+
         response = await asyncio.get_event_loop().run_in_executor(
             None,
             lambda: _client.chat.completions.create(
-                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=150, temperature=0,
+                model=AZURE_OPENAI_DEPLOYMENT, max_tokens=max_tokens, temperature=0,
                 messages=messages,
             )
         )

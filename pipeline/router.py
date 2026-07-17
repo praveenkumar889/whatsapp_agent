@@ -64,7 +64,12 @@ async def dispatch(incoming, result, session_history: list) -> str:
     _routing = getattr(incoming, "_routing", None)
     requested_field = _routing.requested_knowledge_field if _routing else None
     domain = (_routing.knowledge_domain or "product") if _routing else "product"
-    _wants_dynamic_knowledge = bool(requested_field and requested_field.upper() != "NONE")
+    # Gated on needs_product_context: only intercept when the customer is
+    # referencing an already-established active product context (e.g., "is it waterproof",
+    # "warranty of this"). If needs_product_context is False (e.g., comparing products,
+    # category browsing, picking a number from list), pass through to GraphRAG/Followup.
+    _needs_prod_ctx = _routing.needs_product_context if _routing else False
+    _wants_dynamic_knowledge = bool(_needs_prod_ctx and requested_field and requested_field.upper() != "NONE")
 
     # Centralized RequestContext ContextBuilder assembly.
     # Skipped for GREETING/HUMAN_ESCALATION — their handlers only take
@@ -76,7 +81,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
         from ai.context_builder import ContextBuilder
         arc.llm_context = await ContextBuilder(arc).build()
 
-    if arc and requested_field and requested_field.upper() != "NONE":
+    if arc and _wants_dynamic_knowledge:
         # Check messages table for the last graphrag_response in this session
         from db.session_store import get_latest_graphrag_response
         import json
@@ -130,10 +135,10 @@ async def dispatch(incoming, result, session_history: list) -> str:
         val = None
         if matched_product:
             # Resolve actual cache keys: try alias list first, then direct key, then key_url
-            _lookup_keys = _field_aliases.get(requested_field.lower(), [])
-            if not _lookup_keys:
+            _lookup_keys = _field_aliases.get(requested_field.lower(), []) if requested_field else []
+            if not _lookup_keys and requested_field:
                 _lookup_keys = [requested_field, f"{requested_field}_url"]
-            else:
+            elif _lookup_keys and requested_field:
                 _lookup_keys = list(_lookup_keys) + [requested_field, f"{requested_field}_url"]
 
             for _key in _lookup_keys:
@@ -143,7 +148,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
                     break
 
             # Special handling: if val is a dict or list for installation, extract URL
-            if requested_field.lower() == "installation" and not val:
+            if requested_field and requested_field.lower() == "installation" and not val:
                 val = matched_product.get("installation_url") or matched_product.get("pdf_url")
                 if not val:
                     installation = matched_product.get("installation")
@@ -159,7 +164,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
 
         if val:
             from db.prompt_store import get_prompt
-            if requested_field.lower() == "installation":
+            if requested_field and requested_field.lower() == "installation":
                 try:
                     header = get_prompt(incoming, "followup_installation_header_prompt", product_name=arc.resolved_product)
                     return f"{header}\n🔗 {val}"
@@ -170,7 +175,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
                 try:
                     return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=val)
                 except Exception:
-                    label = requested_field.capitalize().replace("_", " ")
+                    label = requested_field.capitalize().replace("_", " ") if requested_field else ""
                     return f"Here is the {label} for *{arc.resolved_product}*:\n\n🔗 {val}"
             else:
                 # If the value is a text block, run it through the LLM with knowledge_asset_answer_prompt
@@ -209,7 +214,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
                 try:
                     return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=str(val))
                 except Exception:
-                    label = requested_field.capitalize().replace("_", " ")
+                    label = requested_field.capitalize().replace("_", " ") if requested_field else ""
                     return f"Here is the {label} for *{arc.resolved_product}*:\n{val}"
 
         # Check cache/refresh state
@@ -241,7 +246,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
             
         # Access structured knowledge
         kstate = getattr(arc.llm_context, "knowledge_state", {})
-        if kstate.get("available"):
+        if kstate.get("available") and requested_field:
             from ai.knowledge_accessor import KnowledgeAccessor
             asset = await KnowledgeAccessor.get(incoming, arc.llm_context.knowledge_context, domain, requested_field)
             if asset:
@@ -277,13 +282,13 @@ async def dispatch(incoming, result, session_history: list) -> str:
                         try:
                             return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=doc_url)
                         except RuntimeError:
-                            if requested_field.lower() == "installation":
+                            if requested_field and requested_field.lower() == "installation":
                                 try:
                                     header = get_prompt(incoming, "followup_installation_header_prompt", product_name=arc.resolved_product)
                                     return f"{header}\n🔗 {doc_url}"
                                 except Exception:
                                     return f"Here is the installation guide for *{arc.resolved_product}*:\n\n🔗 {doc_url}"
-                            label = requested_field.capitalize().replace("_", " ")
+                            label = requested_field.capitalize().replace("_", " ") if requested_field else ""
                             return f"You can view the {label} for *{arc.resolved_product}* here:\n{doc_url}"
 
                 # Deliver typed assets: Text / Specifications / etc
@@ -292,7 +297,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
                 try:
                     return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=asset_val)
                 except RuntimeError:
-                    label = requested_field.capitalize().replace("_", " ")
+                    label = requested_field.capitalize().replace("_", " ") if requested_field else ""
                     return f"Here is the {label} for *{arc.resolved_product}*:\n{asset_val}"
             else:
                 # Deliver missing-asset fallback
@@ -301,7 +306,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
                 try:
                     return get_prompt(incoming, prompt_key, product_name=arc.resolved_product)
                 except RuntimeError:
-                    label = requested_field.capitalize().replace("_", " ")
+                    label = requested_field.capitalize().replace("_", " ") if requested_field else ""
                     return f"This product currently doesn't have {label} details available."
 
 
@@ -366,7 +371,12 @@ async def dispatch(incoming, result, session_history: list) -> str:
         except Exception as e:
             print(f"[ROUTER] customer_history_handler query failed: {e}")
 
-    if intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or confidence < _min_conf:
+    # GraphRAG / follow-up handler handles all product discovery, policy check, advice, and search intents
+    _graphrag_intents = {
+        "FAQ_KNOWLEDGE", "WORKFLOW_ACTION", "FIND_PRODUCT", "BROWSE_CATEGORY",
+        "GET_PRODUCT_INFO", "GET_ADVICE", "CHECK_POLICY"
+    }
+    if intent in _graphrag_intents or confidence < _min_conf:
         return await _call_graphrag_timed(incoming, session_history)
 
     from ai.handlers import handle_unknown

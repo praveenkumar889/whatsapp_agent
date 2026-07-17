@@ -258,7 +258,7 @@ class ContextBuilder:
         )
         from ai.product_context_resolver import ProductContextResolver
 
-        pname = await ProductContextResolver.resolve(self.tenant_id, self.session_id, self.arc.neg_state)
+        pname = await ProductContextResolver.resolve(self.tenant_id, self.session_id, self.arc.neg_state, self.arc.incoming, self.arc.session_history)
 
         active_product_session = False
         knowledge_state = {
