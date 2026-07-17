@@ -129,15 +129,50 @@ async def _is_invoice_confirmation_request(incoming, session_history: list) -> b
         return False
 
 
+async def _extract_invoice_limit(incoming) -> int:
+    """
+    Uses LLM (via DB-stored prompt) to extract how many invoices the user
+    is requesting. Returns 1 for "latest invoice", N for "last N invoices",
+    and a large cap (e.g. 20) for "all invoices". Zero hardcoding.
+    """
+    import json as _json
+    try:
+        system_prompt = _get_invoice_prompt("invoice_limit_extract_prompt", incoming)
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _client.chat.completions.create(
+                model       = AZURE_OPENAI_DEPLOYMENT,
+                max_tokens  = 20,
+                temperature = 0,
+                response_format = {"type": "json_object"},
+                messages    = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user",   "content": incoming.text},
+                ],
+            )
+        )
+        raw = response.choices[0].message.content
+        parsed = _json.loads(raw.strip()) if raw else {}
+        limit = int(parsed.get("limit", 1))
+        print(f"[INVOICE] Extracted invoice limit={limit} from message: '{incoming.text}'")
+        return max(1, limit)
+    except Exception as e:
+        print(f"[INVOICE] invoice_limit_extract_prompt failed ({e}), defaulting limit=1")
+        return 1
+
+
 async def handle_invoice_request(incoming, negotiated_order: Optional[Union[OrderResult, dict]] = None) -> str:
     """
     Generates invoice PDF. When negotiated_order is passed (from confirmed
     negotiation), uses it directly — avoids stale pending order overriding
     the correct negotiated quantity/price.
+    Supports multi-invoice requests (e.g. 'last 2 invoices') dynamically
+    via LLM-extracted limit — returns a formatted list for n>1, PDF for n=1.
     """
     print(f"[INVOICE] Handling invoice request for session {incoming.session_id}")
     from db.session_store import (
         get_last_order_from_orders,
+        get_last_n_orders_from_orders,
         update_order_invoice_url,
         get_pending_order,
         delete_pending_order,
@@ -196,6 +231,47 @@ async def handle_invoice_request(incoming, negotiated_order: Optional[Union[Orde
         except Exception as commit_err:
             print(f"[INVOICE] Error committing pending order: {commit_err}")
 
+        # ── Multi-invoice path: extract requested count dynamically ─────────
+        invoice_limit = await _extract_invoice_limit(incoming)
+        if invoice_limit > 1:
+            orders = await get_last_n_orders_from_orders(incoming.tenant_id, incoming.session_id, n=invoice_limit)
+            if not orders:
+                try:
+                    return _get_invoice_prompt("invoice_no_orders_found_prompt", incoming, sender_name=incoming.sender_name)
+                except RuntimeError:
+                    return (
+                        f"I couldn't find any recent orders for you, {incoming.sender_name}. 🤔\n\n"
+                        f"If you'd like to place a new order, just let me know what you need!"
+                    )
+            print(f"[INVOICE] Returning {len(orders)} invoices for multi-invoice request")
+            lines = []
+            for o in orders:
+                oid       = o.get("order_id") or "N/A"
+                prod      = o.get("product_name") or "Order"
+                qty       = o.get("quantity_value") or 1
+                total     = float(o.get("total_with_gst") or o.get("total_price") or 0)
+                inv_url   = o.get("invoice_url")
+                line = f"📦 *{oid}* — {prod} × {qty} | ₹{total:,.0f}"
+                if inv_url:
+                    line += f"\n   🔗 {inv_url}"
+                else:
+                    line += "\n   _(Invoice PDF not yet generated — reply with the order ID to generate it)_"
+                lines.append(line)
+            body = "\n\n".join(lines)
+            try:
+                return _get_invoice_prompt(
+                    "invoice_multi_reply_prompt", incoming,
+                    sender_name=incoming.sender_name, invoice_count=len(orders),
+                    invoice_list=body, biz_name=incoming.biz_name,
+                )
+            except RuntimeError:
+                return (
+                    f"Here are your last *{len(orders)}* invoices, {incoming.sender_name}! 📄\n\n"
+                    f"{body}\n\n"
+                    f"Thank you for doing business with *{incoming.biz_name}*! 🙏"
+                )
+
+        # ── Single-invoice path ───────────────────────────────────────────────
         order = await get_last_order_from_orders(incoming.tenant_id, incoming.session_id)
     if not order:
         try:

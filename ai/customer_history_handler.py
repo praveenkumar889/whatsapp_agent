@@ -59,9 +59,9 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
         memory_type = str(parsed.get("memory_type", "other")).lower()
         confidence = float(parsed.get("confidence", 0.0))
         try:
-            limit = int(parsed.get("limit", 3))
+            limit = min(int(parsed.get("limit", 1)), 20)  # cap at 20; LLM controls actual value
         except (ValueError, TypeError):
-            limit = 3
+            limit = 1
     except Exception as e:
         print(f"[HISTORY_HANDLER] Classification failed: {e}")
         return None
