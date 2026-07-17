@@ -747,6 +747,31 @@ async def handle_negotiation(
             reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity, tiers=tiers)
             return {"reply": reply, "state": _state(quantity=quantity, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": price_num, "quantity": quantity}
+
+        # GUARD: only present a negotiation first-offer when the customer's current
+        # message ACTUALLY asks for a discount/better price. A plain order request
+        # ("I want 2 units", "order 3") should get a clean store-tier summary
+        # (negotiation_rounds=0 → "Store offer X% OFF") not a "Negotiated price"
+        # label, even if the message was mis-routed here by the negotiation-intent
+        # pre-check. This re-uses the same DB-driven prompt so nothing is hardcoded.
+        # Only applies on the VERY FIRST interaction (rounds==0, no saved state) —
+        # once a real negotiation has started (rounds>0) the offer reply is correct.
+        _actually_wants_discount = rounds > 0 or await is_negotiation_request(msg, incoming, session_history)
+        if not _actually_wants_discount:
+            print(f"[NEGOTIATOR] Step 2: quantity-only order (no discount ask) — routing to no-discount summary")
+            reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity, tiers=tiers)
+            # order_ready=False so product_followup.py returns result["reply"] (the clean
+            # summary) via the normal path. awaiting_invoice_confirmation=True is set so
+            # _invoice_guard in router.py fires correctly when the customer says "Confirm".
+            return {"reply": reply,
+                    "state": _state(quantity=quantity, rounds=0,
+                                    auto_offer_unit_price=offer["offer_price"],
+                                    auto_offer_disc_pct=offer.get("current_tier_disc", 0),
+                                    current_tier_disc=offer.get("current_tier_disc", 0),
+                                    last_offer_price=offer["offer_price"],
+                                    awaiting_invoice_confirmation=True),
+                    "order_ready": False, "escalate": False, "agreed_price": offer["offer_price"], "quantity": quantity}
+
         reply = await _reply_first_offer(incoming, product_name, price_num, regular_price, graphrag_discount_pct, offer, tiers)
         return {"reply": reply,
                 "state": _state(quantity=quantity, rounds=1,

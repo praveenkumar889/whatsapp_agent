@@ -27,12 +27,7 @@ from ai.request_profiler import wrap_llm_client as _wrap_llm_client
 _wrap_llm_client(_client)
 
 
-def _get_prompt_safe(incoming, key: str, fallback: str, **kwargs) -> str:
-    """Safe prompt loader, falling back if not seeded in Postgres database."""
-    try:
-        return get_prompt(incoming, key, **kwargs)
-    except RuntimeError:
-        return fallback
+
 
 
 async def handle_customer_history_query(incoming, session_history: list) -> Optional[str]:
@@ -43,22 +38,7 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
     3. Formats the output dynamically using DB templates.
     """
     # ── Classification Prompt ──
-    classifier_fallback = (
-        "You are an intent classifier for a store customer support bot.\n"
-        "Classify if the customer's message is asking about:\n"
-        "- \"order\": Their past completed purchases, order history, what they bought, or invoice records.\n"
-        "- \"offer\": Past discounts, special pricing history, or active offers they previously accepted.\n"
-        "- \"other\": General questions, catalog browsing, greetings, product questions, or current pricing.\n\n"
-        "Return a JSON object with keys:\n"
-        "{\n"
-        "  \"memory_type\": \"order\" | \"offer\" | \"other\",\n"
-        "  \"confidence\": 0.0 to 1.0\n"
-        "}"
-    )
-
-    system_prompt = _get_prompt_safe(
-        incoming, "memory_query_classifier_prompt", fallback=classifier_fallback
-    )
+    system_prompt = get_prompt(incoming, "memory_query_classifier_prompt")
 
     try:
         resp = await asyncio.get_event_loop().run_in_executor(
@@ -78,11 +58,15 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
         parsed = json.loads(content.strip()) if content else {}
         memory_type = str(parsed.get("memory_type", "other")).lower()
         confidence = float(parsed.get("confidence", 0.0))
+        try:
+            limit = int(parsed.get("limit", 3))
+        except (ValueError, TypeError):
+            limit = 3
     except Exception as e:
         print(f"[HISTORY_HANDLER] Classification failed: {e}")
         return None
 
-    print(f"[HISTORY_HANDLER] Classified message as '{memory_type}' with confidence {confidence:.2f}")
+    print(f"[HISTORY_HANDLER] Classified message as '{memory_type}' with confidence {confidence:.2f} (limit={limit})")
 
     if confidence < 0.6 or memory_type == "other":
         return None  # Fall back to standard GraphRAG query
@@ -93,12 +77,11 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
     # ── Handle Completed Order Inquiries ──
     if memory_type == "order":
         try:
-            orders = await cds.get_order_history(limit=3)
+            orders = await cds.get_order_history(limit=limit)
             
             if not orders:
-                no_orders_fallback = f"Hi {incoming.sender_name or 'there'}! I couldn't find any previous orders for you. Would you like to browse our catalog or place a new order? 😊"
-                return _get_prompt_safe(
-                    incoming, "memory_no_orders_found_prompt", fallback=no_orders_fallback,
+                return get_prompt(
+                    incoming, "memory_no_orders_found_prompt",
                     sender_name=incoming.sender_name or "there"
                 )
             
@@ -116,9 +99,8 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
                 details_list.append(detail)
 
             order_details = "\n".join(details_list)
-            formatter_fallback = f"Hi {incoming.sender_name or 'there'}! Here are your previous orders:\n\n{order_details}"
-            return _get_prompt_safe(
-                incoming, "memory_order_formatter_prompt", fallback=formatter_fallback,
+            return get_prompt(
+                incoming, "memory_order_formatter_prompt",
                 sender_name=incoming.sender_name or "there", order_details=order_details
             )
 
@@ -129,7 +111,7 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
     # ── Handle Offer Inquiries ──
     elif memory_type == "offer":
         try:
-            offers = await cds.get_offer_history(limit=3)
+            offers = await cds.get_offer_history(limit=limit)
 
             # Get current active store offers for the tenant
             from db.session_store import get_tenant_offers
@@ -148,9 +130,8 @@ async def handle_customer_history_query(incoming, session_history: list) -> Opti
                 details_list.append(f"• {prod}: {disc:.0f}% off - {status}")
 
             offer_details = "\n".join(details_list) if details_list else "No past offer negotiations found."
-            formatter_fallback = f"Hi {incoming.sender_name or 'there'}!\n\nPast Offers:\n{offer_details}\n\nCurrent Store Offers:\n{active_store_offers}"
-            return _get_prompt_safe(
-                incoming, "memory_offers_formatter_prompt", fallback=formatter_fallback,
+            return get_prompt(
+                incoming, "memory_offers_formatter_prompt",
                 sender_name=incoming.sender_name or "there", offer_details=offer_details,
                 current_store_offers=active_store_offers
             )

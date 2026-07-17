@@ -404,15 +404,14 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         # ── Pre-check: is this a follow-up about a previously shown product? ──
         # If customer already saw a numbered list and is asking "is it aluminum?"
         # or "tell me more about Romy" — resolve that before calling GraphRAG.
-        if session_history:
-            follow_up_reply = await _try_resolve_product_followup(incoming, session_history)
-            if follow_up_reply == "__ALREADY_HANDLED__":
-                # Image/link/installation already sent directly to WhatsApp —
-                # return empty string so the outer pipeline sends nothing more,
-                # but does NOT fall through to GraphRAG.
-                return ""
-            if follow_up_reply:
-                return follow_up_reply
+        follow_up_reply = await _try_resolve_product_followup(incoming, session_history or [])
+        if follow_up_reply == "__ALREADY_HANDLED__":
+            # Image/link/installation already sent directly to WhatsApp —
+            # return empty string so the outer pipeline sends nothing more,
+            # but does NOT fall through to GraphRAG.
+            return ""
+        if follow_up_reply:
+            return follow_up_reply
 
         # ── Send original query to GraphRAG ──────────────────────────────────
         # GraphRAG uses Neo4j semantic search which understands natural language.
@@ -474,7 +473,12 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
                         _current_product = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
                         if not _current_product:
                             _current_product = arc.resolved_product
-                    else:
+                    elif not getattr(incoming, "_is_new_category_search", False):
+                        # Skip re-attaching the previously active product when
+                        # _try_resolve_product_followup already classified this
+                        # message as a new/broader search (is_new_search=True) —
+                        # otherwise the query GraphRAG receives gets silently
+                        # rewritten back to the stale product name.
                         if getattr(arc.llm_context, "active_product_session", False):
                             _current_product = arc.resolved_product
             history_context = arc.customer_context if arc else ""

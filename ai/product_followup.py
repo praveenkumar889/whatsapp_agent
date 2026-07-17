@@ -9,7 +9,7 @@ import re
 import asyncio
 import json
 import time
-from typing import Optional, cast
+from typing import Any, Optional, cast
 from openai import AzureOpenAI
 
 from config import (
@@ -47,6 +47,15 @@ from ai.request_profiler import wrap_llm_client as _wrap_llm_client
 _wrap_llm_client(_client)
 
 
+def _format_faq_entry(f) -> dict:
+    """External product APIs sometimes return faq entries as plain strings
+    instead of {"question", "answer"} dicts — mirrors the same dual-shape
+    handling already used for the "policies" field just above."""
+    if isinstance(f, dict):
+        return {"q": f.get("question"), "a": f.get("answer")}
+    return {"q": f, "a": ""}
+
+
 async def _parse_followup_message(incoming, selection: list, session_history: Optional[list] = None) -> dict:
     """
     Uses LLM to parse the follow-up message to identify if they are:
@@ -57,7 +66,18 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
     - performing a new category search / broad search (is_new_search)
     Zero hardcoding.
     """
+    # Reuse cached quick_parsed dictionary if already processed in this request
+    cached = getattr(incoming, "_cached_quick_parsed", None)
+    if cached is not None:
+        return cached
+
     product_names = [p.get("product_name") or p.get("name") or "" for p in selection]
+    # Build a numbered catalog string (1-based) so the LLM can resolve
+    # index references like "tell me the features of 44" → product at position 44.
+    # Numbers come directly from the DB-persisted selection order — no hardcoding.
+    numbered_catalog = "\n".join(
+        f"{i + 1}. {name}" for i, name in enumerate(product_names) if name
+    )
     try:
         recent_history = session_history[-4:] if session_history else []
         response = await asyncio.get_event_loop().run_in_executor(
@@ -70,7 +90,7 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
                     {"role": "system", "content": get_prompt(
                         incoming, "pf_data_extraction_prompt",
                         biz_name=incoming.biz_name,
-                        product_catalog=json.dumps(product_names, ensure_ascii=False),
+                        product_catalog=numbered_catalog,
                     )},
                     *recent_history,
                     {"role": "user", "content": incoming.text},
@@ -89,7 +109,10 @@ async def _parse_followup_message(incoming, selection: list, session_history: Op
             if lines[-1].startswith("```"):
                 lines = lines[:-1]
             content = "\n".join(lines).strip()
-        return json.loads(content)
+        
+        res = json.loads(content)
+        incoming._cached_quick_parsed = res
+        return res
     except Exception as e:
         print(f"[FOLLOW-UP] LLM parser failed: {e}")
         return {
@@ -279,16 +302,25 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         str  → LLM answer using product data from cache
         None → not a product follow-up, let call_graphrag_api() handle it
     """
-    neg_state = None
+    # Load negotiation state early (checking incoming cache first to prevent redundant DB calls)
+    neg_state = getattr(incoming, "_cached_neg_state", None)
+    if neg_state is None:
+        neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
+
     selection = await get_graphrag_product_selection(incoming.tenant_id, incoming.session_id)
     if not selection:
         last_prod = await get_last_discussed_product(incoming.tenant_id, incoming.session_id)
+        if not last_prod and neg_state:
+            last_prod = neg_state.get("product_name")
+            if last_prod:
+                print(f"[FOLLOW-UP] No active selection or last discussed product found - loaded product from active negotiation state: {last_prod}")
         if last_prod:
             selection = [{
                 "product_name": last_prod,
                 "name": last_prod,
             }]
-            print(f"[FOLLOW-UP] No active selection found - loaded last discussed product from DB: {last_prod}")
+            if not neg_state or last_prod != neg_state.get("product_name"):
+                print(f"[FOLLOW-UP] No active selection found - loaded last discussed product from DB: {last_prod}")
         else:
             return None
 
@@ -300,7 +332,6 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Runs BEFORE standard follow-up parsing.
     # New-search guard: if customer asks for a new product category, clear
     # any stale negotiation state and route to GraphRAG instead.
-    neg_state = await get_negotiation_state(incoming.tenant_id, incoming.session_id)
 
     # Bypasses negotiation if the user is asking for a specific non-none knowledge field (e.g. images, installation)
     _routing = getattr(incoming, "_routing", None)
@@ -696,9 +727,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         for p in selection
     ]
     _matches_selection = any(
-        _msg_lower == name or
-        (_msg_lower in name and len(_msg_lower) > 6) or
-        (name in _msg_lower and len(name) > 6)
+        _msg_lower == name
         for name in _selection_names if name
     )
     if _matches_selection and parsed.get("is_new_search", False):
@@ -708,13 +737,35 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         if not parsed.get("selected_product_name"):
             for p in selection:
                 pname = (p.get("product_name") or p.get("name") or "").lower().strip()
-                if _msg_lower == pname or (_msg_lower in pname and len(_msg_lower) > 6) or (pname in _msg_lower and len(pname) > 6):
+                if _msg_lower == pname:
                     parsed["selected_product_name"] = p.get("product_name") or p.get("name")
                     print(f"[FOLLOW-UP] Auto-resolved selected_product_name: '{parsed['selected_product_name']}'")
                     break
 
+    # ── Numeric index guard (before is_new_search check) ─────────────────────
+    # "tell me the features of 28", "details about 4", bare "28" etc.
+    # The LLM sees a number and can't map it to a product name, so it returns
+    # is_new_search=True. We intercept here — if the number falls in range of
+    # the active selection list, override to the correct product before routing.
+    if not parsed.get("selected_product_name") or parsed.get("is_new_search", False):
+        import re as _re
+        _num_match = _re.search(r'\b(\d{1,3})\b', incoming.text)
+        if _num_match:
+            _idx = int(_num_match.group(1))
+            if 1 <= _idx <= len(selection):
+                _resolved = selection[_idx - 1]
+                _resolved_name = _resolved.get("product_name") or _resolved.get("name")
+                if _resolved_name:
+                    print(f"[FOLLOW-UP] Numeric guard: index {_idx} → '{_resolved_name}' (overriding is_new_search)")
+                    parsed["selected_product_name"] = _resolved_name
+                    parsed["is_new_search"] = False
+
     if parsed.get("is_new_search", False):
         print(f"[FOLLOW-UP] LLM parser identified category search/new search — routing to GraphRAG")
+        # Flag on `incoming` (same pattern as incoming._routing/_cached_arc) so
+        # call_graphrag_api's query-enrichment step doesn't re-inject the old
+        # active_product_session's resolved_product into this new search below.
+        incoming._is_new_category_search = True
 
         # QUERY ENRICHMENT — LLM-driven, zero hardcoded word lists.
         # Only enriches when query has purely vague references (no product info).
@@ -1368,8 +1419,20 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     cached_product = await get_cached_product_by_name(incoming.tenant_id, product_name)
 
     if not cached_product:
-        print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — falling through to GraphRAG")
-        return None
+        # product_cache miss — but matched_product already has feature_descriptions,
+        # image_url, etc. saved in workflow_sessions items_json (via save_graphrag_product_selection).
+        # Use that directly instead of falling through to GraphRAG which would
+        # re-fetch and potentially return stale context from a different session.
+        if matched_product.get("feature_descriptions"):
+            print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — using data from PRODUCT_SELECTION items")
+            cached_product = matched_product
+        else:
+            print(f"[FOLLOW-UP] product_cache miss for '{product_name}' — falling through to GraphRAG")
+            return None
+
+    # Pylance type narrowing: at this point cached_product is guaranteed non-None
+    # (either fetched from product_cache or assigned from matched_product above).
+    assert cached_product is not None
 
     # ── Send image only if explicitly requested ───────────────────────────
     if asks_for_image:
@@ -1534,7 +1597,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                 )
 
     # Start with a copy of all cached product fields so no custom fields (e.g. wattages) are lost
-    product_context = cached_product.copy()
+    product_context: dict[str, Any] = cached_product.copy()
 
     # Overlay only the formatted, casted, or external helper fields that the LLM/negotiator expect
     product_context.update({
@@ -1548,11 +1611,11 @@ async def _try_resolve_product_followup(incoming, session_history: list):
         "gst_rate":                   getattr(incoming, "gst_rate", 0.18),
         "gst_rate_pct":               int(getattr(incoming, "gst_rate", 0.18) * 100),
         "delivery_policy":            [
-            pol.get("content", "") for pol in cached_product.get("policies", [])
+            pol if isinstance(pol, str) else pol.get("content", "")
+            for pol in cached_product.get("policies", [])
         ] if "policies" in cached_product else [],
         "faqs": [
-            {"q": f.get("question"), "a": f.get("answer")}
-            for f in cached_product.get("faqs", [])
+            _format_faq_entry(f) for f in cached_product.get("faqs", [])
         ] if "faqs" in cached_product else [],
     })
 

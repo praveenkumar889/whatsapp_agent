@@ -8,7 +8,7 @@ def parse_and_render_invoice(text: str) -> bool:
     If yes, extracts the PDF link and order ID, and renders a WhatsApp-style Invoice Card.
     Returns True if rendered as a card, False otherwise.
     """
-    if "Download Invoice PDF" in text or ".pdf" in text:
+    if "Download Invoice PDF" in text:
         # Try to extract the URL
         url_match = re.search(r'(https?://[^\s]+)', text)
         # Try to extract order ID (e.g. *ORD_...* or *INV_...*)
