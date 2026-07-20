@@ -374,7 +374,8 @@ def _get_route(result) -> str:
         return "Greeting Handler"
     if result.intent == "HUMAN_ESCALATION":
         return "Human Handoff Escalation"
-    if result.intent in ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION") or result.confidence_score < DEFAULT_INTENT_MIN_CONFIDENCE:
+    _graphrag_intents = ("FAQ_KNOWLEDGE", "WORKFLOW_ACTION", "FIND_PRODUCT", "BROWSE_CATEGORY", "GET_PRODUCT_INFO", "GET_ADVICE", "CHECK_POLICY")
+    if result.intent in _graphrag_intents or result.confidence_score < DEFAULT_INTENT_MIN_CONFIDENCE:
         return "GraphRAG / Catalog"
     return "Unknown Intent Handler"
 

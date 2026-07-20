@@ -164,6 +164,46 @@ async def dispatch(incoming, result, session_history: list) -> str:
 
         if val:
             from db.prompt_store import get_prompt
+            
+            # Combine the resolved value with feature_descriptions so the LLM has full context
+            _feat_desc = matched_product.get("feature_descriptions") or "" if matched_product else ""
+            if _feat_desc:
+                asset_context = f"Value for {requested_field}: {val}\n\nProduct Details & Features:\n{_feat_desc}"
+            else:
+                asset_context = str(val)
+
+            # Try to run it through the LLM with knowledge_asset_answer_prompt to answer
+            # the user's specific query instead of dumping raw text or links.
+            try:
+                system_prompt = get_prompt(
+                    incoming,
+                    "knowledge_asset_answer_prompt",
+                    asset_name=requested_field,
+                    product_name=arc.resolved_product,
+                    asset_value=asset_context
+                )
+                
+                response = await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: _client.chat.completions.create(
+                        model=AZURE_OPENAI_DEPLOYMENT,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": incoming.text}
+                        ],
+                        max_tokens=1000,
+                        temperature=0,
+                    )
+                )
+                
+                content = response.choices[0].message.content
+                answer = content.strip() if content else None
+                if answer:
+                    return answer
+            except Exception as _le:
+                print(f"[ROUTER] Failed to render dynamic asset answer via LLM: {_le}")
+
+            # Fallback: if LLM fails, handle installation or URL directly
             if requested_field and requested_field.lower() == "installation":
                 try:
                     header = get_prompt(incoming, "followup_installation_header_prompt", product_name=arc.resolved_product)
@@ -178,38 +218,7 @@ async def dispatch(incoming, result, session_history: list) -> str:
                     label = requested_field.capitalize().replace("_", " ") if requested_field else ""
                     return f"Here is the {label} for *{arc.resolved_product}*:\n\n🔗 {val}"
             else:
-                # If the value is a text block, run it through the LLM with knowledge_asset_answer_prompt
-                # to answer the user's specific query (e.g. "is this waterproof") instead of dumping raw text.
-                try:
-                    system_prompt = get_prompt(
-                        incoming,
-                        "knowledge_asset_answer_prompt",
-                        asset_name=requested_field,
-                        product_name=arc.resolved_product,
-                        asset_value=str(val)
-                    )
-                    
-                    response = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: _client.chat.completions.create(
-                            model=AZURE_OPENAI_DEPLOYMENT,
-                            messages=[
-                                {"role": "system", "content": system_prompt},
-                                {"role": "user", "content": incoming.text}
-                            ],
-                            max_tokens=250,
-                            temperature=0,
-                        )
-                    )
-                    
-                    content = response.choices[0].message.content
-                    answer = content.strip() if content else None
-                    if answer:
-                        return answer
-                except Exception as _le:
-                    print(f"[ROUTER] Failed to render dynamic asset answer via LLM: {_le}")
 
-                # Fallback: display the raw text template or label
                 prompt_key = f"asset_success_{requested_field}_prompt"
                 try:
                     return get_prompt(incoming, prompt_key, product_name=arc.resolved_product, value=str(val))

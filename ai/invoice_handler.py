@@ -161,6 +161,38 @@ async def _extract_invoice_limit(incoming) -> int:
         return 1
 
 
+async def _get_delivery_estimation(incoming, shipping_address: str, delivery_time_frame: str) -> Optional[str]:
+    """
+    Uses LLM to dynamically determine estimated delivery timeframe based on the shipping address
+    and the product's delivery timeframe rules.
+    """
+    if not shipping_address or not delivery_time_frame:
+        return None
+    try:
+        system_prompt = _get_invoice_prompt(
+            "delivery_estimation_prompt", incoming,
+            shipping_address=shipping_address,
+            delivery_time_frame=delivery_time_frame
+        )
+        response = await asyncio.get_event_loop().run_in_executor(
+            None,
+            lambda: _client.chat.completions.create(
+                model       = AZURE_OPENAI_DEPLOYMENT,
+                max_tokens  = 150,
+                temperature = 0,
+                messages    = [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": shipping_address},
+                ],
+            )
+        )
+        raw = response.choices[0].message.content
+        return raw.strip() if raw else None
+    except Exception as e:
+        print(f"[INVOICE] Delivery estimation extraction failed: {e}")
+        return None
+
+
 async def handle_invoice_request(incoming, negotiated_order: Optional[Union[OrderResult, dict]] = None) -> str:
     """
     Generates invoice PDF. When negotiated_order is passed (from confirmed
@@ -305,19 +337,46 @@ async def handle_invoice_request(incoming, negotiated_order: Optional[Union[Orde
             await update_order_invoice_url(order["order_id"], incoming.tenant_id, invoice_url)
             print(f"[INVOICE] Invoice URL updated in DB: {invoice_url}")
 
+    # ── Estimate Delivery timeframe dynamically from address ──────────────────
+    est_delivery_msg = None
+    shipping_address = order.get("shipping_address")
+    if shipping_address:
+        items = order.get("items")
+        product_name = None
+        if items and isinstance(items, list) and len(items) > 0:
+            product_name = items[0].get("product_name")
+        else:
+            product_name = order.get("product_name")
+
+        if product_name:
+            try:
+                from db.session_store import get_cached_product_by_name
+                product = await get_cached_product_by_name(incoming.tenant_id, product_name)
+                if product:
+                    delivery_time_frame = product.get("delivery_time_frame")
+                    if delivery_time_frame:
+                        est_delivery_msg = await _get_delivery_estimation(incoming, shipping_address, delivery_time_frame)
+            except Exception as _pe:
+                print(f"[INVOICE] Failed to resolve product or delivery timeframe from cache: {_pe}")
+
     if invoice_url:
         try:
-            return _get_invoice_prompt(
+            success_reply = _get_invoice_prompt(
                 "invoice_success_reply_prompt", incoming,
                 order_id=order.get('order_id'), sender_name=incoming.sender_name,
                 invoice_url=invoice_url, biz_name=incoming.biz_name,
+                delivery_estimation=f"\n\n{est_delivery_msg}" if est_delivery_msg else "",
             )
+            return success_reply
         except RuntimeError:
-            return (
+            fallback_reply = (
                 f"Here is your tax invoice for order *{order.get('order_id')}*, {incoming.sender_name}! 📄\n\n"
                 f"🔗 *Download Invoice PDF*:\n{invoice_url}\n\n"
-                f"Thank you for doing business with *{incoming.biz_name}*! 🙏"
             )
+            if est_delivery_msg:
+                fallback_reply += est_delivery_msg + "\n\n"
+            fallback_reply += f"Thank you for doing business with *{incoming.biz_name}*! 🙏"
+            return fallback_reply
     else:
         support = getattr(incoming, 'support_email', None) or incoming.biz_name
         try:

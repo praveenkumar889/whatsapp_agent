@@ -156,7 +156,7 @@ def calculate_offer(price_num: float, quantity: int, tiers: Optional[list] = Non
     order_value = round(offer_price * quantity, 2)
 
     return {
-        "offer_price": offer_price, "total_price": round(offer_price * quantity, 2),
+        "offer_price": offer_price, "tier_price": tier_price, "total_price": round(offer_price * quantity, 2),
         "floor_price": floor_price, "floor_disc": max_disc,
         "tier_discount_pct": current_tier_disc, "has_discount": current_tier_disc > 0 or max_disc > 0,
         "price_num": price_num, "quantity": quantity, "order_value": order_value,
@@ -479,7 +479,7 @@ async def _reply_no_discount(incoming, product_name, price_num, regular_price, d
         quantity=quantity,
         gst_rate=getattr(incoming, "gst_rate", 0.18),
         store_disc_pct=0,
-        negotiated_unit_price=price_num,
+        negotiated_unit_price=None,
         negotiation_rounds=0,
         tiers=tiers or [],
     )
@@ -725,6 +725,21 @@ async def handle_negotiation(
             reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity, tiers=tiers)
             return {"reply": reply, "state": _state(awaiting_quantity=False, quantity=quantity, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": price_num, "quantity": quantity}
+        
+        # Guard: only present first offer if user actually asks for a discount
+        _actually_wants_discount = await is_negotiation_request(msg, incoming, session_history)
+        if not _actually_wants_discount:
+            print(f"[NEGOTIATOR] Step 1: quantity-only order (no discount ask) — routing to no-discount summary")
+            reply = await _reply_no_discount(incoming, product_name, price_num, regular_price, graphrag_discount_pct, quantity, tiers=tiers)
+            return {"reply": reply,
+                    "state": _state(awaiting_quantity=False, quantity=quantity, rounds=0,
+                                    auto_offer_unit_price=offer["tier_price"],
+                                    auto_offer_disc_pct=offer.get("current_tier_disc", 0),
+                                    current_tier_disc=offer.get("current_tier_disc", 0),
+                                    last_offer_price=offer["tier_price"],
+                                    awaiting_invoice_confirmation=True),
+                    "order_ready": False, "escalate": False, "agreed_price": offer["tier_price"], "quantity": quantity}
+
         reply = await _reply_first_offer(incoming, product_name, price_num, regular_price, graphrag_discount_pct, offer, tiers)
         return {"reply": reply,
                 "state": _state(awaiting_quantity=False, quantity=quantity, rounds=1,
@@ -738,7 +753,7 @@ async def handle_negotiation(
     if not quantity:
         quantity = await extract_quantity(msg, product_name, incoming, session_history)
         if not quantity:
-            ask_msg = get_prompt(incoming, "neg_ask_quantity_prompt", sender_name=incoming.sender_name, product_name=product_name, regular_price=f"{regular_price:,.0f}")
+            ask_msg = get_prompt(incoming, "neg_ask_quantity_prompt", sender_name=incoming.sender_name, product_name=product_name, regular_price=f"{price_num:,.0f}")
             return {"reply": ask_msg,
                     "state": _state(awaiting_quantity=True, rounds=0),
                     "order_ready": False, "escalate": False, "agreed_price": None, "quantity": None}
@@ -765,12 +780,12 @@ async def handle_negotiation(
             # _invoice_guard in router.py fires correctly when the customer says "Confirm".
             return {"reply": reply,
                     "state": _state(quantity=quantity, rounds=0,
-                                    auto_offer_unit_price=offer["offer_price"],
+                                    auto_offer_unit_price=offer["tier_price"],
                                     auto_offer_disc_pct=offer.get("current_tier_disc", 0),
                                     current_tier_disc=offer.get("current_tier_disc", 0),
-                                    last_offer_price=offer["offer_price"],
+                                    last_offer_price=offer["tier_price"],
                                     awaiting_invoice_confirmation=True),
-                    "order_ready": False, "escalate": False, "agreed_price": offer["offer_price"], "quantity": quantity}
+                    "order_ready": False, "escalate": False, "agreed_price": offer["tier_price"], "quantity": quantity}
 
         reply = await _reply_first_offer(incoming, product_name, price_num, regular_price, graphrag_discount_pct, offer, tiers)
         return {"reply": reply,
@@ -861,7 +876,7 @@ async def handle_negotiation(
         # Update baseline and floor price for the new quantity in negotiation state
         negotiation_state.update({
             "quantity": quantity,
-            "auto_offer_unit_price": offer["offer_price"],
+            "auto_offer_unit_price": offer["tier_price"] if rounds == 0 else offer["offer_price"],
             "auto_offer_disc_pct": offer.get("current_tier_disc", 0),
             "current_tier_disc": offer.get("current_tier_disc", 0),
         })
@@ -898,7 +913,7 @@ async def handle_negotiation(
             _disclosure_blocked = _require_disclosure and not _offer_disclosed
 
             _eff_tier_disc = 0 if _disclosure_blocked else offer.get("current_tier_disc", 0)
-            _eff_price     = price_num if _disclosure_blocked else offer["offer_price"]
+            _eff_price     = price_num if _disclosure_blocked else (offer["tier_price"] if rounds == 0 else offer["offer_price"])
 
             sub_price         = round(_eff_price * quantity, 2)
             gst_amount        = round(sub_price * getattr(incoming, "gst_rate", 0.18), 2)

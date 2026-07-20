@@ -191,13 +191,10 @@ async def _send_structured_product_list(incoming, products: list) -> str:
         price     = p.get("price_num", 0)
         reg_price = p.get("regular_price", price)
         discount  = p.get("discount_percentage", 0)
-        if i <= MAX_IMAGE_PRODUCTS:
-            entry = f"*{i}.* {name} — Rs.{float(price):,.0f}"
-            if discount:
-                entry += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
-            lines.append(entry)
-        else:
-            lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
+        entry = f"*{i}.* {name} — Rs.{float(price):,.0f}"
+        if discount:
+            entry += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
+        lines.append(entry)
 
     lines.append(
         "\n" + _reply_prompt(

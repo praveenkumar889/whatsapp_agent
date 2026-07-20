@@ -133,5 +133,7 @@ intent_prompt_version5.txt
 pyrightconfig.json
 regression_test.py
 migrations/
-
-
+docs/
+scratch/
+bugs.md
+skills.md

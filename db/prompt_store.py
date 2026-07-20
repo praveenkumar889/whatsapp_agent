@@ -416,6 +416,7 @@ PROMPT_KEYS: dict = {
     "generate_invoice_cta_fallback":              "generate_invoice_cta_fallback",
     "invoice_no_orders_found_prompt":             "invoice_no_orders_found_prompt",
     "invoice_success_reply_prompt":               "invoice_success_reply_prompt",
+    "delivery_estimation_prompt":                  "delivery_estimation_prompt",
     "invoice_pdf_failed_prompt":                  "invoice_pdf_failed_prompt",
     "neg_still_bargaining_prompt":                "neg_still_bargaining_prompt",
     "neg_ask_quantity_prompt":                    "neg_ask_quantity_prompt",
