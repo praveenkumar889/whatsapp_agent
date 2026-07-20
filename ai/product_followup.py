@@ -477,6 +477,17 @@ async def _try_resolve_product_followup(incoming, session_history: list):
             print(f"[NEGOTIATOR] Fallback to first in selection: {product_name}")
 
         if product_name:
+            selected_options = quick_parsed.get("selected_options")
+            if selected_options:
+                if "(" in product_name:
+                    product_name = product_name.split("(")[0].strip()
+                product_name = f"{product_name} ({selected_options})"
+            
+            try:
+                await save_last_discussed_product(incoming.tenant_id, incoming.session_id, product_name)
+            except Exception as e:
+                print(f"[NEGOTIATOR] Failed to save last discussed product: {e}")
+
             cached = await get_cached_product_by_name(incoming.tenant_id, product_name)
             if cached:
                 price_num      = float(cached.get("list_price") or 0)
@@ -742,23 +753,7 @@ async def _try_resolve_product_followup(incoming, session_history: list):
                     print(f"[FOLLOW-UP] Auto-resolved selected_product_name: '{parsed['selected_product_name']}'")
                     break
 
-    # ── Numeric index guard (before is_new_search check) ─────────────────────
-    # "tell me the features of 28", "details about 4", bare "28" etc.
-    # The LLM sees a number and can't map it to a product name, so it returns
-    # is_new_search=True. We intercept here — if the number falls in range of
-    # the active selection list, override to the correct product before routing.
-    if not parsed.get("selected_product_name") or parsed.get("is_new_search", False):
-        import re as _re
-        _num_match = _re.search(r'\b(\d{1,3})\b', incoming.text)
-        if _num_match:
-            _idx = int(_num_match.group(1))
-            if 1 <= _idx <= len(selection):
-                _resolved = selection[_idx - 1]
-                _resolved_name = _resolved.get("product_name") or _resolved.get("name")
-                if _resolved_name:
-                    print(f"[FOLLOW-UP] Numeric guard: index {_idx} → '{_resolved_name}' (overriding is_new_search)")
-                    parsed["selected_product_name"] = _resolved_name
-                    parsed["is_new_search"] = False
+
 
     if parsed.get("is_new_search", False):
         print(f"[FOLLOW-UP] LLM parser identified category search/new search — routing to GraphRAG")
@@ -1407,8 +1402,9 @@ async def _try_resolve_product_followup(incoming, session_history: list):
     # Dynamically append selected options (wattages, size, color) to product name
     selected_options = parsed.get("selected_options")
     if selected_options:
-        if "(" not in product_name:
-            product_name = f"{product_name} ({selected_options})"
+        if "(" in product_name:
+            product_name = product_name.split("(")[0].strip()
+        product_name = f"{product_name} ({selected_options})"
     
     # Save as the last discussed product in the database so context is retained
     try:
