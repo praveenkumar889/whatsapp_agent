@@ -1069,7 +1069,7 @@ async def get_negotiation_state(
         return None
     except Exception as e:
         print(f"[DB] get_negotiation_state failed: {e}")
-        return None
+        raise
 
 
 async def clear_negotiation_state(

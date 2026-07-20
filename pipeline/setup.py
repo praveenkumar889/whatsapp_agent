@@ -122,7 +122,7 @@ async def setup_pipeline(incoming: IncomingMessage) -> tuple:
             print(f"[PIPELINE] Neg state fetch error (non-critical): {neg_result}")
         else:
             neg_state = neg_result
-        incoming._cached_neg_state = neg_state
+            incoming._cached_neg_state = neg_state
         return True, session_history, neg_state
     except Exception:
         from db.processing_lock import release_lock as _release_lock
