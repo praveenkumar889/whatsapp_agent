@@ -363,10 +363,12 @@ async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional
         max_len = 5000
 
     # WhatsApp API strictly fails with Error 400 if a single message exceeds 4096 characters.
-    # We must cap the effective chunk size at 5000 to prevent delivery failures.
+    # Therefore, while the user limit setting (effective_max_len) is 5000, we must chunk 
+    # at 4096 (chunk_limit) to prevent Meta API delivery failures.
     effective_max_len = min(max_len, 5000)
+    chunk_limit = min(effective_max_len, 4096)
 
-    if len(reply) <= effective_max_len:
+    if len(reply) <= chunk_limit:
         return await send_reply(incoming, reply)
 
     # 1. Split by predefined MSG_SPLIT tags if present
@@ -379,15 +381,15 @@ async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional
         current_chunk = ""
         for line in lines:
             candidate = current_chunk + "\n" + line if current_chunk else line
-            if len(candidate) > effective_max_len:
+            if len(candidate) > chunk_limit:
                 if current_chunk:
                     chunks.append(current_chunk.strip())
-                # If a single line exceeds effective_max_len, split it by characters
-                if len(line) > effective_max_len:
+                # If a single line exceeds chunk_limit, split it by characters
+                if len(line) > chunk_limit:
                     temp_line = line
-                    while len(temp_line) > effective_max_len:
-                        chunks.append(temp_line[:effective_max_len])
-                        temp_line = temp_line[effective_max_len:]
+                    while len(temp_line) > chunk_limit:
+                        chunks.append(temp_line[:chunk_limit])
+                        temp_line = temp_line[chunk_limit:]
                     current_chunk = temp_line
                 else:
                     current_chunk = line
