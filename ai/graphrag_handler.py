@@ -169,17 +169,14 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     if _go:
         asyncio.create_task(save_tenant_offers(tenant_id=incoming.tenant_id, offers_text=_go))
 
-    # Send image cards in parallel — all cards are independent of each other.
-    # Previously sequential (each awaited before starting next), costing
-    # N × ~1s. Now all fire simultaneously and we wait for the slowest one.
+    # Send image cards sequentially to guarantee they are delivered in correct numerical order.
     MAX_IMAGE_PRODUCTS = getattr(incoming, "max_image_products", None) or 3
-    card_tasks = [
-        _send_product_card(incoming, i, p)
-        for i, p in enumerate(products, 1)
-        if i <= MAX_IMAGE_PRODUCTS
-    ]
-    if card_tasks:
-        await asyncio.gather(*card_tasks, return_exceptions=True)
+    for i, p in enumerate(products, 1):
+        if i <= MAX_IMAGE_PRODUCTS:
+            try:
+                await _send_product_card(incoming, i, p)
+            except Exception as ce:
+                print(f"[GRAPHRAG] Error sending product card {i}: {ce}")
 
     lines = [_reply_prompt(
         incoming, "graphrag_product_list_header_prompt",
