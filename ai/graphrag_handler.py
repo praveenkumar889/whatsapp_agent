@@ -178,29 +178,88 @@ async def _send_structured_product_list(incoming, products: list) -> str:
             except Exception as ce:
                 print(f"[GRAPHRAG] Error sending product card {i}: {ce}")
 
-    lines = [_reply_prompt(
+    # Load the max message limit from the DB (same key _send_reply_chunked uses)
+    # so that clients can tune this per-tenant without any code changes.
+    try:
+        from db.prompt_store import get_prompt
+        _limit_str = get_prompt(incoming, "whatsapp_max_message_limit")
+        _wa_limit = min(int(_limit_str.strip()), 4096)
+    except Exception:
+        _wa_limit = 4096
+
+    header = _reply_prompt(
         incoming, "graphrag_product_list_header_prompt",
         fallback=f"Here are the options for you, {incoming.sender_name}! 💡\n",
         sender_name=incoming.sender_name,
-    )]
-    for i, p in enumerate(products, 1):
-        name      = p.get("name", "Product")
-        price     = p.get("price_num", 0)
-        reg_price = p.get("regular_price", price)
-        discount  = p.get("discount_percentage", 0)
-        entry = f"*{i}.* {name} — Rs.{float(price):,.0f}"
-        if discount:
-            entry += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
-        lines.append(entry)
-
-    lines.append(
-        "\n" + _reply_prompt(
-            incoming, "graphrag_product_list_footer_prompt",
-            fallback="Reply with the product *number* or *name* to know more or place an order.",
-        )
+    )
+    footer = "\n" + _reply_prompt(
+        incoming, "graphrag_product_list_footer_prompt",
+        fallback="Reply with the product *number* or *name* to know more or place an order.",
     )
 
+    def _build_lines(prods, strip_suffix, compact_discount):
+        """Build product entry lines with optional name/discount compression."""
+        result = [header]
+        for i, p in enumerate(prods, 1):
+            name      = p.get("name", "Product")
+            price     = p.get("price_num", 0)
+            reg_price = p.get("regular_price", price)
+            discount  = p.get("discount_percentage", 0)
+            if strip_suffix:
+                # Remove long SEO description appended after common separators
+                for sep in [" — ", " - ", " | "]:
+                    if sep in name:
+                        candidate = name.split(sep)[0].strip()
+                        if len(candidate) > 3:
+                            name = candidate
+                            break
+            entry = f"*{i}.* {name} — Rs.{float(price):,.0f}"
+            if discount:
+                if compact_discount:
+                    entry += f" ({discount}% off)"
+                else:
+                    entry += f" (Save {discount}% off Rs.{float(str(reg_price).replace(',','')):,.0f})"
+            result.append(entry)
+        result.append(footer)
+        return "\n".join(result)
+
+    # Strategy 1 — Full names, full discount detail
+    summary_text = _build_lines(products, strip_suffix=False, compact_discount=False)
+    if len(summary_text) <= _wa_limit:
+        return summary_text
+
+    # Strategy 2 — Strip trailing SEO suffixes from names, full discount detail
+    summary_text = _build_lines(products, strip_suffix=True, compact_discount=False)
+    if len(summary_text) <= _wa_limit:
+        return summary_text
+
+    # Strategy 3 — Strip SEO suffixes + compact discount format
+    summary_text = _build_lines(products, strip_suffix=True, compact_discount=True)
+    if len(summary_text) <= _wa_limit:
+        return summary_text
+
+    # Strategy 4 — Strip SEO suffixes + no discount detail
+    lines = [header]
+    for i, p in enumerate(products, 1):
+        name  = p.get("name", "Product")
+        price = p.get("price_num", 0)
+        for sep in [" — ", " - ", " | "]:
+            if sep in name:
+                candidate = name.split(sep)[0].strip()
+                if len(candidate) > 3:
+                    name = candidate
+                    break
+        lines.append(f"*{i}.* {name} — Rs.{float(price):,.0f}")
+    lines.append(footer)
     summary_text = "\n".join(lines)
+    if len(summary_text) <= _wa_limit:
+        return summary_text
+
+    # Strategy 5 — absolute fallback: drop entries from the bottom until it fits
+    while len(summary_text) > _wa_limit and len(lines) > 2:
+        lines.pop(-2)
+        summary_text = "\n".join(lines)
+
     return summary_text
 
 
