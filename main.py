@@ -366,7 +366,7 @@ async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional
     # Therefore, while the user limit setting (effective_max_len) is 5000, we must chunk 
     # at 4096 (chunk_limit) to prevent Meta API delivery failures.
     effective_max_len = min(max_len, 5000)
-    chunk_limit = min(effective_max_len, 4096)
+    chunk_limit = min(effective_max_len, 5000)
 
     if len(reply) <= chunk_limit:
         return await send_reply(incoming, reply)
