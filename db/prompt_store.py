@@ -428,6 +428,8 @@ PROMPT_KEYS: dict = {
     "neg_still_bargaining_prompt":                "neg_still_bargaining_prompt",
     "neg_ask_quantity_prompt":                    "neg_ask_quantity_prompt",
     "neg_ask_quantity_retry_prompt":              "neg_ask_quantity_retry_prompt",
+    "whatsapp_max_message_limit":                 "whatsapp_max_message_limit",
+    "graphrag_max_products_limit":                "graphrag_max_products_limit",
     "graphrag_no_url_configured_prompt":          "graphrag_no_url_configured_prompt",
     "graphrag_403_error_prompt":                  "graphrag_403_error_prompt",
     "graphrag_http_error_prompt":                 "graphrag_http_error_prompt",

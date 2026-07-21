@@ -160,10 +160,18 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     # Moving these off the critical path saves ~400-600ms per product-list response.
     if batch_items:
         asyncio.create_task(save_product_api_responses_batch(incoming.tenant_id, batch_items))
+    try:
+        limit_str = _reply_prompt(incoming, "graphrag_max_products_limit", fallback="30")
+        max_products = int(limit_str.strip())
+    except Exception:
+        max_products = 30
+
+    displayed_products = products[:max_products]
+
     asyncio.create_task(save_graphrag_product_selection(
         tenant_id  = incoming.tenant_id,
         session_id = incoming.session_id,
-        products   = products,
+        products   = displayed_products,
     ))
     _go = next((p.get("global_offers") for p in products if p.get("global_offers")), None)
     if _go:
@@ -171,7 +179,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
 
     # Send image cards sequentially to guarantee they are delivered in correct numerical order.
     MAX_IMAGE_PRODUCTS = getattr(incoming, "max_image_products", None) or 3
-    for i, p in enumerate(products, 1):
+    for i, p in enumerate(displayed_products, 1):
         if i <= MAX_IMAGE_PRODUCTS:
             try:
                 await _send_product_card(incoming, i, p)
@@ -183,7 +191,7 @@ async def _send_structured_product_list(incoming, products: list) -> str:
         fallback=f"Here are the options for you, {incoming.sender_name}! 💡\n",
         sender_name=incoming.sender_name,
     )]
-    for i, p in enumerate(products, 1):
+    for i, p in enumerate(displayed_products, 1):
         name      = p.get("name", "Product")
         price     = p.get("price_num", 0)
         reg_price = p.get("regular_price", price)
