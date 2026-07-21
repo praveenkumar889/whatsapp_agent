@@ -204,8 +204,27 @@ async def _send_structured_product_list(incoming, products: list) -> str:
     )
 
     summary_text = "\n".join(lines)
-    if len(summary_text) > 4096:
-        summary_text = summary_text[:4090] + "\n…"
+    
+    # Load character limit dynamically from DB with fallback
+    try:
+        from db.prompt_store import get_prompt
+        limit_str = get_prompt(incoming, "whatsapp_max_message_limit")
+        max_len = int(limit_str.strip())
+    except Exception:
+        max_len = 5000
+
+    if len(summary_text) > max_len:
+        # Truncate at last complete line boundary to avoid cutting product descriptions in half
+        current_len = 0
+        truncated_lines = []
+        for line in lines:
+            # Add line length plus 1 for newline character, and 2 for the trailing '…'
+            if current_len + len(line) + 2 > max_len:
+                break
+            truncated_lines.append(line)
+            current_len += len(line) + 1
+        truncated_lines.append("…")
+        summary_text = "\n".join(truncated_lines)
 
     return summary_text
 
@@ -726,22 +745,31 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
                     sender_name=incoming.sender_name, website=(incoming.website or incoming.biz_name),
                 )
 
-        if len(reply_str) <= 4096:
+        # Load character limit dynamically from DB with fallback
+        try:
+            from db.prompt_store import get_prompt
+            limit_str = get_prompt(incoming, "whatsapp_max_message_limit")
+            max_len = int(limit_str.strip())
+        except Exception:
+            max_len = 5000
+
+        if len(reply_str) <= max_len:
             return reply_str
 
         # Split long plain text reply at line boundaries
         chunks  = []
         lines   = reply_str.split("\n")
         current = ""
+        safety_limit = max_len - 200
         for line in lines:
             candidate = current + "\n" + line if current else line
-            if len(candidate) > 3800:
+            if len(candidate) > safety_limit:
                 if current:
                     chunks.append(current.strip())
-                if len(line) > 3800:
-                    while len(line) > 3800:
-                        chunks.append(line[:3800])
-                        line = line[3800:]
+                if len(line) > safety_limit:
+                    while len(line) > safety_limit:
+                        chunks.append(line[:safety_limit])
+                        line = line[safety_limit:]
                     current = line
                 else:
                     current = line
@@ -750,7 +778,7 @@ async def call_graphrag_api(incoming, session_history: Optional[list] = None, gr
         if current.strip():
             chunks.append(current.strip())
         if not chunks:
-            chunks = [reply_str[i:i+3800] for i in range(0, len(reply_str), 3800)]
+            chunks = [reply_str[i:i+safety_limit] for i in range(0, len(reply_str), safety_limit)]
 
         print(f"[GRAPHRAG] Split into {len(chunks)} message(s)")
         return "\n\n⟨MSG_SPLIT⟩\n\n".join(chunks)

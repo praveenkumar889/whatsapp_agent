@@ -350,15 +350,48 @@ async def run_pipeline(incoming: IncomingMessage) -> dict:
 
 
 async def _send_reply_chunked(incoming: IncomingMessage, reply: str) -> Optional[str]:
-    """Sends reply, splitting into chunks if over WhatsApp's 4096 char limit."""
+    """Sends reply, splitting into chunks if over WhatsApp's character limit."""
     if not reply:
         return None
 
-    MAX_LEN = 4000
-    if len(reply) <= MAX_LEN:
+    # Load character limit dynamically from DB with fallback
+    try:
+        from db.prompt_store import get_prompt
+        limit_str = get_prompt(incoming, "whatsapp_max_message_limit")
+        max_len = int(limit_str.strip())
+    except Exception:
+        max_len = 5000
+
+    if len(reply) <= max_len:
         return await send_reply(incoming, reply)
 
-    chunks = [reply[i:i+MAX_LEN] for i in range(0, len(reply), MAX_LEN)]
+    # 1. Split by predefined MSG_SPLIT tags if present
+    if "⟨MSG_SPLIT⟩" in reply:
+        chunks = [c.strip() for c in reply.split("⟨MSG_SPLIT⟩") if c.strip()]
+    else:
+        # 2. Split by line boundaries dynamically
+        chunks = []
+        lines = reply.split("\n")
+        current_chunk = ""
+        for line in lines:
+            candidate = current_chunk + "\n" + line if current_chunk else line
+            if len(candidate) > max_len:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                # If a single line exceeds max_len, split it by characters
+                if len(line) > max_len:
+                    temp_line = line
+                    while len(temp_line) > max_len:
+                        chunks.append(temp_line[:max_len])
+                        temp_line = temp_line[max_len:]
+                    current_chunk = temp_line
+                else:
+                    current_chunk = line
+            else:
+                current_chunk = candidate
+        if current_chunk.strip():
+            chunks.append(current_chunk.strip())
+
     last_wamid = None
     for chunk in chunks:
         wamid = await send_reply(incoming, chunk)

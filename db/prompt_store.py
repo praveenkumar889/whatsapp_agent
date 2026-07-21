@@ -109,28 +109,35 @@ class _PromptLoader:
     @staticmethod
     def _from_db(tenant_id: str, name: str, lang: str) -> Optional[tuple]:
         """Returns (prompt_text, version) or None."""
-        try:
-            from db.session_store import _get_client
-            result = (
-                _get_client()
-                .table("prompt_templates")
-                .select("prompt_text, version")
-                .eq("tenant_id",   tenant_id)
-                .eq("prompt_name", name)
-                .eq("language",    lang)
-                .eq("status",      "active")
-                .order("version",  desc=True)
-                .limit(1)
-                .execute()
-            )
-            if result.data:
-                from typing import cast
-                row = cast(dict, result.data[0])
-                return row["prompt_text"], int(row.get("version", 1))
-            return None
-        except Exception as e:
-            print(f"[PROMPT] DB read failed for '{name}': {e}")
-            return None
+        import time
+        max_retries = 3
+        retry_delay = 0.1  # seconds
+        for attempt in range(max_retries):
+            try:
+                from db.session_store import _get_client
+                result = (
+                    _get_client()
+                    .table("prompt_templates")
+                    .select("prompt_text, version")
+                    .eq("tenant_id",   tenant_id)
+                    .eq("prompt_name", name)
+                    .eq("language",    lang)
+                    .eq("status",      "active")
+                    .order("version",  desc=True)
+                    .limit(1)
+                    .execute()
+                )
+                if result.data:
+                    from typing import cast
+                    row = cast(dict, result.data[0])
+                    return row["prompt_text"], int(row.get("version", 1))
+                return None
+            except Exception as e:
+                print(f"[PROMPT] DB read attempt {attempt + 1} failed for '{name}': {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    return None
 
     @staticmethod
     async def aload(tenant_id: str, name: str, lang: str,

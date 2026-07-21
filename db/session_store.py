@@ -1159,20 +1159,11 @@ async def save_last_discussed_product(
         now_utc    = datetime.now(timezone.utc)
         # 30 minutes — long enough to cover a natural conversation, short enough
         # to prevent a product from a previous session poisoning a new one.
-        # (Was 24 hours — caused "Zenia SKY" to appear when customer asked
-        # "which is better?" about Romy/Electra in a brand-new session.)
         expires_at = (now_utc + timedelta(minutes=30)).isoformat()
-        row = {
-            "tenant_id":      tenant_id,
-            "session_id":     session_id,
-            "status":         "LAST_DISCUSSED_PRODUCT",
-            "product_name":   product_name,
-            "expires_at":     expires_at,
-            "updated_at":     now_utc.isoformat(),
-        }
+
         # Update or insert
         existing = await run_sync(lambda: _get_client().table("workflow_sessions")
-            .select("id")
+            .select("id, product_name")
             .eq("tenant_id",  tenant_id)
             .eq("session_id", session_id)
             .eq("status", "LAST_DISCUSSED_PRODUCT")
@@ -1181,11 +1172,39 @@ async def save_last_discussed_product(
 
         if existing.data:
             existing_row = cast(dict, existing.data[0])
+            existing_prod = existing_row.get("product_name") or ""
+            
+            # Option preservation:
+            # If the currently saved product name has options (contains '('), and the new
+            # product name has the same base name but no options (does not contain '('),
+            # preserve the existing options.
+            if "(" in existing_prod and "(" not in product_name:
+                existing_base = existing_prod.split("(")[0].strip().lower()
+                new_base = product_name.split("(")[0].strip().lower()
+                if existing_base == new_base:
+                    product_name = existing_prod
+
+            row = {
+                "tenant_id":      tenant_id,
+                "session_id":     session_id,
+                "status":         "LAST_DISCUSSED_PRODUCT",
+                "product_name":   product_name,
+                "expires_at":     expires_at,
+                "updated_at":     now_utc.isoformat(),
+            }
             await run_sync(lambda: _get_client().table("workflow_sessions")
                 .update(row)
                 .eq("id", existing_row["id"])
                 .execute())
         else:
+            row = {
+                "tenant_id":      tenant_id,
+                "session_id":     session_id,
+                "status":         "LAST_DISCUSSED_PRODUCT",
+                "product_name":   product_name,
+                "expires_at":     expires_at,
+                "updated_at":     now_utc.isoformat(),
+            }
             await run_sync(lambda: _get_client().table("workflow_sessions")
                 .insert(row)
                 .execute())

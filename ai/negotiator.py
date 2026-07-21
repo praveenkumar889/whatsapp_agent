@@ -958,10 +958,7 @@ async def handle_negotiation(
 
             async def _savings() -> str:
                 if total_disc > 0:
-                    try:
-                        return await aget_prompt(incoming, "pricing_order_summary_savings_prompt", total_discount_amount=f"{total_disc:,.0f}")
-                    except Exception:
-                        return f"🎁 *You save Rs.{total_disc:,.0f} on this order!*"
+                    return await aget_prompt(incoming, "pricing_order_summary_savings_prompt", total_discount_amount=f"{total_disc:,.0f}")
                 return ""
 
             async def _footer() -> str:
